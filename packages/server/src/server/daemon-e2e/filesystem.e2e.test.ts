@@ -100,7 +100,9 @@ describe("checkout discard", () => {
         }
       } finally {
         // afterEach shuts down the daemon and its repository observers first.
-        onTestFinished(() => rmSync(cwd, { recursive: true, force: true }));
+        onTestFinished(() =>
+          rmSync(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+        );
       }
     },
   );
