@@ -8,10 +8,10 @@ import {
   readdirSync,
   readlinkSync,
 } from "fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "os";
 import path from "path";
 import { execFileSync } from "node:child_process";
-import { rm } from "node:fs/promises";
 import { createDaemonTestContext, type DaemonTestContext } from "../test-utils/index.js";
 
 function tmpCwd(): string {
@@ -102,7 +102,7 @@ describe("checkout discard", () => {
       } finally {
         // afterEach shuts down the daemon and its repository observers first.
         onTestFinished(() =>
-          rm(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+          rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }),
         );
       }
     },
