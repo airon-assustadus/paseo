@@ -657,7 +657,7 @@ export const ru: TranslationResources = {
       },
       switcher: {
         trigger: "Переключить вкладки (открыто: {{count}})",
-        title: "Переключить вкладку",
+        title: "Вкладки рабочего пространства",
         searchPlaceholder: "Поиск вкладок",
       },
       menu: {
