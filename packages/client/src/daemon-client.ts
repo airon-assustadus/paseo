@@ -6258,10 +6258,26 @@ export class DaemonClient {
     }
     const openingTransport = this.transport;
     let payload: CorrelatedResponsePayload<"network.tunnel.open.response">;
+    let tunnel: NetworkTunnel | undefined;
     try {
       payload = await this.sendCorrelatedSessionRequest({
         message: { type: "network.tunnel.open.request", limits: CLIENT_NETWORK_TUNNEL_LIMITS },
         responseType: "network.tunnel.open.response",
+        selectPayload: (response) => {
+          if (response.ok) {
+            const limits = {
+              initialWindowBytes: response.initialWindowBytes,
+              maxDataBytes: response.maxDataBytes,
+              maxStreams: response.maxStreams,
+              connectTimeoutMs: response.connectTimeoutMs,
+            };
+            if (withinClientNetworkTunnelLimits(limits)) {
+              // A closure can arrive in the same transport turn as this reply.
+              tunnel = this.networkTunnels.open(response.subscriptionId, limits);
+            }
+          }
+          return response;
+        },
       });
     } catch (error) {
       if (error instanceof DaemonRpcError) {
@@ -6279,13 +6295,7 @@ export class DaemonClient {
     if (!payload.ok) {
       throw new NetworkTunnelRpcError("open", payload.error.code, payload.error.message);
     }
-    const limits = {
-      initialWindowBytes: payload.initialWindowBytes,
-      maxDataBytes: payload.maxDataBytes,
-      maxStreams: payload.maxStreams,
-      connectTimeoutMs: payload.connectTimeoutMs,
-    };
-    if (!withinClientNetworkTunnelLimits(limits)) {
+    if (!tunnel) {
       // Refuse at open rather than tear the tunnel down in the middle of a download.
       await this.closeNetworkTunnelSubscription(payload.subscriptionId);
       throw new NetworkTunnelRpcError(
@@ -6294,7 +6304,7 @@ export class DaemonClient {
         "The host answered with tunnel limits above the ones this client asked for.",
       );
     }
-    return this.networkTunnels.open(payload.subscriptionId, limits);
+    return tunnel;
   }
 
   async waitForTerminalStreamEvent(
