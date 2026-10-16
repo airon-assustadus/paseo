@@ -462,7 +462,7 @@ describe("network tunnel generated validation", () => {
     { type: "status", payload: { status: "server_info", serverId: "old-host" } },
   ])("accepts $type", (message) => {
     const envelope = { type: "session", message };
-    expect(GeneratedWSOutboundMessageSchema.safeParse(envelope)).toEqual({
+    expect(validateWSOutboundMessage(envelope)).toEqual({
       success: true,
       data: envelope,
     });
@@ -480,7 +480,7 @@ describe("network tunnel generated validation", () => {
     { requestId: "open", ok: false, error: { code: "unknown", message: "error" } },
   ])("rejects invalid tunnel response %j", (invalidPayload) => {
     expect(
-      GeneratedWSOutboundMessageSchema.safeParse({
+      validateWSOutboundMessage({
         type: "session",
         message: { type: "network.tunnel.open.response", payload: invalidPayload },
       }).success,
@@ -492,7 +492,7 @@ describe("network tunnel generated validation", () => {
     { subscriptionId: "not-a-uuid", reason: "revoked" },
   ])("rejects invalid generated tunnel closure %j", (invalidPayload) => {
     expect(
-      GeneratedWSOutboundMessageSchema.safeParse({
+      validateWSOutboundMessage({
         type: "session",
         message: { type: "network.tunnel.closed", payload: invalidPayload },
       }).success,
