@@ -6318,14 +6318,15 @@ export const UsageProblemSchema = z.discriminatedUnion("kind", [
   }),
   z.object({ kind: z.literal("no_quota"), detail: z.string() }),
 ]);
+const AvailableUsageReportSchema = z.object({
+  status: z.literal("available"),
+  planLabel: z.string().optional(),
+  windows: z.array(ProviderUsageWindowSchema),
+  balances: z.array(ProviderUsageBalanceSchema).optional(),
+  details: z.array(ProviderUsageDetailSchema).optional(),
+});
 export const UsageReportSchema = z.discriminatedUnion("status", [
-  z.object({
-    status: z.literal("available"),
-    planLabel: z.string().optional(),
-    windows: z.array(ProviderUsageWindowSchema),
-    balances: z.array(ProviderUsageBalanceSchema).optional(),
-    details: z.array(ProviderUsageDetailSchema).optional(),
-  }),
+  AvailableUsageReportSchema,
   z.object({ status: z.literal("unavailable"), problem: UsageProblemSchema }),
   z.object({ status: z.literal("error"), error: z.string() }),
 ]);
@@ -6337,6 +6338,11 @@ export const UsageReportEntrySchema = z.object({
   sourceLabel: z.string(),
   icon: z.string().optional(),
   report: UsageReportSchema,
+  // Successful completion time; fetchedAt remains the attempt timestamp for ordering.
+  successfulAt: z.string().optional(),
+  lastSuccessful: z
+    .object({ fetchedAt: z.string(), report: AvailableUsageReportSchema })
+    .optional(),
   loginErrors: z
     .array(
       z.object({
