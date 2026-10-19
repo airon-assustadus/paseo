@@ -16,6 +16,7 @@ import { SessionDelivery, type OwnedSubscription } from "./session/owned-subscri
 import {
   NETWORK_TUNNEL_FAMILY,
   NetworkTunnelSession,
+  TunnelProtocolError,
 } from "./network-tunnel/network-tunnel-session.js";
 import { v4 as uuidv4 } from "uuid";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
@@ -3126,6 +3127,12 @@ export class Session {
     if (binaryFrame.kind === "tunnel") {
       await this.networkTunnelSession.handleFrame(binaryFrame.frame, source);
       return;
+    }
+    if (binaryFrame.kind === "remote_browser") {
+      // No remote browser runs before features.remoteBrowser is advertised, so no ack has an owner.
+      throw new TunnelProtocolError(
+        "Remote browser frame does not belong to an owned subscription",
+      );
     }
     if (!this.authorization.allowsPermission("workspace.write")) {
       return;

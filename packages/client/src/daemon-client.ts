@@ -148,11 +148,18 @@ import {
   encodeFileTransferFrame,
   decodeTerminalStreamFrame,
   decodeTunnelFrame,
+  decodeRemoteBrowserFrame,
   FileTransferOpcode,
+  RemoteBrowserOpcode,
   TerminalStreamOpcode,
   TunnelOpcode,
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
+import type {
+  RemoteBrowserFrameOptions,
+  RemoteBrowserSummary,
+  RemoteBrowserViewport,
+} from "@getpaseo/protocol/remote-browser/rpc-schemas";
 import {
   CLIENT_NETWORK_TUNNEL_LIMITS,
   NetworkTunnelRpcError,
@@ -160,6 +167,13 @@ import {
   withinClientNetworkTunnelLimits,
   type NetworkTunnel,
 } from "./network-tunnel.js";
+import {
+  RemoteBrowserRegistry,
+  RemoteBrowserRpcError,
+  type RemoteBrowserAttachedPayload,
+  type RemoteBrowserAttachment,
+  type RemoteBrowserOperation,
+} from "./remote-browser.js";
 import {
   createRelayE2eeTransportFactory,
   createRelayTransportFactory,
@@ -344,6 +358,20 @@ export type {
   NetworkTunnelTarget,
 } from "./network-tunnel.js";
 export { NetworkTunnelError, NetworkTunnelRpcError } from "./network-tunnel.js";
+export type {
+  RemoteBrowserAttachment,
+  RemoteBrowserEnd,
+  RemoteBrowserFrame,
+  RemoteBrowserFrameOptions,
+  RemoteBrowserInputEvent,
+  RemoteBrowserLimits,
+  RemoteBrowserNavigation,
+  RemoteBrowserOperation,
+  RemoteBrowserState,
+  RemoteBrowserSummary,
+  RemoteBrowserViewport,
+} from "./remote-browser.js";
+export { RemoteBrowserRpcError } from "./remote-browser.js";
 
 export type ConnectionState =
   | { status: "idle" }
@@ -1004,6 +1032,20 @@ type CorrelatedResponsePayloads = {
 };
 type CorrelatedResponsePayload<TType extends CorrelatedResponseType> =
   CorrelatedResponsePayloads[TType];
+type RemoteBrowserResult<TSuccess> =
+  | ({ ok: true } & TSuccess)
+  | { ok: false; error: { code: string; message: string } };
+
+/** Turns a browser.remote.* failure payload into a typed error and narrows to the success shape. */
+function unwrapRemoteBrowserResult<T extends RemoteBrowserResult<object>>(
+  operation: RemoteBrowserOperation,
+  payload: T,
+): Extract<T, { ok: true }> {
+  if (!payload.ok) {
+    throw new RemoteBrowserRpcError(operation, payload.error.code, payload.error.message);
+  }
+  return payload as Extract<T, { ok: true }>;
+}
 
 export class DaemonConnectionError extends Error {
   constructor(
@@ -1276,6 +1318,56 @@ export class DaemonClient {
     handlerError: (error, handler) => {
       this.logger.error({ err: error, handler }, "Network tunnel handler failed");
     },
+  });
+  private readonly remoteBrowsers = new RemoteBrowserRegistry({
+    sendBinary: (frame) => this.sendBinaryFrame(frame),
+    navigate: async (identity, navigation) => {
+      const payload = await this.withRemoteBrowserErrors("navigate", () =>
+        this.sendCorrelatedSessionRequest({
+          message: { type: "browser.remote.navigate.request", ...identity, navigation },
+          responseType: "browser.remote.navigate.response",
+        }),
+      );
+      unwrapRemoteBrowserResult("navigate", payload);
+    },
+    dispatchInput: async (identity, events) => {
+      const payload = await this.withRemoteBrowserErrors("dispatch_input", () =>
+        this.sendCorrelatedSessionRequest({
+          message: { type: "browser.remote.dispatch_input.request", ...identity, events },
+          responseType: "browser.remote.dispatch_input.response",
+        }),
+      );
+      unwrapRemoteBrowserResult("dispatch_input", payload);
+    },
+    resize: async (identity, viewport) => {
+      const payload = await this.withRemoteBrowserErrors("resize", () =>
+        this.sendCorrelatedSessionRequest({
+          message: { type: "browser.remote.resize.request", ...identity, viewport },
+          responseType: "browser.remote.resize.response",
+        }),
+      );
+      return unwrapRemoteBrowserResult("resize", payload).viewport;
+    },
+    setVisibility: async (identity, visible) => {
+      const payload = await this.withRemoteBrowserErrors("set_visibility", () =>
+        this.sendCorrelatedSessionRequest({
+          message: { type: "browser.remote.set_visibility.request", ...identity, visible },
+          responseType: "browser.remote.set_visibility.response",
+        }),
+      );
+      unwrapRemoteBrowserResult("set_visibility", payload);
+    },
+    detach: async (identity) => {
+      const payload = await this.withRemoteBrowserErrors("detach", () =>
+        this.sendCorrelatedSessionRequest({
+          message: { type: "browser.remote.detach.request", ...identity },
+          responseType: "browser.remote.detach.response",
+        }),
+      );
+      unwrapRemoteBrowserResult("detach", payload);
+    },
+    close: (browserId, expectedGeneration) =>
+      this.closeRemoteBrowser(browserId, { expectedGeneration }),
   });
   private pendingBinaryFileReads = new Map<string, PendingBinaryFileRead>();
   private activeBinaryFileTransfers = new Map<string, BinaryFileTransferState>();
@@ -1992,7 +2084,8 @@ export class DaemonClient {
           return null;
         }
         if (!params.selectPayload) {
-          return payload as TResult;
+          // Through unknown: comparing the full payload union with TResult exceeds the checker's union limit.
+          return payload as unknown as TResult;
         }
         return params.selectPayload(payload);
       },
@@ -6236,6 +6329,73 @@ export class DaemonClient {
     return tunnel;
   }
 
+  /** Gate for the remote browser; an older or unsupported host answers false. */
+  isRemoteBrowserSupported(): boolean {
+    // COMPAT(remoteBrowser): added in v0.11.5, remove after 2027-04-19.
+    return this.lastServerInfoMessage?.features?.remoteBrowser === true;
+  }
+
+  async openRemoteBrowser(options: {
+    viewport: RemoteBrowserViewport;
+    url?: string;
+    frames?: RemoteBrowserFrameOptions;
+  }): Promise<RemoteBrowserAttachment> {
+    return this.attachRemoteBrowserWith("open", {
+      type: "browser.remote.open.request",
+      viewport: options.viewport,
+      ...(options.url ? { url: options.url } : {}),
+      ...(options.frames ? { frames: options.frames } : {}),
+    });
+  }
+
+  /** Re-attaches a running browser of this client; any previous attachment ends as superseded. */
+  async attachRemoteBrowser(
+    browserId: string,
+    options: { viewport?: RemoteBrowserViewport; frames?: RemoteBrowserFrameOptions } = {},
+  ): Promise<RemoteBrowserAttachment> {
+    return this.attachRemoteBrowserWith("attach", {
+      type: "browser.remote.attach.request",
+      browserId,
+      ...(options.viewport ? { viewport: options.viewport } : {}),
+      ...(options.frames ? { frames: options.frames } : {}),
+    });
+  }
+
+  async listRemoteBrowsers(): Promise<RemoteBrowserSummary[]> {
+    this.requireRemoteBrowser("list");
+    const payload = await this.withRemoteBrowserErrors("list", () =>
+      this.sendCorrelatedSessionRequest({
+        message: { type: "browser.remote.list.request" },
+        responseType: "browser.remote.list.response",
+      }),
+    );
+    return unwrapRemoteBrowserResult("list", payload).browsers;
+  }
+
+  /**
+   * Session-level close. Pane cleanup passes `expectedGeneration` so it cannot close a browser
+   * that a newer attachment took over; omit it only for explicit user actions.
+   */
+  async closeRemoteBrowser(
+    browserId: string,
+    options: { expectedGeneration?: number } = {},
+  ): Promise<void> {
+    this.requireRemoteBrowser("close");
+    const payload = await this.withRemoteBrowserErrors("close", () =>
+      this.sendCorrelatedSessionRequest({
+        message: {
+          type: "browser.remote.close.request",
+          browserId,
+          ...(options.expectedGeneration !== undefined
+            ? { expectedGeneration: options.expectedGeneration }
+            : {}),
+        },
+        responseType: "browser.remote.close.response",
+      }),
+    );
+    unwrapRemoteBrowserResult("close", payload);
+  }
+
   async waitForTerminalStreamEvent(
     predicate: (event: TerminalStreamEvent) => boolean,
     timeout = 5000,
@@ -6263,6 +6423,80 @@ export class DaemonClient {
 
   private createRequestId(requestId?: string): string {
     return requestId ?? crypto.randomUUID();
+  }
+
+  private requireRemoteBrowser(operation: RemoteBrowserOperation): void {
+    if (!this.isRemoteBrowserSupported()) {
+      throw new RemoteBrowserRpcError(
+        operation,
+        "unsupported_feature",
+        "Update the host to use the remote browser.",
+      );
+    }
+  }
+
+  private async attachRemoteBrowserWith(
+    operation: "open" | "attach",
+    message:
+      | Omit<Extract<SessionInboundMessage, { type: "browser.remote.open.request" }>, "requestId">
+      | Omit<
+          Extract<SessionInboundMessage, { type: "browser.remote.attach.request" }>,
+          "requestId"
+        >,
+  ): Promise<RemoteBrowserAttachment> {
+    this.requireRemoteBrowser(operation);
+    const openingTransport = this.transport;
+    let attachment: RemoteBrowserAttachment | undefined;
+    const register = <T extends RemoteBrowserResult<RemoteBrowserAttachedPayload>>(payload: T) => {
+      // Register in the same transport turn as the reply: frames and state can follow it at once.
+      if (payload.ok) attachment = this.remoteBrowsers.attach(payload) ?? undefined;
+      return payload;
+    };
+    const payload = await this.withRemoteBrowserErrors(operation, () =>
+      message.type === "browser.remote.open.request"
+        ? this.sendCorrelatedSessionRequest({
+            message,
+            responseType: "browser.remote.open.response",
+            selectPayload: register,
+          })
+        : this.sendCorrelatedSessionRequest({
+            message,
+            responseType: "browser.remote.attach.response",
+            selectPayload: register,
+          }),
+    );
+    const attached = unwrapRemoteBrowserResult(operation, payload);
+    if (!attachment) {
+      // Refuse at attach rather than overrun buffers on the first frame.
+      await this.remoteBrowsers.detachUnregistered(attached);
+      throw new RemoteBrowserRpcError(
+        operation,
+        "protocol_error",
+        "The host announced remote browser limits above the ones this client supports.",
+      );
+    }
+    if (this.transport !== openingTransport || this.connectionState.status !== "connected") {
+      throw new RemoteBrowserRpcError(
+        operation,
+        "disconnected",
+        "The host connection changed before the remote browser attached.",
+      );
+    }
+    return attachment;
+  }
+
+  private async withRemoteBrowserErrors<T>(
+    operation: RemoteBrowserOperation,
+    send: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await send();
+    } catch (error) {
+      if (error instanceof DaemonRpcError) {
+        throw new RemoteBrowserRpcError(operation, error.code ?? "rpc_error", error.message);
+      }
+      throw error;
+    }
   }
 
   private async closeNetworkTunnelSubscription(subscriptionId: string): Promise<void> {
@@ -6352,6 +6586,7 @@ export class DaemonClient {
   private disposeTransport(code = 1001, reason = "Reconnecting"): void {
     this.owned.disconnected();
     this.networkTunnels.disconnected();
+    this.remoteBrowsers.disconnected();
     this.providerSnapshotUpdates.clear();
     this.stopLivenessHeartbeat();
     this.cleanupTransport();
@@ -6539,6 +6774,16 @@ export class DaemonClient {
       return true;
     }
 
+    if (opcode === RemoteBrowserOpcode.Frame) {
+      const remoteBrowserFrame = decodeRemoteBrowserFrame(rawBytes);
+      if (remoteBrowserFrame) {
+        this.consecutiveLivenessFailures = 0;
+        this.remoteBrowsers.receiveFrame(remoteBrowserFrame);
+        this.runtimeMetrics?.recordBinaryFrame("other", rawBytes.byteLength, 0);
+      }
+      return true;
+    }
+
     const frame = decodeTerminalStreamFrame(rawBytes);
     if (!frame) {
       return false;
@@ -6569,6 +6814,7 @@ export class DaemonClient {
 
   private handleNetworkTunnelProtocolError(reason: string): void {
     this.networkTunnels.disconnected();
+    this.remoteBrowsers.disconnected();
     this.disposeTransport(1002, reason);
     this.scheduleReconnect({
       reason,
@@ -6712,6 +6958,7 @@ export class DaemonClient {
 
     this.owned.disconnected();
     this.networkTunnels.disconnected();
+    this.remoteBrowsers.disconnected();
     this.providerSnapshotUpdates.clear();
 
     // Clear all pending waiters and queued sends since the connection was lost
@@ -6836,6 +7083,21 @@ export class DaemonClient {
       msg,
       this.config.providerSnapshots !== "wire",
     );
+
+    if (consumerMessage.type === "browser.remote.state") {
+      const { subscriptionId, generation, state } = consumerMessage.payload;
+      this.remoteBrowsers.receiveState(subscriptionId, generation, state);
+    } else if (consumerMessage.type === "browser.remote.detached") {
+      this.remoteBrowsers.receiveDetached(
+        consumerMessage.payload.subscriptionId,
+        consumerMessage.payload.reason,
+      );
+    } else if (consumerMessage.type === "browser.remote.closed") {
+      this.remoteBrowsers.receiveClosed(
+        consumerMessage.payload.subscriptionId,
+        consumerMessage.payload.reason,
+      );
+    }
 
     if (consumerMessage.type === "network.tunnel.closed") {
       this.networkTunnels.daemonClosed(

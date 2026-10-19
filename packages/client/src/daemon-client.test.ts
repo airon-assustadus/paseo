@@ -9,12 +9,18 @@ import {
   type DaemonTransport,
   type Logger,
   type NetworkTunnel,
+  type RemoteBrowserAttachment,
+  type RemoteBrowserFrame,
 } from "./daemon-client";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
+  decodeRemoteBrowserFrame,
   decodeTunnelFrame,
   decodeFileTransferFrame,
+  encodeRemoteBrowserFrame,
+  RemoteBrowserImageFormat,
+  RemoteBrowserOpcode,
   encodeTunnelFrame,
   encodeFileTransferFrame,
   FileTransferOpcode,
@@ -8364,4 +8370,269 @@ test("usage request timeout detaches its update listener", async () => {
   } finally {
     vi.useRealTimers();
   }
+});
+
+const REMOTE_BROWSER_ID = "00000000-0000-4000-8000-0000000000b1";
+const REMOTE_SUBSCRIPTION_ID = "00000000-0000-4000-8000-0000000000b2";
+const REMOTE_VIEWPORT = {
+  width: 390,
+  height: 844,
+  deviceScaleFactor: 3,
+  mobile: true,
+  touch: true,
+};
+const REMOTE_LIMITS = {
+  maxFramesInFlight: 2,
+  maxFrameBytes: 16,
+  maxImageEdge: 1920,
+  maxImagePixels: 4194304,
+  maxInputEventsPerRequest: 64,
+  maxInputRequestsPerSecond: 120,
+  detachedTimeoutMs: 60000,
+  frameAckTimeoutMs: 30000,
+};
+const REMOTE_STATE = {
+  url: "about:blank",
+  title: "",
+  canGoBack: false,
+  canGoForward: false,
+  loading: false,
+  error: null,
+  focusedEditable: null,
+  viewport: REMOTE_VIEWPORT,
+  visible: true,
+  notice: null,
+};
+
+function remoteFrame(seq: number, overrides: { image?: Uint8Array; imageWidth?: number } = {}) {
+  return encodeRemoteBrowserFrame({
+    opcode: RemoteBrowserOpcode.Frame,
+    subscriptionId: REMOTE_SUBSCRIPTION_ID,
+    generation: 1,
+    seq,
+    cssWidth: 390,
+    cssHeight: 844,
+    imageWidth: overrides.imageWidth ?? 780,
+    imageHeight: 1688,
+    format: RemoteBrowserImageFormat.Jpeg,
+    image: overrides.image ?? new Uint8Array([seq + 1]),
+  });
+}
+
+/** Answers the open request and, in the same synchronous turn, delivers `frames`. */
+async function openRemoteBrowserWithFrames(
+  frames: Uint8Array[],
+  limits = REMOTE_LIMITS,
+): Promise<{
+  attachment: RemoteBrowserAttachment;
+  transport: ReturnType<typeof createMockTransport>;
+}> {
+  const { client, transport } = createTunnelClient({ remoteBrowser: true });
+  const opening = client.openRemoteBrowser({ viewport: REMOTE_VIEWPORT });
+  const request = parseSentFrame(transport.sent.at(-1));
+  expect(request.type).toBe("browser.remote.open.request");
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "browser.remote.open.response",
+      payload: {
+        requestId: request.requestId,
+        ok: true,
+        browserId: REMOTE_BROWSER_ID,
+        subscriptionId: REMOTE_SUBSCRIPTION_ID,
+        generation: 1,
+        limits,
+        state: REMOTE_STATE,
+      },
+    }),
+  );
+  for (const frame of frames) transport.triggerMessage(frame);
+  const attachment = await opening;
+  return { attachment, transport };
+}
+
+function sentRemoteAcks(transport: ReturnType<typeof createMockTransport>) {
+  return transport.sent
+    .filter((data) => typeof data !== "string")
+    .map((data) => decodeRemoteBrowserFrame(assertUint8Array(data)))
+    .filter((frame) => frame?.opcode === RemoteBrowserOpcode.FrameAck)
+    .map((frame) => frame?.seq);
+}
+
+test("remote browser is gated on the daemon feature", async () => {
+  const { client } = createTunnelClient({});
+  expect(client.isRemoteBrowserSupported()).toBe(false);
+  await expect(client.openRemoteBrowser({ viewport: REMOTE_VIEWPORT })).rejects.toMatchObject({
+    name: "RemoteBrowserRpcError",
+    code: "unsupported_feature",
+  });
+});
+
+test("remote browser replays frames that arrived with the open reply, in order", async () => {
+  const { attachment, transport } = await openRemoteBrowserWithFrames([
+    remoteFrame(0),
+    remoteFrame(1),
+  ]);
+  const painted: RemoteBrowserFrame[] = [];
+  attachment.onFrame((frame) => painted.push(frame));
+  expect(painted.map((frame) => frame.seq)).toEqual([0, 1]);
+  expect(painted[0]).toMatchObject({ imageWidth: 780, cssWidth: 390, mimeType: "image/jpeg" });
+
+  for (const frame of painted) attachment.ackFrame(frame);
+  attachment.ackFrame(painted[0]);
+  expect(sentRemoteAcks(transport)).toEqual([0, 1]);
+});
+
+test("remote browser keeps credit flowing over many frames with exact acks", async () => {
+  const { attachment, transport } = await openRemoteBrowserWithFrames([]);
+  let painted = 0;
+  attachment.onFrame((frame) => {
+    painted += 1;
+    attachment.ackFrame(frame);
+  });
+  for (let seq = 0; seq < 1000; seq += 1) transport.triggerMessage(remoteFrame(seq));
+  expect(painted).toBe(1000);
+  expect(sentRemoteAcks(transport)).toHaveLength(1000);
+  expect(attachment.ended).toBeNull();
+});
+
+test.each([
+  ["more frames than the announced window", [remoteFrame(0), remoteFrame(1), remoteFrame(2)]],
+  ["a frame above the announced bytes", [remoteFrame(0, { image: new Uint8Array(17) })]],
+  ["an image wider than the announced edge", [remoteFrame(0, { imageWidth: 1921 })]],
+  ["a repeated sequence", [remoteFrame(0), remoteFrame(0)]],
+])("remote browser ends the attachment on %s", async (_name, frames) => {
+  const { attachment, transport } = await openRemoteBrowserWithFrames(frames);
+  expect(attachment.ended).toEqual({ kind: "detached", reason: "protocol_error" });
+  const detach = parseSentFrame(transport.sent.findLast((data) => typeof data === "string"));
+  expect(detach).toMatchObject({
+    type: "browser.remote.detach.request",
+    browserId: REMOTE_BROWSER_ID,
+    subscriptionId: REMOTE_SUBSCRIPTION_ID,
+    generation: 1,
+  });
+  const frames_: RemoteBrowserFrame[] = [];
+  attachment.onFrame((frame) => frames_.push(frame));
+  expect(frames_).toEqual([]);
+});
+
+test("remote browser refuses limits above the protocol ceilings", async () => {
+  const { client, transport } = createTunnelClient({ remoteBrowser: true });
+  const opening = client.openRemoteBrowser({ viewport: REMOTE_VIEWPORT });
+  const request = parseSentFrame(transport.sent.at(-1));
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "browser.remote.open.response",
+      payload: {
+        requestId: request.requestId,
+        ok: true,
+        browserId: REMOTE_BROWSER_ID,
+        subscriptionId: REMOTE_SUBSCRIPTION_ID,
+        generation: 1,
+        limits: { ...REMOTE_LIMITS, maxImageEdge: 4096 },
+        state: REMOTE_STATE,
+      },
+    }),
+  );
+  const refused = expect(opening).rejects.toMatchObject({ code: "protocol_error" });
+  const detach = await vi.waitFor(() => {
+    const sent = parseSentFrame(transport.sent.at(-1));
+    expect(sent.type).toBe("browser.remote.detach.request");
+    return sent;
+  });
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "browser.remote.detach.response",
+      payload: { requestId: detach.requestId, ok: true, browserId: REMOTE_BROWSER_ID },
+    }),
+  );
+  await refused;
+});
+
+test("remote browser operations carry the attachment triple and die with it", async () => {
+  const { attachment, transport } = await openRemoteBrowserWithFrames([]);
+  const navigating = attachment.navigate({ kind: "reload" });
+  const navigate = parseSentFrame(transport.sent.at(-1));
+  expect(navigate).toMatchObject({
+    type: "browser.remote.navigate.request",
+    browserId: REMOTE_BROWSER_ID,
+    subscriptionId: REMOTE_SUBSCRIPTION_ID,
+    generation: 1,
+    navigation: { kind: "reload" },
+  });
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "browser.remote.navigate.response",
+      payload: {
+        requestId: navigate.requestId,
+        ok: false,
+        error: { code: "stale_attachment", message: "Attachment replaced" },
+      },
+    }),
+  );
+  await expect(navigating).rejects.toMatchObject({
+    name: "RemoteBrowserRpcError",
+    operation: "navigate",
+    code: "stale_attachment",
+  });
+
+  const ends: unknown[] = [];
+  attachment.onEnd((end) => ends.push(end));
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "browser.remote.detached",
+      payload: {
+        subscriptionId: REMOTE_SUBSCRIPTION_ID,
+        browserId: REMOTE_BROWSER_ID,
+        generation: 1,
+        reason: "superseded",
+      },
+    }),
+  );
+  expect(ends).toEqual([{ kind: "detached", reason: "superseded" }]);
+  const sentBefore = transport.sent.length;
+  await expect(attachment.dispatchInput([{ kind: "text", text: "a" }])).rejects.toMatchObject({
+    code: "stale_attachment",
+  });
+  expect(transport.sent.length).toBe(sentBefore);
+});
+
+test("remote browser close is generation-guarded and state updates are routed", async () => {
+  const { attachment, transport } = await openRemoteBrowserWithFrames([]);
+  const states: string[] = [];
+  attachment.onState((state) => states.push(state.title));
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "browser.remote.state",
+      payload: {
+        subscriptionId: REMOTE_SUBSCRIPTION_ID,
+        browserId: REMOTE_BROWSER_ID,
+        generation: 1,
+        state: { ...REMOTE_STATE, title: "Loaded" },
+      },
+    }),
+  );
+  expect(states).toEqual(["Loaded"]);
+  expect(attachment.state.title).toBe("Loaded");
+
+  const closing = attachment.close();
+  const close = parseSentFrame(transport.sent.at(-1));
+  expect(close).toMatchObject({
+    type: "browser.remote.close.request",
+    browserId: REMOTE_BROWSER_ID,
+    expectedGeneration: 1,
+  });
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "browser.remote.close.response",
+      payload: { requestId: close.requestId, ok: true, browserId: REMOTE_BROWSER_ID },
+    }),
+  );
+  await closing;
+  expect(attachment.ended).toEqual({ kind: "closed", reason: "closed" });
+});
+
+test("remote browser attachments end when the transport disconnects", async () => {
+  const { attachment, transport } = await openRemoteBrowserWithFrames([remoteFrame(0)]);
+  transport.triggerClose({ code: 1006 });
+  expect(attachment.ended).toEqual({ kind: "disconnected", reason: "disconnected" });
 });

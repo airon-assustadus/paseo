@@ -27,6 +27,29 @@ import {
   NetworkTunnelCloseResponseSchema,
   NetworkTunnelClosedMessageSchema,
 } from "./network-tunnel/rpc-schemas.js";
+import {
+  RemoteBrowserAttachRequestSchema,
+  RemoteBrowserAttachResponseSchema,
+  RemoteBrowserCloseRequestSchema,
+  RemoteBrowserCloseResponseSchema,
+  RemoteBrowserClosedMessageSchema,
+  RemoteBrowserDetachRequestSchema,
+  RemoteBrowserDetachResponseSchema,
+  RemoteBrowserDetachedMessageSchema,
+  RemoteBrowserDispatchInputRequestSchema,
+  RemoteBrowserDispatchInputResponseSchema,
+  RemoteBrowserListRequestSchema,
+  RemoteBrowserListResponseSchema,
+  RemoteBrowserNavigateRequestSchema,
+  RemoteBrowserNavigateResponseSchema,
+  RemoteBrowserOpenRequestSchema,
+  RemoteBrowserOpenResponseSchema,
+  RemoteBrowserResizeRequestSchema,
+  RemoteBrowserResizeResponseSchema,
+  RemoteBrowserSetVisibilityRequestSchema,
+  RemoteBrowserSetVisibilityResponseSchema,
+  RemoteBrowserStateMessageSchema,
+} from "./remote-browser/rpc-schemas.js";
 import { AGENT_LIFECYCLE_STATUSES } from "./agent-lifecycle.js";
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "./agent-title-limits.js";
 import { AgentProviderSchema } from "./provider-manifest.js";
@@ -3181,6 +3204,15 @@ export const SubscriptionReleaseResponseSchema = z.object({
 export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   NetworkTunnelOpenRequestSchema,
   NetworkTunnelCloseRequestSchema,
+  RemoteBrowserOpenRequestSchema,
+  RemoteBrowserAttachRequestSchema,
+  RemoteBrowserDetachRequestSchema,
+  RemoteBrowserCloseRequestSchema,
+  RemoteBrowserListRequestSchema,
+  RemoteBrowserNavigateRequestSchema,
+  RemoteBrowserDispatchInputRequestSchema,
+  RemoteBrowserResizeRequestSchema,
+  RemoteBrowserSetVisibilityRequestSchema,
   BrowserHostRegisterRequestSchema,
   SubscriptionReleaseRequestSchema,
   SessionEventsSetSubscriptionRequestSchema,
@@ -3561,6 +3593,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(networkTunnel): added in v0.12.0, remove after 2027-10-08 once daemon floor >= v0.12.0.
         networkTunnel: z.boolean().optional(),
+        // COMPAT(remoteBrowser): added in v0.11.5, remove after 2027-04-19 once daemon floor includes browser.remote.*.
+        remoteBrowser: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
         workspaceRequestReceipts: z.boolean().optional(),
         creationLifecycle: z.boolean().optional(),
@@ -6826,6 +6860,18 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   NetworkTunnelOpenResponseSchema,
   NetworkTunnelCloseResponseSchema,
   NetworkTunnelClosedMessageSchema,
+  RemoteBrowserOpenResponseSchema,
+  RemoteBrowserAttachResponseSchema,
+  RemoteBrowserDetachResponseSchema,
+  RemoteBrowserCloseResponseSchema,
+  RemoteBrowserListResponseSchema,
+  RemoteBrowserNavigateResponseSchema,
+  RemoteBrowserDispatchInputResponseSchema,
+  RemoteBrowserResizeResponseSchema,
+  RemoteBrowserSetVisibilityResponseSchema,
+  RemoteBrowserStateMessageSchema,
+  RemoteBrowserDetachedMessageSchema,
+  RemoteBrowserClosedMessageSchema,
   BrowserHostRegisterResponseSchema,
   SubscriptionReleaseResponseSchema,
   SessionEventsSetSubscriptionResponseSchema,
