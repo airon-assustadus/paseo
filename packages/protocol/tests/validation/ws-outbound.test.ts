@@ -418,3 +418,84 @@ describe("network tunnel generated validation", () => {
     ).toBe(false);
   });
 });
+
+describe("remote browser generated validation", () => {
+  const browserId = "22222222-2222-4222-8222-222222222222";
+  const subscriptionId = "11111111-1111-4111-8111-111111111111";
+  const viewport = { width: 390, height: 844, deviceScaleFactor: 3, mobile: true, touch: true };
+  const limits = {
+    maxFramesInFlight: 2,
+    maxFrameBytes: 1048576,
+    maxImageEdge: 1920,
+    maxImagePixels: 4194304,
+    maxInputEventsPerRequest: 64,
+    maxInputRequestsPerSecond: 120,
+    detachedTimeoutMs: 60000,
+    frameAckTimeoutMs: 30000,
+  };
+  const state = {
+    url: "http://localhost:3000/",
+    title: '\u0000"\\😀',
+    canGoBack: true,
+    canGoForward: false,
+    loading: true,
+    error: { code: "policy_denied", url: "http://169.254.169.254/", message: "Denied" },
+    focusedEditable: { inputMode: "text", inputType: "text", enterKeyHint: "enter" },
+    viewport,
+    visible: true,
+    notice: null,
+  };
+  const attached = {
+    requestId: "open",
+    ok: true,
+    browserId,
+    subscriptionId,
+    generation: 1,
+    limits,
+    state,
+  };
+
+  it.each([
+    { type: "browser.remote.open.response", payload: attached },
+    { type: "browser.remote.attach.response", payload: { ...attached, generation: 2 } },
+    {
+      type: "browser.remote.open.response",
+      payload: {
+        requestId: "open",
+        ok: false,
+        error: { code: "browser_unavailable", message: "x" },
+      },
+    },
+    { type: "browser.remote.state", payload: { subscriptionId, browserId, generation: 1, state } },
+    {
+      type: "browser.remote.detached",
+      payload: { subscriptionId, browserId, generation: 1, reason: "superseded" },
+    },
+    { type: "browser.remote.closed", payload: { subscriptionId, browserId, reason: "closed" } },
+    {
+      type: "status",
+      payload: { status: "server_info", serverId: "host", features: { remoteBrowser: true } },
+    },
+  ])("accepts $type", (message) => {
+    const envelope = { type: "session", message };
+    expect(GeneratedWSOutboundMessageSchema.safeParse(envelope)).toEqual({
+      success: true,
+      data: envelope,
+    });
+  });
+
+  it.each([
+    { ...attached, ok: "true" },
+    { ...attached, generation: 0 },
+    { ...attached, limits: { ...limits, maxFrameBytes: 0 } },
+    { ...attached, state: { ...state, title: "t".repeat(1025) } },
+    { requestId: "open", ok: true, browserId, subscriptionId, generation: 1, limits },
+  ])("rejects invalid remote browser attach payload %#", (invalidPayload) => {
+    expect(
+      GeneratedWSOutboundMessageSchema.safeParse({
+        type: "session",
+        message: { type: "browser.remote.open.response", payload: invalidPayload },
+      }).success,
+    ).toBe(false);
+  });
+});

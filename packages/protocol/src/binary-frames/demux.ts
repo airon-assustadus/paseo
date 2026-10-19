@@ -1,5 +1,10 @@
 import { decodeTunnelFrame, TunnelOpcode, type TunnelFrame } from "./tunnel.js";
 import {
+  decodeRemoteBrowserFrame,
+  RemoteBrowserOpcode,
+  type RemoteBrowserBinaryFrame,
+} from "./remote-browser.js";
+import {
   decodeFileTransferFrame,
   FileTransferOpcode,
   type FileTransferFrame,
@@ -13,7 +18,8 @@ import {
 export type BinaryFrame =
   | { kind: "terminal"; frame: TerminalStreamFrame }
   | { kind: "file_transfer"; frame: FileTransferFrame }
-  | { kind: "tunnel"; frame: TunnelFrame };
+  | { kind: "tunnel"; frame: TunnelFrame }
+  | { kind: "remote_browser"; frame: RemoteBrowserBinaryFrame };
 
 export function decodeBinaryFrame(bytes: Uint8Array): BinaryFrame | null {
   switch (bytes[0]) {
@@ -38,6 +44,11 @@ export function decodeBinaryFrame(bytes: Uint8Array): BinaryFrame | null {
     case TunnelOpcode.WindowUpdate: {
       const frame = decodeTunnelFrame(bytes);
       return frame ? { kind: "tunnel", frame } : null;
+    }
+    case RemoteBrowserOpcode.Frame:
+    case RemoteBrowserOpcode.FrameAck: {
+      const frame = decodeRemoteBrowserFrame(bytes);
+      return frame ? { kind: "remote_browser", frame } : null;
     }
     default:
       return null;

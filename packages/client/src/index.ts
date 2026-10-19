@@ -8,6 +8,20 @@ export type {
   NetworkTunnelTarget,
   NetworkTunnelErrorCode,
 } from "./network-tunnel.js";
+export { RemoteBrowserRpcError } from "./remote-browser.js";
+export type {
+  RemoteBrowserAttachment,
+  RemoteBrowserEnd,
+  RemoteBrowserFrame,
+  RemoteBrowserFrameOptions,
+  RemoteBrowserInputEvent,
+  RemoteBrowserLimits,
+  RemoteBrowserNavigation,
+  RemoteBrowserOperation,
+  RemoteBrowserState,
+  RemoteBrowserSummary,
+  RemoteBrowserViewport,
+} from "./remote-browser.js";
 import type { OwnedSubscription } from "./connection/index.js";
 export type { OwnedSubscription, SubscriptionObserver } from "./connection/index.js";
 import type { DaemonClientConfig } from "./daemon-client.js";
