@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hostile hello</title>
+  </head>
+  <body>
+    <script>
+      parent.postMessage({ type: "paseo.web.hello", v: 1 }, "*");
+      parent.postMessage({ type: "fixture.hostile.sent", origin: location.origin }, "*");
+    </script>
+  </body>
+</html>
