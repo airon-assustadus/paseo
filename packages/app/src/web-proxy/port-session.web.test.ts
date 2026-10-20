@@ -7,10 +7,11 @@ import {
 } from "./bridge-messages";
 import { startPortSession, type PortSession } from "./port-session.web";
 import type { WebProxyCapability } from "./request-policy";
-import type {
-  WebProxyTransport,
-  WebProxyTransportRequest,
-  WebProxyTransportResponse,
+import {
+  WebProxyTransportError,
+  type WebProxyTransport,
+  type WebProxyTransportRequest,
+  type WebProxyTransportResponse,
 } from "./transport";
 
 const DESTINATION = "http://127.0.0.1:4173";
@@ -141,6 +142,10 @@ function start(input: {
 
 function abortedFlags(harness: Harness): boolean[] {
   return harness.calls.map((call) => call.signal.aborted);
+}
+
+async function failWith(error: Error): Promise<WebProxyTransportResponse> {
+  throw error;
 }
 
 function requestMessage(overrides: Partial<RequestMessage> = {}): RequestMessage {
@@ -470,7 +475,7 @@ describe("startPortSession", () => {
     expect(harness.calls).toEqual([]);
   });
 
-  it("hides transport failures behind a fixed code", async () => {
+  it("hides transport failures behind a fixed code and reason", async () => {
     const harness = start({
       respond: () => Promise.reject(new Error("dial 10.0.0.5 failed: secret detail")),
     });
@@ -481,6 +486,83 @@ describe("startPortSession", () => {
       generation: 1,
       requestId: 1,
       code: "transport_error",
+      reason: "upstream_error",
     });
+  });
+
+  it.each([
+    [
+      new WebProxyTransportError("credentials_unsupported"),
+      "transport_error",
+      "credentials_unsupported",
+    ],
+    [
+      new WebProxyTransportError("not_allowed", "redirect_blocked"),
+      "redirect_blocked",
+      "not_allowed",
+    ],
+    [new WebProxyTransportError("tls_error"), "transport_error", "tls_error"],
+  ] as const)(
+    "passes a typed transport failure on with its code and reason",
+    async (error, code, reason) => {
+      const harness = start({ respond: () => failWith(error) });
+      send(harness.content, requestMessage());
+      expect(await harness.next()).toEqual({
+        type: "paseo.web.response.error",
+        v: 1,
+        generation: 1,
+        requestId: 1,
+        code,
+        reason,
+      });
+    },
+  );
+
+  it("reports a body that fails after the head with the transport's reason", async () => {
+    const failing = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(2));
+      },
+      pull(controller) {
+        controller.error(new WebProxyTransportError("transport_closed"));
+      },
+    });
+    const harness = start({ respond: () => Promise.resolve(ok(failing)) });
+    send(harness.content, requestMessage());
+    expect(await harness.next()).toMatchObject({ type: "paseo.web.response.head" });
+    expect(await harness.next()).toMatchObject({ type: "paseo.web.response.chunk" });
+    expect(await harness.next()).toEqual({
+      type: "paseo.web.response.error",
+      v: 1,
+      generation: 1,
+      requestId: 1,
+      code: "transport_error",
+      reason: "transport_closed",
+    });
+  });
+
+  it("keeps a cancelled body's slot until the transport's cancel has finished", async () => {
+    const release = Promise.withResolvers<void>();
+    const slowCancel = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(4));
+      },
+      // A relayed transport resolves this once the host confirms the upstream request closed.
+      cancel: () => release.promise,
+    });
+    const harness = start({
+      respond: (request) => Promise.resolve(ok(request.url.endsWith("/slow") ? slowCancel : null)),
+      limits: { ...DEFAULT_BRIDGE_LIMITS, maxConcurrentRequests: 1 },
+    });
+    send(harness.content, requestMessage({ path: "/slow" }));
+    await harness.next();
+    expect(await harness.next()).toMatchObject({ type: "paseo.web.response.chunk" });
+    send(harness.content, { type: "paseo.web.cancel", v: 1, generation: 1, requestId: 1 });
+    send(harness.content, requestMessage({ requestId: 2 }));
+    expect(await harness.next()).toMatchObject({ requestId: 2, code: "too_many_requests" });
+
+    release.resolve();
+    send(harness.content, requestMessage({ requestId: 3 }));
+    expect(await harness.next()).toMatchObject({ type: "paseo.web.response.head", requestId: 3 });
   });
 });

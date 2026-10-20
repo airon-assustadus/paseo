@@ -393,6 +393,42 @@ describe("createShellWorker responses", () => {
     expect(response.headers.get("x-paseo-web-proxy-error")).toBe("redirect_blocked");
   });
 
+  it("exposes the transport's reason before the head and in the body's error after it", async () => {
+    const harness = await admittedApp();
+    const early = subresource(harness, `${ORIGIN}/private`);
+    const first = await forwardedAt(harness, 1);
+    reply(first.port, {
+      type: "paseo.web.response.error",
+      v: 1,
+      generation: 1,
+      requestId: 1,
+      code: "transport_error",
+      reason: "credentials_unsupported",
+    });
+    const refused = await early;
+    expect(refused.status).toBe(502);
+    expect(refused.headers.get("x-paseo-web-proxy-error")).toBe("transport_error");
+    expect(refused.headers.get("x-paseo-web-proxy-reason")).toBe("credentials_unsupported");
+
+    const late = subresource(harness, `${ORIGIN}/stream`);
+    const second = await forwardedAt(harness, 2);
+    reply(second.port, head(200));
+    const response = await late;
+    reply(second.port, {
+      type: "paseo.web.response.error",
+      v: 1,
+      generation: 1,
+      requestId: 1,
+      code: "transport_error",
+      reason: "transport_closed",
+    });
+    await expect(response.text()).rejects.toMatchObject({
+      name: "ShellBridgeClosedError",
+      code: "transport_error",
+      reason: "transport_closed",
+    });
+  });
+
   it("refuses an oversized body without reaching the bootstrap", async () => {
     const harness = await admittedApp();
     const response = await subresource(harness, `${ORIGIN}/upload`, {

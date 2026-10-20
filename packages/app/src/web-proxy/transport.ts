@@ -1,4 +1,9 @@
-import type { BridgeHeaders, BridgeMethod, BridgeRequestMode } from "./bridge-messages";
+import type {
+  BridgeErrorReason,
+  BridgeHeaders,
+  BridgeMethod,
+  BridgeRequestMode,
+} from "./bridge-messages";
 
 // The broker's only way out. A concrete adapter (daemon session, SDK) owns its own opaque
 // request ids, replay protection and limits; the content's requestId never reaches it.
@@ -34,4 +39,16 @@ export interface WebProxyTransport {
     request: WebProxyTransportRequest,
     signal: AbortSignal,
   ): Promise<WebProxyTransportResponse>;
+}
+
+// The only way a transport failure can carry a reason to the content. Any other rejection, from
+// the request or from the response body, reaches the content as transport_error/upstream_error.
+export class WebProxyTransportError extends Error {
+  constructor(
+    readonly reason: BridgeErrorReason,
+    readonly code: "transport_error" | "redirect_blocked" = "transport_error",
+  ) {
+    super(`Web proxy transport failed: ${reason}`);
+    this.name = "WebProxyTransportError";
+  }
 }

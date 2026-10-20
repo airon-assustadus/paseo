@@ -13,6 +13,17 @@ export type BridgeErrorCode =
   | "redirect_blocked"
   | "path_not_allowed"
   | "transport_error";
+// Why the transport failed, from a closed list (adapter-contract.md §3.2). Nothing else about the
+// upstream failure (message, URL, headers, body) ever reaches the content.
+export type BridgeErrorReason =
+  | "credentials_unsupported"
+  | "not_allowed"
+  | "unreachable"
+  | "timeout"
+  | "tls_error"
+  | "limit"
+  | "transport_closed"
+  | "upstream_error";
 export type BridgeRevokeReason =
   | "frame_navigated"
   | "disposed"
@@ -111,6 +122,7 @@ export interface ResponseErrorMessage {
   generation: number;
   requestId: number;
   code: BridgeErrorCode;
+  reason?: BridgeErrorReason;
 }
 
 export interface RevokeMessage {
@@ -144,6 +156,16 @@ const ERROR_CODES: readonly BridgeErrorCode[] = [
   "redirect_blocked",
   "path_not_allowed",
   "transport_error",
+];
+const ERROR_REASONS: readonly BridgeErrorReason[] = [
+  "credentials_unsupported",
+  "not_allowed",
+  "unreachable",
+  "timeout",
+  "tls_error",
+  "limit",
+  "transport_closed",
+  "upstream_error",
 ];
 const REVOKE_REASONS: readonly BridgeRevokeReason[] = [
   "frame_navigated",
@@ -345,6 +367,26 @@ function parseResponseHead(data: Record<string, unknown>): ResponseHeadMessage |
   };
 }
 
+function parseResponseError(data: Record<string, unknown>): ResponseErrorMessage | null {
+  const keys = ["type", "v", "generation", "requestId", "code"];
+  const hasReason = "reason" in data;
+  if (!hasExactKeys(data, hasReason ? [...keys, "reason"] : keys)) return null;
+  if (!isRequestEnvelope(data, "paseo.web.response.error")) return null;
+  const { generation, requestId, code, reason } = data;
+  if (typeof generation !== "number" || typeof requestId !== "number") return null;
+  if (!isOneOf(code, ERROR_CODES)) return null;
+  const message: ResponseErrorMessage = {
+    type: "paseo.web.response.error",
+    v: 1,
+    generation,
+    requestId,
+    code,
+  };
+  if (!hasReason) return message;
+  if (!isOneOf(reason, ERROR_REASONS)) return null;
+  return { ...message, reason };
+}
+
 export function parseControlMessage(data: unknown): ControlMessage | null {
   if (!isRecord(data)) return null;
   const { generation, requestId } = data;
@@ -369,11 +411,6 @@ export function parseControlMessage(data: unknown): ControlMessage | null {
     if (!isRequestEnvelope(data, "paseo.web.response.end")) return null;
     return { type: "paseo.web.response.end", v: 1, generation, requestId };
   }
-  if (data.type === "paseo.web.response.error") {
-    if (!hasExactKeys(data, ["type", "v", "generation", "requestId", "code"])) return null;
-    if (!isRequestEnvelope(data, "paseo.web.response.error")) return null;
-    if (!isOneOf(data.code, ERROR_CODES)) return null;
-    return { type: "paseo.web.response.error", v: 1, generation, requestId, code: data.code };
-  }
+  if (data.type === "paseo.web.response.error") return parseResponseError(data);
   return null;
 }

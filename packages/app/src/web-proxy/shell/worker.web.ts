@@ -2,6 +2,7 @@ import {
   isBridgeMethod,
   parseControlMessage,
   type BridgeErrorCode,
+  type BridgeErrorReason,
   type BridgeHeaders,
   type BridgeRequestMode,
   type ControlMessage,
@@ -68,7 +69,10 @@ export class ShellBridgeTimeoutError extends Error {
 }
 
 export class ShellBridgeClosedError extends Error {
-  constructor(readonly code: ShellFailureCode | BridgeErrorCode) {
+  constructor(
+    readonly code: ShellFailureCode | BridgeErrorCode,
+    readonly reason: BridgeErrorReason | null = null,
+  ) {
     super(`Web proxy bridge ended the response: ${code}`);
     this.name = "ShellBridgeClosedError";
   }
@@ -76,15 +80,19 @@ export class ShellBridgeClosedError extends Error {
 
 const NULL_BODY_STATUSES = new Set([204, 205, 304]);
 
-function failureResponse(status: number, code: ShellFailureCode | BridgeErrorCode): Response {
-  return new Response(`Paseo web proxy: ${code}\n`, {
-    status,
-    headers: {
-      "content-type": "text/plain; charset=utf-8",
-      "cache-control": "no-store",
-      "x-paseo-web-proxy-error": code,
-    },
+function failureResponse(
+  status: number,
+  code: ShellFailureCode | BridgeErrorCode,
+  reason: BridgeErrorReason | null = null,
+): Response {
+  const headers = new Headers({
+    "content-type": "text/plain; charset=utf-8",
+    "cache-control": "no-store",
+    "x-paseo-web-proxy-error": code,
   });
+  if (reason !== null) headers.set("x-paseo-web-proxy-reason", reason);
+  const detail = reason === null ? code : `${code} (${reason})`;
+  return new Response(`Paseo web proxy: ${detail}\n`, { status, headers });
 }
 
 // Mitigation only: self-navigation, WebRTC and prefetch are outside what CSP governs.
@@ -230,12 +238,19 @@ function awaitResponse(input: {
     resolve(response);
   }
 
-  function fail(status: number, code: ShellFailureCode | BridgeErrorCode): void {
-    settle(failureResponse(status, code), "done");
+  function fail(
+    status: number,
+    code: ShellFailureCode | BridgeErrorCode,
+    reason: BridgeErrorReason | null = null,
+  ): void {
+    settle(failureResponse(status, code, reason), "done");
   }
 
-  function failBody(code: ShellFailureCode | BridgeErrorCode): void {
-    queue.failure = new ShellBridgeClosedError(code);
+  function failBody(
+    code: ShellFailureCode | BridgeErrorCode,
+    reason: BridgeErrorReason | null = null,
+  ): void {
+    queue.failure = new ShellBridgeClosedError(code, reason);
     queue.wake?.();
   }
 
@@ -272,7 +287,7 @@ function awaitResponse(input: {
     } else if (message.type === "paseo.web.revoke") {
       failBody("session_revoked");
     } else if (message.type === "paseo.web.response.error") {
-      failBody(message.code);
+      failBody(message.code, message.reason ?? null);
     } else {
       failBody("bridge_error");
     }
@@ -281,8 +296,9 @@ function awaitResponse(input: {
   function onHeadPhaseMessage(message: ControlMessage): void {
     if (message.type === "paseo.web.response.head") onHead(message);
     else if (message.type === "paseo.web.revoke") fail(502, "session_revoked");
-    else if (message.type === "paseo.web.response.error") fail(502, message.code);
-    else fail(502, "bridge_error");
+    else if (message.type === "paseo.web.response.error") {
+      fail(502, message.code, message.reason ?? null);
+    } else fail(502, "bridge_error");
   }
 
   headTimer = setTimeout(() => {
