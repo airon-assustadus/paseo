@@ -899,3 +899,127 @@ describe("web proxy fixture", () => {
     });
   });
 });
+
+function headerValues(raw: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < raw.length; index += 2) {
+    if (raw[index].toLowerCase() === name) values.push(raw[index + 1]);
+  }
+  return values;
+}
+
+describe("held posts and repeated headers", () => {
+  it("holds a POST response until released and records arrival, effect and release (D-FIX-1)", async () => {
+    const pending = open(`${main.http.baseUrl}/post/held-1?hold=1&n=held-1`, {
+      method: "POST",
+      body: "submit",
+    });
+    let responded = false;
+    void pending.then(() => {
+      responded = true;
+      return undefined;
+    });
+    expect(await main.events.waitFor("post.arrived", (e) => e.nonce === "held-1")).toMatchObject({
+      token: "held-1",
+      held: true,
+    });
+    expect(await main.events.waitFor("post.count", (e) => e.nonce === "held-1")).toMatchObject({
+      count: 1,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(responded).toBe(false);
+    expect(main.postCount("held-1")).toBe(1);
+
+    expect(main.releasePost("held-1")).toBe(1);
+    const { res } = await pending;
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse((await collect(res)).toString("utf8"))).toEqual({
+      token: "held-1",
+      count: 1,
+      held: true,
+    });
+    expect(await main.events.waitFor("post.released", (e) => e.nonce === "held-1")).toMatchObject({
+      token: "held-1",
+      delivered: true,
+    });
+    expect(main.releasePost("held-1")).toBe(0);
+    const plain = await requestJson<{ count: number }>(
+      `${main.http.baseUrl}/post/held-1?n=held-1b`,
+      {
+        method: "POST",
+      },
+    );
+    expect(plain.json).toEqual({ token: "held-1", count: 2 });
+    expect(await main.events.waitFor("post.arrived", (e) => e.nonce === "held-1b")).toMatchObject({
+      held: false,
+    });
+  });
+
+  it("records an undelivered release when the client left before the barrier opened", async () => {
+    const url = new URL(`${main.http.baseUrl}/post/held-2?hold=1&n=held-2`);
+    const req = http.request({
+      host: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
+      method: "POST",
+    });
+    req.on("error", () => undefined);
+    req.end("submit");
+    await main.events.waitFor("post.count", (e) => e.nonce === "held-2");
+    req.destroy();
+    await main.events.waitFor("post.abandoned", (e) => e.nonce === "held-2");
+
+    expect(main.releasePost("held-2")).toBe(1);
+    expect(await main.events.waitFor("post.released", (e) => e.nonce === "held-2")).toMatchObject({
+      token: "held-2",
+      delivered: false,
+    });
+  });
+
+  it("caps the number of held posts", async () => {
+    const fixture = await startWebProxyFixture({ limits: { maxHeldPosts: 1 } });
+    try {
+      const first = open(`${fixture.http.baseUrl}/post/cap?hold=1&n=cap-1`, { method: "POST" });
+      await fixture.events.waitFor("post.count", (e) => e.nonce === "cap-1");
+      const second = await requestJson<{ error: string }>(
+        `${fixture.http.baseUrl}/post/cap?hold=1&n=cap-2`,
+        {
+          method: "POST",
+        },
+      );
+      expect(second).toMatchObject({ status: 429, json: { error: "too_many_held", limit: 1 } });
+      expect(fixture.releasePost("cap")).toBe(1);
+      expect((await first).res.statusCode).toBe(200);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("sends two Location lines and repeated headers in order (D-FIX-2)", async () => {
+    const duplicate = await open(`${main.http.baseUrl}/headers/duplicate?n=dup-1`);
+    await collect(duplicate.res);
+    expect(duplicate.res.statusCode).toBe(302);
+    expect(headerValues(duplicate.res.rawHeaders, "location")).toEqual([
+      "/redirect/landing?n=dup-1&which=first",
+      "/redirect/landing?n=dup-1&which=second",
+    ]);
+    expect(duplicate.res.headers.location).toBe("/redirect/landing?n=dup-1&which=first");
+    expect(headerValues(duplicate.res.rawHeaders, "vary")).toEqual(["Accept-Encoding", "Origin"]);
+    expect(headerValues(duplicate.res.rawHeaders, "link")).toEqual([
+      "</a.css>; rel=preload; as=style",
+      "</b.js>; rel=preload; as=script",
+    ]);
+    expect(headerValues(duplicate.res.rawHeaders, "cache-control")).toEqual([
+      "no-store",
+      "private",
+    ]);
+
+    const repeated = await open(`${main.http.baseUrl}/headers/repeated?n=rep-1`);
+    expect((await collect(repeated.res)).toString("utf8")).toBe("repeated headers\n");
+    expect(repeated.res.statusCode).toBe(200);
+    expect(headerValues(repeated.res.rawHeaders, "location")).toEqual([]);
+    expect(headerValues(repeated.res.rawHeaders, "vary")).toEqual(["Accept-Encoding", "Origin"]);
+    expect(headerValues(repeated.res.rawHeaders, "link")).toHaveLength(2);
+  });
+});
