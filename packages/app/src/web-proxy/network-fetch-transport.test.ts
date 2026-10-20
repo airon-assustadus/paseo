@@ -393,6 +393,64 @@ describe("requests", () => {
   });
 });
 
+describe("request frame bounds", () => {
+  // The host checks the frame in string units: URL length, header name length, and the sum of
+  // name and value lengths against the agreed maxRequestHeadBytes (1024 in LIMITS).
+  const base = `${DESTINATION}/app/`;
+  const urlAtLimit = base + "a".repeat(8192 - base.length);
+  // "é" serializes as "%C3%A9": 1360 of them plus padding land exactly on 8192 characters.
+  const encodedAtLimit = new URL(base + "é".repeat(1360) + "a".repeat(8192 - base.length - 8160))
+    .href;
+  const encodedOverLimit = new URL(base + "é".repeat(1400)).href;
+
+  it("builds the boundary URLs on the limit", () => {
+    expect(urlAtLimit).toHaveLength(8192);
+    expect(encodedAtLimit).toHaveLength(8192);
+    expect(encodedOverLimit.length).toBeGreaterThan(8192);
+  });
+
+  function pair(name: string, value: string): [string, string] {
+    return [name, value];
+  }
+
+  it.each([
+    { name: "a URL at the limit", input: { url: urlAtLimit } },
+    { name: "a percent-encoded URL at the limit", input: { url: encodedAtLimit } },
+    { name: "headers at the agreed budget", input: { headers: [pair("x-a", "v".repeat(1021))] } },
+    { name: "a header name at the limit", input: { headers: [pair("n".repeat(256), "")] } },
+  ])("sends $name unchanged", async ({ input }) => {
+    const session = await openSession();
+    void send(session, input);
+    const [frame] = framesOfType(session.channel, "request");
+    expect(frame).toMatchObject({ requestId: 1, ...input });
+    expect(frame?.url.length).toBeLessThanOrEqual(8192);
+  });
+
+  it.each([
+    { name: "a URL one character over", input: { url: `${urlAtLimit}a` } },
+    { name: "a URL over the limit only once percent-encoded", input: { url: encodedOverLimit } },
+    {
+      name: "headers one character over the agreed budget",
+      input: { headers: [pair("x-a", "v".repeat(1022))] },
+    },
+    { name: "a header name one character over", input: { headers: [pair("n".repeat(257), "")] } },
+  ])("refuses $name alone, before it takes an id", async ({ input }) => {
+    const session = await openSession();
+    const other = send(session);
+    const error = await send(session, input).catch((caught: unknown) => caught);
+    expect(brokerViewOf(error)).toEqual({ code: "transport_error", reason: "limit" });
+    void send(session);
+    expect(framesOfType(session.channel, "request").map((frame) => frame.requestId)).toEqual([
+      1, 2,
+    ]);
+
+    session.channel.deliver(headFrame(1));
+    expect((await other).status).toBe(200);
+    expect(framesOfType(session.channel, "close")).toEqual([]);
+    expect(session.closedReasons).toEqual([]);
+  });
+});
+
 describe("response credit", () => {
   it("grants credit only for chunks the consumer pulled", async () => {
     const session = await openSession();
