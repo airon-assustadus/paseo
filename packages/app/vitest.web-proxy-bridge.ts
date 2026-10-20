@@ -1,12 +1,14 @@
+import { realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import type { Plugin } from "esbuild";
 
 /**
- * Vitest browser command that starts the web proxy bridge host on first use (adapter contract §7).
- * Runs in the Vitest Node process. The host and esbuild load inside the first call, so a run whose
- * tests never ask for the bridge opens nothing. Takes no input from the browser: the page origin,
- * the shell entries and the host module are all decided here, and only the host's public
+ * Vitest browser commands that start the web proxy bridge host on first use (adapter contract §7),
+ * directly or behind the local relay stack (relay-r2-command-plan.md). They run in the Vitest Node
+ * process. The host, the stack and esbuild load inside the first call, so a run whose tests never
+ * ask for them opens nothing. They take no input from the browser beyond a validated nonce: the
+ * page origin, the shell entries and the modules are all decided here, and only a closed public
  * description crosses back to the page.
  */
 
@@ -31,9 +33,49 @@ export interface WebProxyBridgeInfo {
   shell: BridgeShellInfo;
 }
 
+/**
+ * What the relay page receives. Every field is connection authority (the pairing offer plus the
+ * host token): it stays in the test page and never reaches content, the worker, logs or evidence.
+ */
+export interface WebProxyRelayInfo {
+  /** "127.0.0.1:<port>" of the client-leg tap, without a scheme; TLS is off. */
+  relay: { endpoint: string };
+  daemon: { serverId: string; daemonPublicKeyB64: string };
+  bridge: {
+    tcpPort: number;
+    token: string;
+    allowedOrigin: string;
+    fixture: BridgeFixtureInfo;
+    shell: BridgeShellInfo;
+  };
+  /** The server's length-prefixed codec, served by this browser server: "/@fs" + its real path. */
+  codecModuleUrl: string;
+}
+
+export type RelayTapDirection = "toTarget" | "fromTarget";
+
+/** One relay leg as the stack's taps saw it: counts, booleans and handshake names only. */
+export interface WebProxyRelayLegEvidence {
+  connections: number;
+  messages: number;
+  nonHandshakeMessages: number;
+  handshake: Array<"e2ee_hello" | "e2ee_ready">;
+  bytes: Record<RelayTapDirection, number>;
+  overflow: { direction: RelayTapDirection; limit: number } | null;
+  contains: Record<"nonce" | "token" | "hello", Record<RelayTapDirection, boolean>>;
+}
+
+export interface WebProxyRelayEvidence {
+  clientLeg: WebProxyRelayLegEvidence;
+  daemonLeg: WebProxyRelayLegEvidence;
+}
+
 declare module "vitest/browser" {
   interface BrowserCommands {
     webProxyBridge(): Promise<WebProxyBridgeInfo>;
+    webProxyRelayBridge(): Promise<WebProxyRelayInfo>;
+    webProxyRelayRestart(): Promise<void>;
+    webProxyRelayEvidence(nonce: string): Promise<WebProxyRelayEvidence>;
   }
 }
 
@@ -62,7 +104,19 @@ export type WebProxyBridgeProblem =
   | "no_browser_origin"
   | "host_module_invalid"
   | "host_result_invalid"
-  | "closed_during_start";
+  | "closed_during_start"
+  | "codec_module_invalid"
+  | "stack_module_invalid"
+  | "relay_start_failed"
+  | "relay_result_invalid"
+  | "relay_not_started"
+  | "relay_not_ready"
+  | "relay_busy"
+  | "relay_failed"
+  | "relay_closed"
+  | "relay_restart_failed"
+  | "relay_evidence_failed"
+  | "invalid_nonce";
 
 export class WebProxyBridgeError extends Error {
   constructor(
@@ -93,6 +147,8 @@ export const BRIDGE_SHELL_LAYOUT = {
 } as const;
 
 const HOST_MODULE = "../server/src/server/network-fetch/__fixtures__/bridge-host.ts";
+const STACK_MODULE = "../server/src/server/network-fetch/__fixtures__/relay-bridge-stack.ts";
+const CODEC_MODULE = "../server/src/server/network-fetch/__fixtures__/length-prefixed.ts";
 const SHELL_SOURCES = {
   bootstrap: "src/web-proxy/shell/bootstrap.web.ts",
   worker: "src/web-proxy/shell/worker.web.ts",
@@ -273,6 +329,368 @@ export function createWebProxyBridgeCommand(options: WebProxyBridgeOptions) {
   };
 }
 
+export interface RelayStackOptions {
+  shell: BridgeShellBundle;
+  allowedOrigin: string;
+}
+
+export interface WebProxyRelayOptions {
+  stackModulePath: string;
+  codecModulePath: string;
+  /** The codec must resolve inside this directory, which the browser server already serves. */
+  servedRoot: string;
+  bundleShell(controlOrigin: string): Promise<BridgeShellBundle>;
+}
+
+const RELAY_ENDPOINT = /^127\.0\.0\.1:([1-9]\d{0,4})$/;
+const SERVER_ID = /^srv_[A-Za-z0-9_-]{12}$/;
+/** 32-byte box public key, standard base64. */
+const DAEMON_PUBLIC_KEY = /^[A-Za-z0-9+/]{43}=$/;
+const NONCE = /^[A-Za-z0-9_-]{8,64}$/;
+const STACK_STEPS = ["relay", "taps", "daemon", "registration", "offer", "host"] as const;
+const DIRECTIONS = ["toTarget", "fromTarget"] as const;
+const MARKERS = ["nonce", "token", "hello"] as const;
+
+/** The codec URL is computed here, never chosen by the page, and only for a file already served. */
+function resolveCodecModuleUrl(modulePath: string, servedRoot: string): string {
+  let real: string;
+  let root: string;
+  try {
+    real = realpathSync(modulePath);
+    root = realpathSync(servedRoot);
+  } catch {
+    throw new WebProxyBridgeError("codec_module_invalid", "The codec module does not exist");
+  }
+  const relative = path.relative(root, real);
+  const isInside =
+    relative !== "" && !path.isAbsolute(relative) && relative.split(path.sep)[0] !== "..";
+  if (!isInside || path.extname(real) !== ".ts") {
+    throw new WebProxyBridgeError(
+      "codec_module_invalid",
+      "The codec module is not inside the served root",
+    );
+  }
+  return `/@fs${real}`;
+}
+
+type StartRelayStack = (options: RelayStackOptions) => Promise<unknown>;
+
+function stackStarter(module: unknown): StartRelayStack {
+  const start: unknown = isRecord(module) ? module.startRelayBridgeStack : undefined;
+  if (typeof start !== "function") {
+    throw new WebProxyBridgeError(
+      "stack_module_invalid",
+      "The relay stack module does not export startRelayBridgeStack",
+    );
+  }
+  return async (options) => start(options);
+}
+
+/** The page learns which step failed, never the cause: it can carry log lines, ports or paths. */
+function stackStartFailure(error: unknown): WebProxyBridgeError {
+  const step = isRecord(error) ? error.step : undefined;
+  const known = STACK_STEPS.find((candidate) => candidate === step);
+  const message = known
+    ? `The relay stack failed at step "${known}"`
+    : "The relay stack failed to start";
+  return new WebProxyBridgeError("relay_start_failed", message);
+}
+
+function isPort(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65_535;
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isBoolean(value: unknown): value is boolean {
+  return typeof value === "boolean";
+}
+
+function isHandshake(value: unknown): value is "e2ee_hello" | "e2ee_ready" {
+  return value === "e2ee_hello" || value === "e2ee_ready";
+}
+
+function matches(value: unknown, pattern: RegExp): value is string {
+  return typeof value === "string" && pattern.test(value);
+}
+
+type RelayStackInfo = Omit<WebProxyRelayInfo, "codecModuleUrl">;
+
+function parseRelayEndpoint(value: unknown): string | null {
+  const match = typeof value === "string" ? RELAY_ENDPOINT.exec(value) : null;
+  return match !== null && isPort(Number(match[1])) ? match[0] : null;
+}
+
+function parseRelayInfo(value: unknown, allowedOrigin: string): RelayStackInfo | null {
+  if (!isRecord(value) || !isRecord(value.relay)) return null;
+  if (!isRecord(value.daemon) || !isRecord(value.bridge)) return null;
+  const endpoint = parseRelayEndpoint(value.relay.endpoint);
+  const { serverId, daemonPublicKeyB64 } = value.daemon;
+  const { tcpPort, token } = value.bridge;
+  const fixture = parseFixture(value.bridge.fixture);
+  const shell = parseShell(value.bridge.shell);
+  if (endpoint === null || !matches(serverId, SERVER_ID)) return null;
+  if (!matches(daemonPublicKeyB64, DAEMON_PUBLIC_KEY)) return null;
+  if (!isPort(tcpPort) || !matches(token, TOKEN) || value.bridge.allowedOrigin !== allowedOrigin) {
+    return null;
+  }
+  if (fixture === null || shell === null) return null;
+  return {
+    relay: { endpoint },
+    daemon: { serverId, daemonPublicKeyB64 },
+    bridge: { tcpPort, token, allowedOrigin, fixture, shell },
+  };
+}
+
+function parseDirections<T>(
+  value: unknown,
+  isValue: (entry: unknown) => entry is T,
+): Record<RelayTapDirection, T> | null {
+  if (!isRecord(value)) return null;
+  const { toTarget, fromTarget } = value;
+  return isValue(toTarget) && isValue(fromTarget) ? { toTarget, fromTarget } : null;
+}
+
+function parseOverflow(value: unknown): WebProxyRelayLegEvidence["overflow"] | undefined {
+  if (value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const direction = DIRECTIONS.find((candidate) => candidate === value.direction);
+  return direction && isCount(value.limit) ? { direction, limit: value.limit } : undefined;
+}
+
+function parseContains(value: unknown): WebProxyRelayLegEvidence["contains"] | null {
+  if (!isRecord(value)) return null;
+  const [nonce, token, hello] = MARKERS.map((marker) => parseDirections(value[marker], isBoolean));
+  return nonce && token && hello ? { nonce, token, hello } : null;
+}
+
+function parseLeg(value: unknown): WebProxyRelayLegEvidence | null {
+  if (!isRecord(value)) return null;
+  const { connections, messages, nonHandshakeMessages, handshake } = value;
+  if (!isCount(connections) || !isCount(messages) || !isCount(nonHandshakeMessages)) return null;
+  if (!Array.isArray(handshake) || !handshake.every(isHandshake)) return null;
+  const bytes = parseDirections(value.bytes, isCount);
+  const overflow = parseOverflow(value.overflow);
+  const contains = parseContains(value.contains);
+  if (bytes === null || overflow === undefined || contains === null) return null;
+  return {
+    connections,
+    messages,
+    nonHandshakeMessages,
+    handshake: [...handshake],
+    bytes,
+    overflow,
+    contains,
+  };
+}
+
+function parseEvidence(value: unknown): WebProxyRelayEvidence | null {
+  if (!isRecord(value)) return null;
+  const clientLeg = parseLeg(value.clientLeg);
+  const daemonLeg = parseLeg(value.daemonLeg);
+  return clientLeg && daemonLeg ? { clientLeg, daemonLeg } : null;
+}
+
+/** The three operations the commands use; host, daemon, relay and taps stay out of reach. */
+interface RelayStack {
+  restart(): Promise<void>;
+  evidence(nonce: string): Promise<unknown>;
+  close(): Promise<void>;
+}
+
+interface ParsedStack {
+  /** Present whenever the result can be shut down, even if the rest of it is malformed. */
+  close: (() => Promise<void>) | null;
+  stack: RelayStack | null;
+  info: RelayStackInfo | null;
+}
+
+function parseStack(value: unknown, allowedOrigin: string): ParsedStack {
+  if (!isRecord(value)) return { close: null, stack: null, info: null };
+  const { close, restartRelay, evidence } = value;
+  if (typeof close !== "function") return { close: null, stack: null, info: null };
+  const shutdown = async () => {
+    await close.call(value);
+  };
+  const info = parseRelayInfo(value.info, allowedOrigin);
+  if (typeof restartRelay !== "function" || typeof evidence !== "function" || info === null) {
+    return { close: shutdown, stack: null, info: null };
+  }
+  const stack: RelayStack = {
+    restart: async () => {
+      await restartRelay.call(value);
+    },
+    evidence: async (nonce) => evidence.call(value, { nonce }),
+    close: shutdown,
+  };
+  return { close: shutdown, stack, info };
+}
+
+type RelayPhase =
+  | { state: "starting" }
+  | { state: "ready"; stack: RelayStack }
+  | { state: "restarting"; stack: RelayStack }
+  /** A failed restart keeps its stack, so the run's close still shuts it down. */
+  | { state: "failed"; stack: RelayStack | null }
+  | { state: "closed" };
+
+interface RelayRun {
+  phase: RelayPhase;
+}
+
+/** Read through a function so a check after an await is not narrowed by the assignment before it. */
+function isRunClosed(run: RelayRun): boolean {
+  return run.phase.state === "closed";
+}
+
+function readyStack(run: RelayRun): RelayStack {
+  switch (run.phase.state) {
+    case "starting":
+      throw new WebProxyBridgeError("relay_not_ready", "The relay stack is still starting");
+    case "restarting":
+      throw new WebProxyBridgeError("relay_busy", "The relay is restarting");
+    case "failed":
+      throw new WebProxyBridgeError("relay_failed", "The relay stack failed");
+    case "closed":
+      throw new WebProxyBridgeError("relay_closed", "The relay stack is closed");
+    case "ready":
+      return run.phase.stack;
+  }
+}
+
+function unexpectedArguments(command: string): WebProxyBridgeError {
+  return new WebProxyBridgeError("unexpected_arguments", `${command} takes no arguments`);
+}
+
+export function createWebProxyRelayCommands(options: WebProxyRelayOptions) {
+  const runs = new WeakMap<object, { run: RelayRun; info: Promise<WebProxyRelayInfo> }>();
+
+  async function start(context: BridgeCommandContext, run: RelayRun): Promise<WebProxyRelayInfo> {
+    // Registered before anything opens, so a run that ends mid-start still releases the stack.
+    context.project.vitest.onClose(async () => {
+      const previous = run.phase;
+      run.phase = { state: "closed" };
+      if ("stack" in previous) await previous.stack?.close();
+    });
+    try {
+      const allowedOrigin = browserOrigin(context);
+      const codecModuleUrl = resolveCodecModuleUrl(options.codecModulePath, options.servedRoot);
+      const shell = await options.bundleShell(allowedOrigin);
+      const startStack = stackStarter(await context.project.import(options.stackModulePath));
+      if (isRunClosed(run)) {
+        throw new WebProxyBridgeError(
+          "closed_during_start",
+          "Vitest closed before the stack started",
+        );
+      }
+      let started: unknown;
+      try {
+        started = await startStack({ shell, allowedOrigin });
+      } catch (error) {
+        throw stackStartFailure(error);
+      }
+      const parsed = parseStack(started, allowedOrigin);
+      if (parsed.stack === null || parsed.info === null) {
+        await parsed.close?.();
+        throw new WebProxyBridgeError(
+          "relay_result_invalid",
+          "The relay stack did not return its decided public description and operations",
+        );
+      }
+      if (isRunClosed(run)) {
+        await parsed.stack.close();
+        throw new WebProxyBridgeError(
+          "closed_during_start",
+          "Vitest closed while the stack started",
+        );
+      }
+      run.phase = { state: "ready", stack: parsed.stack };
+      return { ...parsed.info, codecModuleUrl };
+    } catch (error) {
+      if (!isRunClosed(run)) run.phase = { state: "failed", stack: null };
+      throw error;
+    }
+  }
+
+  function webProxyRelayBridge(
+    context: BridgeCommandContext,
+    ...payload: unknown[]
+  ): Promise<WebProxyRelayInfo> {
+    if (payload.length > 0) return Promise.reject(unexpectedArguments("webProxyRelayBridge"));
+    const vitest = context.project.vitest;
+    let entry = runs.get(vitest);
+    if (!entry) {
+      const run: RelayRun = { phase: { state: "starting" } };
+      // A failed start stays the answer for this run: tests see the same error, never a retry.
+      entry = { run, info: start(context, run) };
+      runs.set(vitest, entry);
+    }
+    // After a failed restart the stack exists but is unusable; a failed start keeps its own error.
+    const { phase } = entry.run;
+    if (phase.state === "failed" && phase.stack !== null) {
+      return Promise.reject(new WebProxyBridgeError("relay_failed", "The relay stack failed"));
+    }
+    return entry.info;
+  }
+
+  async function webProxyRelayRestart(
+    context: BridgeCommandContext,
+    ...payload: unknown[]
+  ): Promise<void> {
+    if (payload.length > 0) throw unexpectedArguments("webProxyRelayRestart");
+    const entry = runs.get(context.project.vitest);
+    if (!entry) throw new WebProxyBridgeError("relay_not_started", "No relay stack was started");
+    const { run } = entry;
+    const stack = readyStack(run);
+    run.phase = { state: "restarting", stack };
+    try {
+      await stack.restart();
+    } catch {
+      if (isRunClosed(run))
+        throw new WebProxyBridgeError("relay_closed", "The relay stack is closed");
+      run.phase = { state: "failed", stack };
+      throw new WebProxyBridgeError("relay_restart_failed", "The relay did not come back");
+    }
+    if (isRunClosed(run))
+      throw new WebProxyBridgeError("relay_closed", "The relay stack is closed");
+    run.phase = { state: "ready", stack };
+  }
+
+  async function webProxyRelayEvidence(
+    context: BridgeCommandContext,
+    ...payload: unknown[]
+  ): Promise<WebProxyRelayEvidence> {
+    if (payload.length !== 1) {
+      throw new WebProxyBridgeError("unexpected_arguments", "webProxyRelayEvidence takes a nonce");
+    }
+    const [nonce] = payload;
+    if (!matches(nonce, NONCE)) {
+      throw new WebProxyBridgeError("invalid_nonce", "The nonce must match [A-Za-z0-9_-]{8,64}");
+    }
+    const entry = runs.get(context.project.vitest);
+    if (!entry) throw new WebProxyBridgeError("relay_not_started", "No relay stack was started");
+    const stack = readyStack(entry.run);
+    let collected: unknown;
+    try {
+      collected = await stack.evidence(nonce);
+    } catch {
+      throw new WebProxyBridgeError(
+        "relay_evidence_failed",
+        "The relay stack refused the evidence",
+      );
+    }
+    const evidence = parseEvidence(collected);
+    if (evidence === null) {
+      throw new WebProxyBridgeError("relay_result_invalid", "The relay evidence is not as decided");
+    }
+    return evidence;
+  }
+
+  return { webProxyRelayBridge, webProxyRelayRestart, webProxyRelayEvidence };
+}
+
 /** The esbuild the app declares, not whichever copy the workspace root hoisted. */
 export function resolveAppEsbuild(appRoot: string): typeof import("esbuild") {
   return createRequire(path.join(appRoot, "package.json"))("esbuild");
@@ -368,6 +786,16 @@ export function createShellBundler(
 export function webProxyBridgeCommandFor(appRoot: string) {
   return createWebProxyBridgeCommand({
     hostModulePath: path.resolve(appRoot, HOST_MODULE),
+    bundleShell: createShellBundler(appRoot),
+  });
+}
+
+/** The relay commands as the app's browser project registers them; the worktree root is served. */
+export function webProxyRelayCommandsFor(appRoot: string) {
+  return createWebProxyRelayCommands({
+    stackModulePath: path.resolve(appRoot, STACK_MODULE),
+    codecModulePath: path.resolve(appRoot, CODEC_MODULE),
+    servedRoot: path.resolve(appRoot, "../.."),
     bundleShell: createShellBundler(appRoot),
   });
 }
