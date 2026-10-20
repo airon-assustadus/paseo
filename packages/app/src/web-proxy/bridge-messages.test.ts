@@ -53,6 +53,31 @@ describe("parseContentMessage", () => {
 });
 
 describe("parseControlMessage", () => {
+  const error = {
+    type: "paseo.web.response.error",
+    v: 1,
+    generation: 1,
+    requestId: 1,
+    code: "transport_error",
+  };
+
+  it("accepts an error with or without a reason from the closed list", () => {
+    expect(parseControlMessage(error)).toEqual(error);
+    expect(parseControlMessage({ ...error, reason: "tls_error" })).toEqual({
+      ...error,
+      reason: "tls_error",
+    });
+  });
+
+  it.each([
+    ["an unknown reason", { ...error, reason: "dial 10.0.0.5 refused" }],
+    ["a non-string reason", { ...error, reason: 1 }],
+    ["an undefined reason key", { ...error, reason: undefined }],
+    ["a message field", { ...error, reason: "timeout", message: "socket hang up" }],
+  ])("rejects an error with %s", (_label, message) => {
+    expect(parseControlMessage(message)).toBeNull();
+  });
+
   it("rejects a head with an unconstructible status", () => {
     expect(
       parseControlMessage({
