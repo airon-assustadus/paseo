@@ -40,18 +40,53 @@ export interface LengthPrefixedReaderOptions {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
+/** A ceiling outside 1..65 536 or not an integer (NaN, Infinity, fractions) is a configuration error. */
+function assertFrameCeiling(maxFrameBytes: number): void {
+  if (
+    !Number.isSafeInteger(maxFrameBytes) ||
+    maxFrameBytes < 1 ||
+    maxFrameBytes > MAX_LENGTH_PREFIXED_FRAME_BYTES
+  ) {
+    throw new RangeError(
+      `maxFrameBytes must be an integer from 1 to ${MAX_LENGTH_PREFIXED_FRAME_BYTES}`,
+    );
+  }
+}
+
+/** UTF-8 length without allocating; stops counting once `limit` is exceeded. */
+function utf8Length(text: string, limit: number): number {
+  let bytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      // A surrogate pair is one 4-byte code point; a lone surrogate encodes as U+FFFD (3 bytes).
+      const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else bytes += 3;
+    } else bytes += 3;
+    if (bytes > limit) return bytes;
+  }
+  return bytes;
+}
+
 export function encodeLengthPrefixed(
   text: string,
   maxFrameBytes = MAX_LENGTH_PREFIXED_FRAME_BYTES,
 ): Uint8Array {
-  const payload = encoder.encode(text);
-  if (payload.length === 0) throw new LengthPrefixedError("zero_length", 0);
-  if (payload.length > maxFrameBytes) {
-    throw new LengthPrefixedError("frame_too_large", payload.length);
-  }
-  const frame = new Uint8Array(LENGTH_PREFIX_BYTES + payload.length);
-  new DataView(frame.buffer).setUint32(0, payload.length, false);
-  frame.set(payload, LENGTH_PREFIX_BYTES);
+  assertFrameCeiling(maxFrameBytes);
+  if (text.length === 0) throw new LengthPrefixedError("zero_length", 0);
+  // UTF-8 never needs fewer bytes than UTF-16 code units, so this rejects before any counting.
+  if (text.length > maxFrameBytes) throw new LengthPrefixedError("frame_too_large", null);
+  const length = utf8Length(text, maxFrameBytes);
+  if (length > maxFrameBytes) throw new LengthPrefixedError("frame_too_large", length);
+  const frame = new Uint8Array(LENGTH_PREFIX_BYTES + length);
+  new DataView(frame.buffer).setUint32(0, length, false);
+  const written = encoder.encodeInto(text, frame.subarray(LENGTH_PREFIX_BYTES)).written;
+  if (written !== length) throw new LengthPrefixedError("frame_too_large", written);
   return frame;
 }
 
@@ -66,7 +101,10 @@ export class LengthPrefixedReader {
   private poisonedBy: LengthPrefixedViolation | null = null;
 
   constructor(options: LengthPrefixedReaderOptions) {
-    this.maxFrameBytes = options.maxFrameBytes ?? MAX_LENGTH_PREFIXED_FRAME_BYTES;
+    const maxFrameBytes = options.maxFrameBytes ?? MAX_LENGTH_PREFIXED_FRAME_BYTES;
+    // Checked before the buffer exists: a bad ceiling must not allocate anything.
+    assertFrameCeiling(maxFrameBytes);
+    this.maxFrameBytes = maxFrameBytes;
     this.onFrame = options.onFrame;
     this.partial = new Uint8Array(LENGTH_PREFIX_BYTES + this.maxFrameBytes);
     this.header = new DataView(this.partial.buffer, 0, LENGTH_PREFIX_BYTES);

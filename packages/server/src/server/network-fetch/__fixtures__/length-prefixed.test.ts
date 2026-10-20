@@ -119,6 +119,39 @@ describe("length-prefixed codec", () => {
     );
   });
 
+  it.each([
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["negative", -1],
+    ["fraction", 1.5],
+    ["zero", 0],
+    ["above the protocol ceiling", MAX_LENGTH_PREFIXED_FRAME_BYTES + 1],
+  ])(
+    "rejects a %s ceiling in the encoder and the reader before allocating (RC-1)",
+    (_name, ceiling) => {
+      expect(() => encodeLengthPrefixed("a", ceiling)).toThrow(RangeError);
+      expect(
+        () => new LengthPrefixedReader({ maxFrameBytes: ceiling, onFrame: () => undefined }),
+      ).toThrow(RangeError);
+    },
+  );
+
+  it("measures UTF-8 size before encoding and never lets a NaN ceiling pass an oversized frame (RC-1)", () => {
+    expect(() => encodeLengthPrefixed("x".repeat(MAX_LENGTH_PREFIXED_FRAME_BYTES + 1))).toThrow(
+      expect.objectContaining({ violation: "frame_too_large" }),
+    );
+    expect(encodeLengthPrefixed("é".repeat(32_768)).length).toBe(LENGTH_PREFIX_BYTES + 65_536);
+    expect(() => encodeLengthPrefixed("é".repeat(32_769))).toThrow(
+      expect.objectContaining({ violation: "frame_too_large" }),
+    );
+    expect(encodeLengthPrefixed("😀".repeat(16_384)).length).toBe(LENGTH_PREFIX_BYTES + 65_536);
+    expect(() => encodeLengthPrefixed("😀".repeat(16_384) + "a")).toThrow(
+      expect.objectContaining({ violation: "frame_too_large" }),
+    );
+    expect(encodeLengthPrefixed("\ud800").length).toBe(LENGTH_PREFIX_BYTES + 3);
+    expect(() => encodeLengthPrefixed("abc", Number.NaN)).toThrow(RangeError);
+  });
+
   it("honours a smaller per-reader ceiling", () => {
     const { frames, reader: target } = reader(16);
     expect(target.push(encodeLengthPrefixed("0123456789abcdef"))).toBe(20);
