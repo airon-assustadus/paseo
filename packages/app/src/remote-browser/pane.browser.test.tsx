@@ -12,6 +12,7 @@ import {
 } from "@getpaseo/client";
 import { i18n as testI18n } from "@/i18n/i18next";
 import { RemoteBrowserPane } from "./pane";
+import { clearRemoteBrowserBindings } from "./registry";
 import { createFakeAttachment, createFakeClient, state } from "./test-utils/fake-remote-browser";
 
 // Load translations so the overlays and buttons expose their real text.
@@ -48,12 +49,15 @@ interface Mounted {
 }
 
 const mounted: Mounted[] = [];
+let tabCounter = 0;
 
 afterEach(() => {
   for (const entry of mounted.splice(0)) {
     act(() => entry.root.unmount());
     entry.container.remove();
   }
+  // A disposed pane keeps its tab→browser binding for a later re-attach; the next test is a new tab.
+  clearRemoteBrowserBindings();
   runtime.supported = true;
   runtime.status = "online";
 });
@@ -72,7 +76,7 @@ function mountPane(props: { isInteractive?: boolean; onFocusPane?: () => void } 
   const root = createRoot(container);
   act(() =>
     root.render(
-      <RemoteBrowserPane browserId={`tab-${mounted.length}`} serverId="host-1" {...props} />,
+      <RemoteBrowserPane browserId={`tab-${tabCounter++}`} serverId="host-1" {...props} />,
     ),
   );
   mounted.push({ root, container });
@@ -87,7 +91,20 @@ function mountPane(props: { isInteractive?: boolean; onFocusPane?: () => void } 
     if (!(element instanceof HTMLElement)) throw new Error("gesture surface is not mounted");
     return element;
   };
-  return { ...fake, container, view, hiddenInput, surface };
+  /** A wheel tick at a pane-local point, dispatched with real client coordinates. */
+  const wheel = (x: number, y: number, deltaY: number) => {
+    const bounds = surface().getBoundingClientRect();
+    surface().dispatchEvent(
+      new WheelEvent("wheel", {
+        deltaY,
+        clientX: bounds.left + x,
+        clientY: bounds.top + y,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  };
+  return { ...fake, container, view, hiddenInput, surface, wheel };
 }
 
 async function openAttachment(
@@ -193,17 +210,11 @@ describe("remote browser pane in a real browser", () => {
     expect(mouse[1].y).toBeCloseTo(50, 0);
     expect(onFocusPane).toHaveBeenCalled();
 
-    pane.surface().dispatchEvent(
-      new WheelEvent("wheel", {
-        deltaY: 120,
-        clientX: 10,
-        clientY: 10,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+    pane.wheel(30, 20, 120);
     await waitFor(() => expect(inputsOfKind(attachment, "wheel")).toHaveLength(1));
     expect(inputsOfKind(attachment, "wheel")[0]).toMatchObject({ deltaX: 0, deltaY: 120 });
+    expect(inputsOfKind(attachment, "wheel")[0].x).toBeCloseTo(30, 0);
+    expect(inputsOfKind(attachment, "wheel")[0].y).toBeCloseTo(20, 0);
   });
 
   it("still focuses the pane but sends nothing while the pane is not interactive", async () => {
@@ -214,7 +225,7 @@ describe("remote browser pane in a real browser", () => {
 
     await userEvent.click(pane.surface(), { position: { x: 40, y: 40 } });
     await waitFor(() => expect(onFocusPane).toHaveBeenCalled());
-    pane.surface().dispatchEvent(new WheelEvent("wheel", { deltaY: 60, bubbles: true }));
+    pane.wheel(40, 40, 60);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(attachment.inputs).toEqual([]);
   });

@@ -97,6 +97,13 @@ export default defineConfig({
       "react-native-reanimated",
       "react-native-gesture-handler",
       "react-native-keyboard-controller",
+      // Reached through @/runtime/host-runtime by any test that renders a host-aware component.
+      // The scanner reads their native entries (JSX in .js, TurboModuleRegistry); unbundled, the
+      // resolver lands on their web files, and tests mock expo-router in vitest.setup.ts anyway.
+      "expo-router",
+      "expo-modules-core",
+      "expo-constants",
+      "expo-file-system",
     ],
   },
   // The globals a React Native bundler defines, which esbuild is no longer there to supply for
