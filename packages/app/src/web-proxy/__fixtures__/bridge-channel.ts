@@ -19,7 +19,35 @@ export const BRIDGE_CHANNEL_LIMITS = {
   maxEventsPerPage: 128,
   maxBufferedBytes: 1_048_576,
   maxServerNames: 16,
+  // The lab host's own ceilings (bridge-host.ts, routes.ts): the core accepts a longer TTL,
+  // the bridge host closes a session that asks for more (BF-3).
+  maxSessionTtlMs: 300_000,
+  maxHeldPosts: 64,
 } as const;
+
+// The recorder's kinds as the host accepts them (bridge-host.ts FIXTURE_EVENT_KINDS). Mirrored,
+// not imported: the app does not depend on the server package.
+export const FIXTURE_EVENT_KINDS = [
+  "request",
+  "canary.hit",
+  "slow.closed",
+  "large.closed",
+  "upload.finished",
+  "sse.closed",
+  "ws.opened",
+  "ws.closed",
+  "redirect.landing",
+  "probe.report",
+  "post.count",
+  "post.arrived",
+  "post.released",
+  "post.abandoned",
+] as const;
+
+export type FixtureEventKind = (typeof FIXTURE_EVENT_KINDS)[number];
+
+// The fixture's POST token, as the host validates it before releasing held responses.
+const POST_TOKEN = /^[A-Za-z0-9_-]{1,64}$/;
 
 // Client close codes: a browser WebSocket only accepts 1000 and 3000–4999.
 const CLOSE_NORMAL = 1000;
@@ -51,9 +79,10 @@ export interface HarnessStats {
 
 export interface BridgeHarness {
   fixture: BridgeFixtureInfo;
-  events(query: { kind?: string; after?: number }): Promise<FixtureEventsPage>;
+  events(query: { kind?: FixtureEventKind; after?: number }): Promise<FixtureEventsPage>;
   stats(requestId: number): Promise<HarnessStats>;
-  release(token: string): Promise<boolean>;
+  // How many held POST responses for `token` the fixture released.
+  release(token: string): Promise<number>;
 }
 
 export interface BridgeConnection {
@@ -94,7 +123,7 @@ export class BridgeChannelError extends Error {
 }
 
 export class BridgeChannelUsageError extends Error {
-  constructor(readonly problem: "listen_twice" | "query_pending") {
+  constructor(readonly problem: "listen_twice" | "query_pending" | "invalid_query") {
     super(`Bridge channel misused: ${problem}`);
     this.name = "BridgeChannelUsageError";
   }
@@ -434,6 +463,11 @@ export function openBridgeChannel(options: OpenBridgeChannelOptions): Promise<Br
     return {
       fixture,
       async events(input) {
+        // Refused here, without a frame: the host would end the whole session for it (BF-4).
+        const isKindValid = input.kind === undefined || FIXTURE_EVENT_KINDS.includes(input.kind);
+        if (!isKindValid || (input.after !== undefined && !isCount(input.after))) {
+          throw new BridgeChannelUsageError("invalid_query");
+        }
         const frame = await query("fixture.events.result", { type: "fixture.events", ...input });
         const { events, next, more, dropped } = frame;
         if (!hasKeys(frame, ["type", "events", "next", "more", "dropped"])) return invalid();
@@ -448,6 +482,8 @@ export function openBridgeChannel(options: OpenBridgeChannelOptions): Promise<Br
         return { events, next, more, dropped };
       },
       async stats(requestId) {
+        if (!isCount(requestId) || requestId === 0)
+          throw new BridgeChannelUsageError("invalid_query");
         const frame = await query("harness.stats.result", { type: "harness.stats", requestId });
         const { delivered, credited, active } = frame;
         const keys = ["type", "requestId", "delivered", "credited", "active"];
@@ -456,13 +492,18 @@ export function openBridgeChannel(options: OpenBridgeChannelOptions): Promise<Br
         return { requestId, delivered, credited, active };
       },
       async release(fixtureToken) {
+        if (!POST_TOKEN.test(fixtureToken)) throw new BridgeChannelUsageError("invalid_query");
         const frame = await query("fixture.release.result", {
           type: "fixture.release",
           token: fixtureToken,
         });
         const { released } = frame;
-        if (!hasKeys(frame, ["type", "released"]) || typeof released !== "boolean")
+        // The answer must name the token this query asked about; one release query is pending
+        // at a time, so any other token is a host fault (BF-1).
+        if (!hasKeys(frame, ["type", "token", "released"]) || frame.token !== fixtureToken) {
           return invalid();
+        }
+        if (!isCount(released) || released > BRIDGE_CHANNEL_LIMITS.maxHeldPosts) return invalid();
         return released;
       },
     };
