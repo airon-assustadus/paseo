@@ -162,7 +162,7 @@ describe("web proxy broker and shell", () => {
     const position = buttonPosition(report);
     await shell.getByTestId("paseo-web-proxy-app").click({ position });
     expect(await waitForMessages(CONTENT_A, "fixture.clicked", 1)).toEqual([
-      { type: "fixture.clicked", count: 1 },
+      { type: "fixture.clicked", count: 1, echo: "POST ?click=1 click" },
     ]);
 
     // The app re-sent hello from the bootstrap's realm and its own: one grant only.
@@ -172,7 +172,18 @@ describe("web proxy broker and shell", () => {
     // Subresources race each other through the worker; the set is what the app asked for.
     const paths = transport.requests.map((request) => new URL(request.url).pathname);
     expect(paths.toSorted()).toEqual(
-      ["/", "/style.css", "/app.js", "/api/echo", "/old", "/new", "/cross", "/big"].toSorted(),
+      [
+        "/",
+        "/style.css",
+        "/app.js",
+        "/api/echo",
+        "/old",
+        "/new",
+        "/cross",
+        "/big",
+        // The click posts once more.
+        "/api/echo",
+      ].toSorted(),
     );
     for (const request of transport.requests) {
       expect(request.url.startsWith(`${FIXTURE_DESTINATION_ORIGIN}/`)).toBe(true);
@@ -188,33 +199,56 @@ describe("web proxy broker and shell", () => {
       transport.requests.map((request) => [new URL(request.url).pathname, request]),
     );
     expect(byPath.get("/")?.initiator.mode).toBe("navigate");
-    expect(byPath.get("/api/echo")?.bodyText).toBe("hello bridge");
+    const echo = transport.requests.find((request) => request.url.endsWith("/api/echo?q=1"));
+    expect(echo?.bodyText).toBe("hello bridge");
   }, 30_000);
 
-  it("admits only the control → bootstrap → app chain and keeps the destination's CSP", async () => {
+  it("serves the app's own frame chain, refuses frames outside it and keeps the destination's CSP", async () => {
     const { transport } = mount({ index: "framing" });
 
-    // C → K → K → K: the app frames another proxied page; its img-src 'none' still applies.
+    // A new frame created by the app has no observable initiator: refused before the transport.
+    expect(await waitForMessages(CONTENT_A, "fixture.child", 1)).toEqual([
+      { type: "fixture.child", text: "Paseo web proxy: client_not_admitted" },
+    ]);
+    // The app navigating itself keeps its session (C → K → K); img-src 'none' still applies.
     const [own] = await waitForMessages(CONTENT_A, "fixture.framed", 1);
     expect(own).toEqual({ type: "fixture.framed", via: "self", blocked: "img-src" });
-    // A destination that forbids framing is refused with a reason, not stripped or left blank.
-    expect(await waitForMessages(CONTENT_A, "fixture.refused", 1)).toEqual([
-      { type: "fixture.refused", text: "Paseo web proxy: embedding_refused" },
-    ]);
 
-    // C → wp-b → K: the worker serves the page, the browser enforces frame-ancestors on it.
+    // C → wp-b → K: a frame placed by a foreign page never reaches the transport.
     const target = `${CONTENT_A}${HARNESS.mountPath}framed?via=foreign`;
     const relay = `${CONTENT_B}${HARNESS.shellPathPrefix}relay.html?target=${encodeURIComponent(target)}`;
     appendFrame(relay);
-    const foreignUrl = `${FIXTURE_DESTINATION_ORIGIN}/framed?via=foreign`;
-    await vi.waitFor(() => expect(requestedUrls(transport)).toContain(foreignUrl), SLOW);
-    // Absence can only be observed by waiting; a loaded page reports within milliseconds.
+    // Absence can only be observed by waiting; a served page reports within milliseconds.
     await new Promise((resolve) => setTimeout(resolve, 1_000));
-    const framed = messagesOf(CONTENT_A, "fixture.framed");
-    expect(framed).toEqual([own]);
-    const paths = transport.requests.map((request) => new URL(request.url).pathname);
-    expect(paths).not.toContain("/pixel.png");
+    expect(messagesOf(CONTENT_A, "fixture.framed")).toEqual([own]);
+    const urls = requestedUrls(transport);
+    expect(urls.filter((url) => url.includes("via=foreign") || url.includes("via=child"))).toEqual(
+      [],
+    );
+    expect(urls.map((url) => new URL(url).pathname)).not.toContain("/pixel.png");
   }, 30_000);
+
+  it("routes two views of one destination to their own transports, also after one is revoked", async () => {
+    const first = mount({ index: "app" });
+    const second = mount({ index: "app" });
+    const reports = await waitForMessages(CONTENT_A, "fixture.report", 2);
+    for (const view of [first, second]) {
+      const paths = view.transport.requests.map((request) => new URL(request.url).pathname);
+      expect(paths.filter((path) => path === "/app.js")).toEqual(["/app.js"]);
+    }
+
+    first.broker.revoke("disposed");
+    const firstCount = first.transport.requests.length;
+    const shell = page.frameLocator(page.elementLocator(currentFrame(second.broker)));
+    await shell.getByTestId("paseo-web-proxy-app").click({ position: buttonPosition(reports[0]) });
+    expect(await waitForMessages(CONTENT_A, "fixture.clicked", 1)).toEqual([
+      { type: "fixture.clicked", count: 1, echo: "POST ?click=1 click" },
+    ]);
+    expect(requestedUrls(second.transport)).toContain(
+      `${FIXTURE_DESTINATION_ORIGIN}/api/echo?click=1`,
+    );
+    expect(first.transport.requests).toHaveLength(firstCount);
+  }, 45_000);
 
   it("refuses the control origin as content origin before creating a frame or a port", () => {
     const transport = createFixtureTransport({ index: "app" });

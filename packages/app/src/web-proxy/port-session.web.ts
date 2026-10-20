@@ -1,6 +1,7 @@
 import {
   parseContentMessage,
   type BridgeErrorCode,
+  type BridgeErrorReason,
   type BridgeLimits,
   type BridgeRevokeReason,
   type ControlMessage,
@@ -12,7 +13,11 @@ import {
   resolveDestinationUrl,
   type WebProxyCapability,
 } from "./request-policy";
-import type { WebProxyTransport, WebProxyTransportResponse } from "./transport";
+import {
+  WebProxyTransportError,
+  type WebProxyTransport,
+  type WebProxyTransportResponse,
+} from "./transport";
 
 export interface PortSessionOptions {
   port: MessagePort;
@@ -46,8 +51,15 @@ export function startPortSession(options: PortSessionOptions): PortSession {
     port.postMessage(message, transfer);
   }
 
-  function sendError(requestId: number, code: BridgeErrorCode): void {
-    send({ type: "paseo.web.response.error", v: 1, generation, requestId, code });
+  function sendError(requestId: number, code: BridgeErrorCode, reason?: BridgeErrorReason): void {
+    const message: ControlMessage = {
+      type: "paseo.web.response.error",
+      v: 1,
+      generation,
+      requestId,
+      code,
+    };
+    send(reason === undefined ? message : { ...message, reason });
   }
 
   function finish(requestId: number, entry: InFlightRequest): void {
@@ -84,6 +96,28 @@ export function startPortSession(options: PortSessionOptions): PortSession {
     }).then(() => waitForCredit(entry, bytes));
   }
 
+  // Returns false when the request was aborted before the body ended.
+  async function pumpBody(input: {
+    requestId: number;
+    entry: InFlightRequest;
+    reader: ReadableStreamDefaultReader<Uint8Array>;
+  }): Promise<boolean> {
+    const { requestId, entry, reader } = input;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (entry.abort.signal.aborted) return false;
+      if (done) return true;
+      for (let offset = 0; offset < value.byteLength; offset += limits.maxChunkBytes) {
+        const piece = value.slice(offset, offset + limits.maxChunkBytes);
+        await waitForCredit(entry, piece.byteLength);
+        if (entry.abort.signal.aborted) return false;
+        entry.unackedBytes += piece.byteLength;
+        const chunk = piece.buffer;
+        send({ type: "paseo.web.response.chunk", v: 1, generation, requestId, chunk }, [chunk]);
+      }
+    }
+  }
+
   async function streamBody(input: {
     requestId: number;
     entry: InFlightRequest;
@@ -91,21 +125,20 @@ export function startPortSession(options: PortSessionOptions): PortSession {
   }): Promise<void> {
     const { requestId, entry } = input;
     const reader = input.body.getReader();
-    entry.abort.signal.addEventListener("abort", () => void reader.cancel(), { once: true });
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (entry.abort.signal.aborted) return;
-      if (done) break;
-      for (let offset = 0; offset < value.byteLength; offset += limits.maxChunkBytes) {
-        const piece = value.slice(offset, offset + limits.maxChunkBytes);
-        await waitForCredit(entry, piece.byteLength);
-        if (entry.abort.signal.aborted) return;
-        entry.unackedBytes += piece.byteLength;
-        const chunk = piece.buffer;
-        send({ type: "paseo.web.response.chunk", v: 1, generation, requestId, chunk }, [chunk]);
-      }
+    const cancellation: { done: Promise<void> | null } = { done: null };
+    function cancelBody(): void {
+      cancellation.done = reader.cancel();
     }
-    send({ type: "paseo.web.response.end", v: 1, generation, requestId });
+    entry.abort.signal.addEventListener("abort", cancelBody, { once: true });
+    try {
+      const completed = await pumpBody({ requestId, entry, reader });
+      if (completed) send({ type: "paseo.web.response.end", v: 1, generation, requestId });
+    } finally {
+      entry.abort.signal.removeEventListener("abort", cancelBody);
+      // The slot is released only once the transport has let go of the body: for a relayed
+      // transport, cancel resolves when the host confirms the upstream request is gone.
+      if (cancellation.done !== null) await cancellation.done;
+    }
   }
 
   async function relayResponse(input: {
@@ -168,10 +201,15 @@ export function startPortSession(options: PortSessionOptions): PortSession {
         return;
       }
       await relayResponse({ message, url, entry, response });
-    } catch {
-      // Any transport or stream failure ends only this request. Its detail stays on the
-      // control side: the content receives a fixed code.
-      if (!entry.abort.signal.aborted) sendError(message.requestId, "transport_error");
+    } catch (error) {
+      // Any transport or stream failure ends only this request. Only a typed transport error
+      // carries a reason, and only from the closed list; the rest is upstream_error.
+      if (entry.abort.signal.aborted) return;
+      if (error instanceof WebProxyTransportError) {
+        sendError(message.requestId, error.code, error.reason);
+        return;
+      }
+      sendError(message.requestId, "transport_error", "upstream_error");
     } finally {
       finish(message.requestId, entry);
     }

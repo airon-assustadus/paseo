@@ -9,13 +9,24 @@ import {
   type ControlMessage,
   type HelloMessage,
 } from "../bridge-messages";
-import { parseShellRequestMessage, readShellFetchFields } from "./relay-messages";
+import {
+  isResync,
+  parseShellRequestMessage,
+  parseWorkerToBootstrapMessage,
+  readShellFetchFields,
+  type ShellResyncReplyMessage,
+  type ShellSessionCloseMessage,
+  type ShellSessionOpenMessage,
+  type ShellTicketPrepareMessage,
+  type ShellWorkerToBootstrapMessage,
+} from "./relay-messages";
 
 export type ShellBootstrapStatus =
   | "no_session"
   | "registering"
   | "worker_failed"
   | "awaiting_grant"
+  | "session_refused"
   | "ready"
   | "revoked";
 
@@ -26,7 +37,10 @@ export interface ShellBootstrapOptions {
   workerUrl: string;
   workerScope: string;
   workerType: WorkerType;
-  appPath: string;
+  // The worker's entry path; the app frame starts there with a one-time ticket.
+  enterPath: string;
+  // How long the worker may take to answer session.open and ticket.prepare.
+  sessionReplyTimeoutMs: number;
 }
 
 interface Grant {
@@ -87,19 +101,35 @@ function announceUntilGranted(options: ShellBootstrapOptions, granted: Promise<G
   void granted.then(() => clearInterval(timer));
 }
 
+// 16 random bytes, base64url: correlation for the worker, not a secret from same-origin code.
+function createTicket(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const binary = String.fromCharCode(...bytes);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+interface Relay {
+  // Opens the worker session and prepares the entry ticket; null when the worker refused.
+  openSession(worker: ServiceWorker): Promise<string | null>;
+}
+
 // Relays the worker's per-request ports to the single broker port. The broker port lives
-// here, in a window, because the browser may stop the worker whenever it is idle.
+// here, in a window, because the browser may stop the worker whenever it is idle. This page
+// also keeps the copy of its admitted client ids that a restarted worker asks for.
 function startRelay(input: {
   options: ShellBootstrapOptions;
   grant: Grant;
   appFrame: HTMLIFrameElement;
-}): void {
+}): Relay {
   const { options, grant, appFrame } = input;
   const doc = options.window.document;
   const workerUrl = new URL(options.workerUrl, options.window.location.href).href;
   const pending = new Map<number, MessagePort>();
   let nextRequestId = 1;
   let revokedReason: BridgeRevokeReason | null = null;
+  let sessionPort: MessagePort | null = null;
+  let admitted: string[] = [];
+  let awaitingReply: ((message: ShellWorkerToBootstrapMessage | null) => void) | null = null;
 
   function revokeMessage(reason: BridgeRevokeReason): ControlMessage {
     return { type: "paseo.web.revoke", v: 1, generation: grant.generation, reason };
@@ -133,12 +163,9 @@ function startRelay(input: {
     toBroker({ type: "paseo.web.ack", v: 1, generation, requestId, bytes: message.bytes });
   }
 
-  function onWorkerMessage(event: MessageEvent): void {
-    const source = event.source;
-    if (!(source instanceof ServiceWorker) || source.scriptURL !== workerUrl) return;
-    const fields = readShellFetchFields(event.data);
-    const workerPort = event.ports[0];
-    if (fields === null || event.ports.length !== 1 || workerPort === undefined) return;
+  function onFetch(fields: Record<string, unknown>, ports: ReadonlyArray<MessagePort>): void {
+    const workerPort = ports[0];
+    if (ports.length !== 1 || workerPort === undefined) return;
     if (revokedReason !== null) {
       toWorker(workerPort, revokeMessage(revokedReason));
       return;
@@ -164,10 +191,84 @@ function startRelay(input: {
     toBroker(request, request.body === null ? [] : [request.body]);
   }
 
+  function onSessionMessage(event: MessageEvent): void {
+    const fields = readShellFetchFields(event.data);
+    if (fields !== null) {
+      onFetch(fields, event.ports);
+      return;
+    }
+    const message = parseWorkerToBootstrapMessage(event.data);
+    if (message === null) return;
+    if (message.type === "paseo.shell.admitted") {
+      admitted = message.clientIds;
+      return;
+    }
+    const resolve = awaitingReply;
+    awaitingReply = null;
+    resolve?.(message);
+  }
+
+  function adoptSessionPort(port: MessagePort): void {
+    sessionPort?.removeEventListener("message", onSessionMessage);
+    sessionPort?.close();
+    sessionPort = port;
+    port.addEventListener("message", onSessionMessage);
+    port.start();
+  }
+
+  function nextReply(): Promise<ShellWorkerToBootstrapMessage | null> {
+    const { promise, resolve } = Promise.withResolvers<ShellWorkerToBootstrapMessage | null>();
+    const timer = setTimeout(() => {
+      awaitingReply = null;
+      resolve(null);
+    }, options.sessionReplyTimeoutMs);
+    awaitingReply = (message) => {
+      clearTimeout(timer);
+      resolve(message);
+    };
+    return promise;
+  }
+
+  // A restarted worker rebuilds its routes from the bootstraps it can still see. A revoked
+  // bootstrap stays silent, so a late answer can never bring its session back.
+  function onWorkerMessage(event: MessageEvent): void {
+    const source = event.source;
+    if (!(source instanceof ServiceWorker) || source.scriptURL !== workerUrl) return;
+    const port = event.ports[0];
+    if (!isResync(event.data) || event.ports.length !== 1 || port === undefined) return;
+    if (revokedReason !== null) {
+      port.close();
+      return;
+    }
+    const reply: ShellResyncReplyMessage = { type: "paseo.shell.resync.reply", admitted };
+    port.postMessage(reply, []);
+    adoptSessionPort(port);
+  }
+
+  async function openSession(worker: ServiceWorker): Promise<string | null> {
+    const channel = new MessageChannel();
+    adoptSessionPort(channel.port1);
+    const reply = nextReply();
+    const open: ShellSessionOpenMessage = { type: "paseo.shell.session.open" };
+    worker.postMessage(open, [channel.port2]);
+    if ((await reply)?.type !== "paseo.shell.session.ready" || sessionPort === null) return null;
+    const ticket = createTicket();
+    const ticketReply = nextReply();
+    const prepare: ShellTicketPrepareMessage = { type: "paseo.shell.ticket.prepare", ticket };
+    sessionPort.postMessage(prepare, []);
+    const ready = await ticketReply;
+    const isReady = ready?.type === "paseo.shell.ticket.ready" && ready.ticket === ticket;
+    return isReady ? ticket : null;
+  }
+
   // Runs once; afterwards every worker request gets the same answer at once, not a timeout.
   function revoke(reason: BridgeRevokeReason): void {
     if (revokedReason !== null) return;
     revokedReason = reason;
+    const close: ShellSessionCloseMessage = { type: "paseo.shell.session.close" };
+    sessionPort?.postMessage(close, []);
+    sessionPort?.close();
+    sessionPort = null;
     grant.port.removeEventListener("message", onBrokerMessage);
     grant.port.removeEventListener("close", onBrokerPortClosed);
     grant.port.removeEventListener("messageerror", onBrokerMessageError);
@@ -209,6 +310,7 @@ function startRelay(input: {
   grant.port.addEventListener("close", onBrokerPortClosed);
   grant.port.addEventListener("messageerror", onBrokerMessageError);
   grant.port.start();
+  return { openSession };
 }
 
 export async function startShellBootstrap(options: ShellBootstrapOptions): Promise<void> {
@@ -219,14 +321,20 @@ export async function startShellBootstrap(options: ShellBootstrapOptions): Promi
   }
   const granted = listenForGrant(options);
   showStatus(doc, "registering");
+  let worker: ServiceWorker | null = null;
   try {
     const registration = await options.window.navigator.serviceWorker.register(options.workerUrl, {
       scope: options.workerScope,
       type: options.workerType,
     });
     await waitForActivation(registration);
+    worker = registration.active;
   } catch {
     // Without the worker no request can reach the broker; the page states it and stops.
+    showStatus(doc, "worker_failed");
+    return;
+  }
+  if (worker === null) {
     showStatus(doc, "worker_failed");
     return;
   }
@@ -239,8 +347,13 @@ export async function startShellBootstrap(options: ShellBootstrapOptions): Promi
   appFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms");
   appFrame.dataset.testid = "paseo-web-proxy-app";
   appFrame.title = "Proxied page";
-  startRelay({ options, grant, appFrame });
-  appFrame.src = options.appPath;
+  const relay = startRelay({ options, grant, appFrame });
+  const ticket = await relay.openSession(worker);
+  if (ticket === null) {
+    showStatus(doc, "session_refused");
+    return;
+  }
+  appFrame.src = `${options.enterPath}?t=${ticket}`;
   doc.body.append(appFrame);
   showStatus(doc, "ready");
 }
