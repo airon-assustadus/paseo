@@ -7,7 +7,6 @@ import {
   type ConnectionOffer,
 } from "@getpaseo/protocol/connection-offer";
 import { buildRelayWebSocketUrl } from "@getpaseo/protocol/daemon-endpoints";
-import { decrypt, deriveSharedKey, generateKeyPair } from "@getpaseo/relay";
 import type { NetworkTunnel, NetworkTunnelStream } from "@getpaseo/client";
 import {
   BRIDGE_HARNESS_LIMITS,
@@ -120,12 +119,20 @@ relaySuite(SUITE_NAME, () => {
         .filter((message) => message.plaintextHandshake !== null)
         .map((message) => message.plaintextHandshake);
       expect(handshakes).toEqual(["e2ee_hello", "e2ee_ready"]);
-      const firstCiphertext = clientTap
+      // Pending (R1-C1): decrypting the captured ciphertext with a wrong key is not attempted here,
+      // because the tap keeps payloads out of reach by design. The controls above are not a
+      // cryptographic audit; they show the request went through the authenticated path and that
+      // the markers never crossed the relay in clear.
+      const ciphertextMessages = clientTap
         .messages()
-        .find((message) => message.plaintextHandshake === null);
-      expect(firstCiphertext).toBeDefined();
-      await expect(decryptWithRandomKey(firstCiphertext?.bytes ?? 0)).resolves.toBe("rejected");
-      logEvidence("R1-1/R1-2", { ...evidence, handshakes, bodyBytes: body.length });
+        .filter((message) => message.plaintextHandshake === null).length;
+      expect(ciphertextMessages).toBeGreaterThan(0);
+      logEvidence("R1-1/R1-2", {
+        ...evidence,
+        handshakes,
+        ciphertextMessages,
+        bodyBytes: body.length,
+      });
     },
     TEST_TIMEOUT_MS,
   );
@@ -240,8 +247,9 @@ relaySuite(SUITE_NAME, () => {
       await host.backend.events.waitFor("post.count", (e) => e.token === token, 30_000);
 
       await relay.restart();
-      // The tunnel loses its transport; the test's adapter marks the request transport_closed and
-      // never resends. The host sees the TCP peer go and cancels the exchange.
+      // The tunnel loses its transport and the host, seeing the TCP peer go, cancels the exchange.
+      // This harness drives frames directly: it proves a single effect on the path exercised, not
+      // the retry behaviour of the app adapter, which has its own tests.
       await first.stream.closed;
       await host.backend.events.waitFor("post.abandoned", (e) => e.token === token, 30_000);
 
@@ -546,20 +554,6 @@ function relayEvidence(): Evidence {
     bytes: { client: clientTap.summary().bytes, daemon: daemonTap.summary().bytes },
     sha256: { client: clientTap.summary().sha256, daemon: daemonTap.summary().sha256 },
   };
-}
-
-/** A random keypair cannot open a frame of that size; records only the outcome, never bytes. */
-function decryptWithRandomKey(ciphertextBytes: number): Promise<"rejected" | "opened"> {
-  if (ciphertextBytes === 0) return Promise.resolve("opened");
-  const ours = generateKeyPair();
-  const theirs = generateKeyPair();
-  const shared = deriveSharedKey(ours.secretKey, theirs.publicKey);
-  try {
-    decrypt(shared, new ArrayBuffer(ciphertextBytes));
-    return Promise.resolve("opened");
-  } catch {
-    return Promise.resolve("rejected");
-  }
 }
 
 function logEvidence(label: string, evidence: Record<string, unknown>): void {
