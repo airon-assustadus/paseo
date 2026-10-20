@@ -4,7 +4,12 @@ import { pipeline, type Readable } from "node:stream";
 import tls from "node:tls";
 import zlib from "node:zlib";
 import { TunnelCloseReason } from "@getpaseo/protocol/binary-frames/index";
-import { dialTarget, type TunnelDial, type TunnelLookup } from "../network-tunnel/dial-target.js";
+import {
+  defaultLookup,
+  dialTarget,
+  type TunnelDial,
+  type TunnelLookup,
+} from "../network-tunnel/dial-target.js";
 import {
   closeReasonForError,
   normalizeAddress,
@@ -61,6 +66,15 @@ export interface NetworkFetchLimits {
   maxRequestBodyBytes: number;
   maxResponseBodyBytes: number;
   maxRedirects: number;
+}
+
+/**
+ * What is left once an exchange released its resources. The only declared residual is a DNS lookup
+ * still running in the resolver, which libuv cannot cancel; nothing is claimed about kernel buffers
+ * or process memory.
+ */
+export interface ExchangeRelease {
+  dnsPending: boolean;
 }
 
 export interface ExchangeEvents {
@@ -150,6 +164,19 @@ export class FetchExchange {
   private settled = false;
   private request: http.ClientRequest | null = null;
   private socket: Socket | null = null;
+  /**
+   * Every socket this exchange received or created, with the promise of its `close` event. The
+   * listener is attached on receipt, so a `close` that already happened is a resolved promise, not
+   * a missed event. `socket.closed` is not used: it turns true before the handle actually closed.
+   */
+  private readonly sockets = new Map<Socket, Promise<void>>();
+  private lookupsInFlight = 0;
+  private runSettled: Promise<void> | null = null;
+  private resolveReleased: (release: ExchangeRelease) => void = () => undefined;
+  /** Resolves once the exchange settled, its work stopped, and every socket it held closed. */
+  readonly released: Promise<ExchangeRelease> = new Promise((resolve) => {
+    this.resolveReleased = resolve;
+  });
   private body: Readable | null = null;
   private droppedRequestHeaders: string[] = [];
 
@@ -176,7 +203,7 @@ export class FetchExchange {
   }
 
   start(): void {
-    void this.run().catch((error: unknown) => this.failWith(error));
+    this.runSettled ??= this.run().catch((error: unknown) => this.failWith(error));
   }
 
   writeBody(chunk: Uint8Array): void {
@@ -231,13 +258,18 @@ export class FetchExchange {
     this.flushResponse();
   }
 
-  cancel(): void {
-    if (this.settled) return;
-    this.settled = true;
-    this.teardown();
+  /** Stops the exchange and reports when its resources are released; repeat calls share the promise. */
+  cancel(): Promise<ExchangeRelease> {
+    if (!this.settled) {
+      this.settled = true;
+      this.teardown();
+      this.finishRelease(this.lookupsInFlight > 0);
+    }
+    return this.released;
   }
 
   private async run(): Promise<void> {
+    if (this.settled) return;
     let hop: Hop = {
       url: this.url,
       method: this.input.method,
@@ -252,6 +284,10 @@ export class FetchExchange {
         throw new NetworkFetchError(code, "Target is outside the session scope");
       }
       const response = await this.send(hop, redirects === 0);
+      if (this.settled) {
+        response.destroy();
+        return;
+      }
       const location = redirectLocation(response, hop.url);
       if (!location || this.input.redirect === "manual") {
         const redirect = location
@@ -330,7 +366,7 @@ export class FetchExchange {
         port,
         deadline,
         signal: this.abort.signal,
-        lookup: this.env.lookup,
+        lookup: (name) => this.lookup(name),
         dial: this.env.dial,
         // Runs after the lookup and before any connect, so a lapse during DNS opens no socket.
         isDenied: (address, targetPort) => {
@@ -348,8 +384,44 @@ export class FetchExchange {
       }
       throw dialError(error);
     }
+    this.track(socket);
     if (url.protocol !== "https:") return socket;
     return this.secure({ socket, hostname, deadline });
+  }
+
+  /** Counts resolver calls in flight: the one residual `release` cannot wait for. */
+  private lookup(hostname: string): ReturnType<TunnelLookup> {
+    this.lookupsInFlight += 1;
+    return (this.env.lookup ?? defaultLookup)(hostname).finally(() => {
+      this.lookupsInFlight -= 1;
+    });
+  }
+
+  private track(socket: Socket): void {
+    if (this.sockets.has(socket)) return;
+    this.sockets.set(
+      socket,
+      new Promise<void>((resolve) => {
+        socket.once("close", () => {
+          this.sockets.delete(socket);
+          resolve();
+        });
+      }),
+    );
+  }
+
+  private finishRelease(dnsPending: boolean): void {
+    void this.awaitRelease(dnsPending).then((release) => {
+      this.resolveReleased(release);
+      return undefined;
+    });
+  }
+
+  /** Snapshot the sockets only after `run()` stopped, so a socket handed over late is awaited too. */
+  private async awaitRelease(dnsPending: boolean): Promise<ExchangeRelease> {
+    await this.runSettled;
+    await Promise.all(this.sockets.values());
+    return { dnsPending };
   }
 
   private secure(input: { socket: Socket; hostname: string; deadline: number }): Promise<Socket> {
@@ -365,6 +437,7 @@ export class FetchExchange {
         rejectUnauthorized: true,
       });
       this.socket = secured;
+      this.track(secured);
       const settle = (outcome: { error: NetworkFetchError } | null) => {
         clearTimeout(timer);
         secured.removeListener("secureConnect", onSecure);
@@ -466,6 +539,7 @@ export class FetchExchange {
     if (this.responseEnded) {
       this.settled = true;
       this.teardown();
+      this.finishRelease(false);
       this.events.end();
       return;
     }
@@ -498,6 +572,7 @@ export class FetchExchange {
     if (this.settled) return;
     this.settled = true;
     this.teardown();
+    this.finishRelease(false);
     this.events.fail(toFetchError(error));
   }
 
@@ -508,6 +583,7 @@ export class FetchExchange {
     this.body?.destroy();
     this.request?.destroy();
     this.socket?.destroy();
+    for (const socket of this.sockets.keys()) socket.destroy();
   }
 }
 
