@@ -78,9 +78,21 @@ export interface RelayLegEvidence {
   contains: Record<"nonce" | "token" | "hello", Record<WsTapDirection, boolean>>;
 }
 
+/**
+ * Host totals copied from `BridgeHost.stats`, across both listeners; the host does not count per
+ * transport. The page compares them with the channel openings and sessions it made itself, so an
+ * equality proves there was no other authenticated path (RV-7).
+ */
+export interface RelayHostTotals {
+  connections: number;
+  authenticatedConnections: number;
+  sessionsOpened: number;
+}
+
 export interface RelayBridgeEvidence {
   clientLeg: RelayLegEvidence;
   daemonLeg: RelayLegEvidence;
+  host: RelayHostTotals;
 }
 
 export type RelayBridgeStackStep = "relay" | "taps" | "daemon" | "registration" | "offer" | "host";
@@ -118,7 +130,9 @@ export interface RelayBridgeStack {
   relayRegistrations(): number;
   /**
    * Restarts the relay on the same port and resolves only after a new registration line, counted
-   * against the number seen before the restart; an old line never satisfies it.
+   * against the number seen before the restart; an old line never satisfies it. A concurrent
+   * restart, a restart after a failed one, or after `close()`, rejects with `RelayBridgeStackError`;
+   * a failed restart leaves the stack failed and `close()` still tears everything down.
    */
   restartRelay(): Promise<void>;
   /** Both legs, labelled; booleans and counts only. */
@@ -127,6 +141,9 @@ export interface RelayBridgeStack {
   close(): Promise<void>;
 }
 
+// wrangler's local runtime is not supported on Node 25 yet. The stack refuses up front instead of
+// letting the relay startup time out, so an unsupported runtime fails the R2 proof visibly.
+const MAX_SUPPORTED_NODE_MAJOR = 24;
 const DEFAULT_RELAY_STARTUP_TIMEOUT_MS = 90_000;
 const DEFAULT_REGISTRATION_TIMEOUT_MS = 30_000;
 const REGISTRATION_LINE = "relay_control_connected";
@@ -194,6 +211,14 @@ export async function startRelayBridgeStack(
       closedPorts.push(entry.port);
     }
     throw new RelayBridgeStackStartError(failedStep, closedPorts, cause);
+  }
+
+  const nodeMajor = Number((process.versions.node ?? "0").split(".")[0] ?? "0");
+  if (nodeMajor > MAX_SUPPORTED_NODE_MAJOR) {
+    return unwind(
+      "relay",
+      new Error(`The local relay needs Node <= ${MAX_SUPPORTED_NODE_MAJOR}, found ${nodeMajor}`),
+    );
   }
 
   let relay: LocalWranglerRelay;
@@ -270,6 +295,36 @@ export async function startRelayBridgeStack(
 
   const tcpPort = host.tcp.port;
   let closing: Promise<void> | null = null;
+  let restarting: Promise<void> | null = null;
+  let failure: Error | null = null;
+
+  function assertRestartable(): void {
+    if (closing !== null) {
+      throw new RelayBridgeStackError("restart", "Relay bridge stack is closed");
+    }
+    if (restarting !== null) {
+      throw new RelayBridgeStackError("restart", "Relay bridge stack is already restarting");
+    }
+    if (failure !== null) {
+      throw new RelayBridgeStackError(
+        "restart",
+        `Relay bridge stack failed earlier: ${failure.message}`,
+      );
+    }
+  }
+
+  async function restart(): Promise<void> {
+    const before = log.registrations();
+    step("relay restarting", { registrations: before });
+    try {
+      await relay.restart();
+      await log.waitForRegistrations(before + 1, registrationTimeoutMs);
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+      throw error;
+    }
+    step("daemon re-registered", { registrations: log.registrations() });
+  }
 
   async function closeAll(): Promise<void> {
     const failures: unknown[] = [];
@@ -326,21 +381,28 @@ export async function startRelayBridgeStack(
     relay,
     taps: { client: clientTap, daemon: daemonTap },
     relayRegistrations: () => log.registrations(),
+    // Async so a refused restart rejects instead of throwing; the guard still runs synchronously.
     restartRelay: async () => {
-      if (closing !== null) {
-        throw new RelayBridgeStackError("restart", "Relay bridge stack is closed");
-      }
-      const before = log.registrations();
-      step("relay restarting", { registrations: before });
-      await relay.restart();
-      await log.waitForRegistrations(before + 1, registrationTimeoutMs);
-      step("daemon re-registered", { registrations: log.registrations() });
+      assertRestartable();
+      restarting = restart().finally(() => {
+        restarting = null;
+      });
+      return restarting;
     },
     evidence: ({ nonce }) => {
       if (nonce.length === 0) {
         throw new RelayBridgeStackError("evidence", "Evidence needs a non-empty nonce");
       }
-      return { clientLeg: legEvidence(clientTap, nonce), daemonLeg: legEvidence(daemonTap, nonce) };
+      const stats = host.stats;
+      return {
+        clientLeg: legEvidence(clientTap, nonce),
+        daemonLeg: legEvidence(daemonTap, nonce),
+        host: {
+          connections: stats.connections,
+          authenticatedConnections: stats.authenticatedConnections,
+          sessionsOpened: stats.sessionsOpened,
+        },
+      };
     },
     close: () => {
       closing ??= closeAll();

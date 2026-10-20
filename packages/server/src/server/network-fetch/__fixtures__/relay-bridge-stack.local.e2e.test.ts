@@ -1,5 +1,6 @@
-import { connect } from "node:net";
+import { connect, type Socket } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { encodeLengthPrefixed, LengthPrefixedReader } from "./length-prefixed.js";
 import {
   RelayBridgeStackError,
   RelayBridgeStackStartError,
@@ -11,20 +12,18 @@ import {
  * Lifecycle of the shared L-relay infrastructure. The traffic proofs live in the R1 harness
  * (`daemon-e2e/web-proxy-relay.local.e2e.test.ts`); here only start, restart, evidence shape, close
  * and partial-failure cleanup are asserted. Each `describe` starts one local wrangler relay.
+ *
+ * No conditional skip: on a runtime the local relay does not support, the start rejects and the
+ * file fails visibly (RV-11).
  */
-
-const nodeMajor = Number((process.versions.node ?? "0").split(".")[0] ?? "0");
-// wrangler's local runtime is not supported on Node 25 yet; the skip is visible, not silent.
-const relaySuite = nodeMajor < 25 ? describe : describe.skip;
-const suiteName = (name: string) =>
-  nodeMajor < 25 ? name : `${name} — skipped: wrangler needs Node < 25, found ${nodeMajor}`;
 
 const SHELL = { bootstrapJs: "// bootstrap bundle (unused on TCP)", workerJs: "// worker bundle" };
 const ALLOWED_ORIGIN = "http://127.0.0.1:1";
 const TEST_TIMEOUT_MS = 120_000;
 const ABSENT = { toTarget: false, fromTarget: false };
+const NO_HOST_TOTALS = { connections: 0, authenticatedConnections: 0, sessionsOpened: 0 };
 
-relaySuite(suiteName("relay bridge stack"), () => {
+describe("relay bridge stack", () => {
   let stack: RelayBridgeStack;
   const steps: string[] = [];
 
@@ -70,7 +69,44 @@ relaySuite(suiteName("relay bridge stack"), () => {
       expect(leg.overflow).toBeNull();
       expect(leg.contains).toEqual({ nonce: ABSENT, token: ABSENT, hello: ABSENT });
     }
+    expect(evidence.host).toEqual(NO_HOST_TOTALS);
   });
+
+  it(
+    "copies the host's connection, authentication and session totals into the evidence",
+    async () => {
+      // One peer on the TCP listener, authenticated and with a session: the three totals the page
+      // compares with its own openings (RV-7). Copied from `host.stats`, not counted here.
+      const peer = await connectTcp(stack.info.bridge.tcpPort);
+      try {
+        peer.send({ type: "harness.hello", token: stack.info.bridge.token });
+        await peer.take("harness.ready");
+        expect(stack.evidence({ nonce: "never-sent" }).host).toEqual({
+          connections: 1,
+          authenticatedConnections: 1,
+          sessionsOpened: 0,
+        });
+        peer.send({
+          type: "session.open",
+          scope: { origin: stack.info.bridge.fixture.http.origin, pathPrefix: "/" },
+          ttlMs: 60_000,
+        });
+        await peer.take("session.opened");
+        const { host } = stack.evidence({ nonce: "never-sent" });
+        expect(host).toEqual({ connections: 1, authenticatedConnections: 1, sessionsOpened: 1 });
+        const stats = stack.host.stats;
+        expect(host).toEqual({
+          connections: stats.connections,
+          authenticatedConnections: stats.authenticatedConnections,
+          sessionsOpened: stats.sessionsOpened,
+        });
+      } finally {
+        peer.socket.destroy();
+        await peer.closed;
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
 
   it(
     "restarts the relay on the same port and resolves only after the daemon registers again",
@@ -79,7 +115,10 @@ relaySuite(suiteName("relay bridge stack"), () => {
       const instanceBefore = { ...stack.relay.instance };
       const portBefore = stack.relay.port;
 
-      await stack.restartRelay();
+      const restart = stack.restartRelay();
+      // A second restart while one is in flight is refused with a typed error, not queued.
+      await expect(stack.restartRelay()).rejects.toBeInstanceOf(RelayBridgeStackError);
+      await restart;
 
       expect(stack.relay.port).toBe(portBefore);
       expect(stack.relay.instance).not.toEqual(instanceBefore);
@@ -117,7 +156,7 @@ relaySuite(suiteName("relay bridge stack"), () => {
   );
 });
 
-relaySuite(suiteName("relay bridge stack start failure"), () => {
+describe("relay bridge stack start failure", () => {
   it(
     "tears down the relay, both taps and the daemon when the host refuses the origin",
     async () => {
@@ -156,6 +195,53 @@ function listenerPorts(stack: RelayBridgeStack): Record<string, number> {
     daemonTap: stack.taps.daemon.port,
     relay: stack.relay.port,
   };
+}
+
+interface TcpPeer {
+  socket: Socket;
+  send(frame: Record<string, unknown>): void;
+  /** Next frame of `type`, in arrival order; frames of other types are kept for later takes. */
+  take(type: string): Promise<Record<string, unknown>>;
+  closed: Promise<void>;
+}
+
+/** A direct length-prefixed peer on the host's TCP listener, the same protocol the tunnel carries. */
+function connectTcp(port: number): Promise<TcpPeer> {
+  const socket = connect({ host: "127.0.0.1", port });
+  const frames: Array<Record<string, unknown>> = [];
+  const waiters = new Set<() => void>();
+  const reader = new LengthPrefixedReader({
+    onFrame: (text) => {
+      frames.push(JSON.parse(text) as Record<string, unknown>);
+      for (const waiter of waiters) waiter();
+    },
+  });
+  socket.on("data", (chunk: Buffer) => reader.push(chunk));
+  socket.on("error", () => undefined);
+  const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+  const peer: TcpPeer = {
+    socket,
+    send: (frame) => {
+      socket.write(encodeLengthPrefixed(JSON.stringify(frame)));
+    },
+    take: (type) =>
+      new Promise((resolve) => {
+        const check = () => {
+          const index = frames.findIndex((frame) => frame.type === type);
+          if (index === -1) return;
+          waiters.delete(check);
+          const [frame] = frames.splice(index, 1);
+          if (frame) resolve(frame);
+        };
+        waiters.add(check);
+        check();
+      }),
+    closed,
+  };
+  return new Promise((resolve, reject) => {
+    socket.once("connect", () => resolve(peer));
+    socket.once("error", reject);
+  });
 }
 
 /** Resolves with the connect outcome: "connected" or the error code, never throws. */
