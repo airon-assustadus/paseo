@@ -164,8 +164,12 @@ export class FetchExchange {
   private settled = false;
   private request: http.ClientRequest | null = null;
   private socket: Socket | null = null;
-  /** Every socket this exchange received or created; entries leave when they emit `close`. */
-  private readonly sockets = new Set<Socket>();
+  /**
+   * Every socket this exchange received or created, with the promise of its `close` event. The
+   * listener is attached on receipt, so a `close` that already happened is a resolved promise, not
+   * a missed event. `socket.closed` is not used: it turns true before the handle actually closed.
+   */
+  private readonly sockets = new Map<Socket, Promise<void>>();
   private lookupsInFlight = 0;
   private runSettled: Promise<void> | null = null;
   private resolveReleased: (release: ExchangeRelease) => void = () => undefined;
@@ -394,8 +398,16 @@ export class FetchExchange {
   }
 
   private track(socket: Socket): void {
-    this.sockets.add(socket);
-    socket.once("close", () => this.sockets.delete(socket));
+    if (this.sockets.has(socket)) return;
+    this.sockets.set(
+      socket,
+      new Promise<void>((resolve) => {
+        socket.once("close", () => {
+          this.sockets.delete(socket);
+          resolve();
+        });
+      }),
+    );
   }
 
   private finishRelease(dnsPending: boolean): void {
@@ -408,7 +420,7 @@ export class FetchExchange {
   /** Snapshot the sockets only after `run()` stopped, so a socket handed over late is awaited too. */
   private async awaitRelease(dnsPending: boolean): Promise<ExchangeRelease> {
     await this.runSettled;
-    await Promise.all([...this.sockets].map(closeOf));
+    await Promise.all(this.sockets.values());
     return { dnsPending };
   }
 
@@ -571,13 +583,8 @@ export class FetchExchange {
     this.body?.destroy();
     this.request?.destroy();
     this.socket?.destroy();
-    for (const socket of this.sockets) socket.destroy();
+    for (const socket of this.sockets.keys()) socket.destroy();
   }
-}
-
-function closeOf(socket: Socket): Promise<void> {
-  if (socket.closed) return Promise.resolve();
-  return new Promise((resolve) => socket.once("close", () => resolve()));
 }
 
 /** The head timeout starts once the body is written: a slow upload is not a slow server. */

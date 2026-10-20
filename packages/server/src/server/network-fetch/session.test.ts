@@ -1278,6 +1278,8 @@ function gatedDial(mode: "honours-abort" | "ignores-abort") {
   const pending: Pending[] = [];
   const aborted: string[] = [];
   const sockets: net.Socket[] = [];
+  /** Sockets whose `close` event fired; `socket.closed` turns true earlier than the event. */
+  const closed = new Set<net.Socket>();
   let calls = 0;
   const waiters: Array<{ count: number; resolve: () => void }> = [];
   const dial: TunnelDial = (input) =>
@@ -1305,6 +1307,7 @@ function gatedDial(mode: "honours-abort" | "ignores-abort") {
     dial,
     aborted,
     sockets,
+    closed,
     get calls(): number {
       return calls;
     },
@@ -1320,6 +1323,7 @@ function gatedDial(mode: "honours-abort" | "ignores-abort") {
           port: port ?? entry.input.port,
         });
         sockets.push(socket);
+        socket.once("close", () => closed.add(socket));
         await new Promise<void>((resolve) => socket.once("connect", () => resolve()));
         entry.resolve(socket);
       }
@@ -1704,11 +1708,11 @@ describe("network fetch session: release signal (D-CORE-1)", () => {
     await dialer.connectAll();
     await recording.until(() => recording.deliveredBytes(1) > 0);
     const socket = dialer.sockets[0];
-    expect(socket.closed).toBe(false);
+    expect(dialer.closed.has(socket)).toBe(false);
 
     const release = await session.cancel(1);
     expect(release).toEqual({ dnsPending: false });
-    expect(socket.closed).toBe(true);
+    expect(dialer.closed.has(socket)).toBe(true);
     expect(session.pendingReleases).toBe(0);
     // The remote side sees the close too; its timing relative to the resolution is not asserted.
     await held.upstreamClosed;
@@ -1729,7 +1733,7 @@ describe("network fetch session: release signal (D-CORE-1)", () => {
     await dialer.connectAll();
     await clientHello;
     expect(await session.cancel(1)).toEqual({ dnsPending: false });
-    expect(dialer.sockets[0].closed).toBe(true);
+    expect(dialer.closed.has(dialer.sockets[0])).toBe(true);
     await silent.closed;
     await expectSilenceAfter(recording, 1, 0);
   });
@@ -1835,7 +1839,7 @@ describe("network fetch session: release signal (D-CORE-1)", () => {
     if (!release) throw new Error("expected an active request");
     await dialer.connectAll();
     expect(await release).toEqual({ dnsPending: false });
-    expect(dialer.sockets[0].closed).toBe(true);
+    expect(dialer.closed.has(dialer.sockets[0])).toBe(true);
   });
 
   it("keeps the pending set empty across many request/cancel cycles", async () => {
