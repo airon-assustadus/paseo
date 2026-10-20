@@ -1,8 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   NetworkFetchOpenFailedError,
-  NetworkFetchRedirectBlockedError,
-  NetworkFetchTransportError,
   openNetworkFetchTransport,
   type NetworkFetchChannel,
   type NetworkFetchChannelHandlers,
@@ -11,10 +9,14 @@ import {
   type NetworkFetchOutboundFrame,
   type NetworkFetchTransport,
   type NetworkFetchTransportClosedReason,
-  type NetworkFetchTransportReason,
 } from "./network-fetch-transport";
+import type { BridgeErrorReason } from "./bridge-messages";
 import type { WebProxyCapability } from "./request-policy";
-import type { WebProxyTransportRequest, WebProxyTransportResponse } from "./transport";
+import {
+  WebProxyTransportError,
+  type WebProxyTransportRequest,
+  type WebProxyTransportResponse,
+} from "./transport";
 
 const DESTINATION = "http://127.0.0.1:4173";
 const CAPABILITY: WebProxyCapability = {
@@ -176,8 +178,15 @@ function framesOfType<T extends NetworkFetchOutboundFrame["type"]>(
   );
 }
 
-function reasonOf(error: unknown): NetworkFetchTransportReason | null {
-  return error instanceof NetworkFetchTransportError ? error.reason : null;
+function reasonOf(error: unknown): BridgeErrorReason | null {
+  return error instanceof WebProxyTransportError ? error.reason : null;
+}
+
+// What the broker reads: only a WebProxyTransportError carries its code and reason to the content.
+function brokerViewOf(error: unknown): Pick<WebProxyTransportError, "code" | "reason"> | null {
+  return error instanceof WebProxyTransportError
+    ? { code: error.code, reason: error.reason }
+    : null;
 }
 
 function bodyOf(response: WebProxyTransportResponse): ReadableStream<Uint8Array> {
@@ -308,8 +317,10 @@ describe("requests", () => {
     });
     const otherUrl = send(session, { url: "http://127.0.0.1:9999/app/page" });
     void send(session);
-    await expect(otherInitiator).rejects.toMatchObject({ reason: "not_allowed" });
-    await expect(otherUrl).rejects.toMatchObject({ reason: "not_allowed" });
+    for (const refused of [otherInitiator, otherUrl]) {
+      const error = await refused.catch((caught: unknown) => caught);
+      expect(brokerViewOf(error)).toEqual({ code: "transport_error", reason: "not_allowed" });
+    }
     expect(framesOfType(session.channel, "request").map((frame) => frame.requestId)).toEqual([
       1, 2,
     ]);
@@ -438,7 +449,7 @@ describe("response credit", () => {
 });
 
 describe("errors", () => {
-  const expected: Record<NetworkFetchErrorCode, NetworkFetchTransportReason> = {
+  const expected: Record<NetworkFetchErrorCode, BridgeErrorReason> = {
     credentials_unsupported: "credentials_unsupported",
     not_allowlisted: "not_allowed",
     redirect_not_allowlisted: "not_allowed",
@@ -475,7 +486,7 @@ describe("errors", () => {
       message: "secret upstream detail",
     });
     const error = await response.catch((caught: unknown) => caught);
-    expect(reasonOf(error)).toBe(reason);
+    expect(brokerViewOf(error)).toEqual({ code: "transport_error", reason });
     expect(String(error)).not.toContain("secret");
   });
 
@@ -519,6 +530,52 @@ describe("cancellation", () => {
     expect(framesOfType(session.channel, "request").map((frame) => frame.requestId)).toEqual([
       1, 2, 3,
     ]);
+  });
+
+  it("holds a request aborted by its signal after the head until released", async () => {
+    const session = await openSession();
+    const abort = new AbortController();
+    const response = send(session, {}, abort.signal);
+    void send(session);
+    session.channel.deliver(headFrame(1));
+    const reader = bodyOf(await response).getReader();
+    session.channel.deliver(bodyFrame(1, "abcd"));
+    abort.abort();
+    abort.abort();
+    expect(framesOfType(session.channel, "cancel")).toEqual([{ type: "cancel", requestId: 1 }]);
+
+    const read = track(reader.read());
+    session.channel.deliver(bodyFrame(1, "efgh"));
+    await expect(send(session)).rejects.toMatchObject({ reason: "limit" });
+    await flush();
+    expect(read.state).toBe("pending");
+    expect(framesOfType(session.channel, "grantCredit")).toEqual([]);
+
+    session.channel.deliver({ type: "cancelled", requestId: 1, dnsPending: false });
+    await flush();
+    expect(read.state).toBe("rejected");
+    expect(read.error).toBe(abort.signal.reason);
+    void send(session);
+    expect(framesOfType(session.channel, "request").map((frame) => frame.requestId)).toEqual([
+      1, 2, 3,
+    ]);
+    expect(session.closedReasons).toEqual([]);
+  });
+
+  it("does not cancel twice when the stream is cancelled after the signal aborted", async () => {
+    const session = await openSession();
+    const abort = new AbortController();
+    const response = send(session, {}, abort.signal);
+    session.channel.deliver(headFrame(1));
+    const reader = bodyOf(await response).getReader();
+    abort.abort();
+    const cancelling = track(reader.cancel());
+    expect(framesOfType(session.channel, "cancel")).toHaveLength(1);
+    await flush();
+    expect(cancelling.state).toBe("pending");
+    session.channel.deliver({ type: "cancelled", requestId: 1, dnsPending: false });
+    await flush();
+    expect(cancelling.state).toBe("fulfilled");
   });
 
   it("does not send a request whose signal is already aborted", async () => {
@@ -654,8 +711,10 @@ describe("redirects", () => {
 
     session.channel.deliver({ type: "cancelled", requestId: 1, dnsPending: false });
     await flush();
-    expect(response.error).toBeInstanceOf(NetworkFetchRedirectBlockedError);
-    expect(reasonOf(response.error)).toBe("not_allowed");
+    expect(brokerViewOf(response.error)).toEqual({
+      code: "redirect_blocked",
+      reason: "not_allowed",
+    });
   });
 
   it("keeps exactly one Location, the core's, where the first one was", async () => {

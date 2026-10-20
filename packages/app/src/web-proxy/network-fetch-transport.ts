@@ -1,9 +1,10 @@
-import type { BridgeHeaders, BridgeMethod } from "./bridge-messages";
+import type { BridgeErrorReason, BridgeHeaders, BridgeMethod } from "./bridge-messages";
 import type { WebProxyCapability } from "./request-policy";
-import type {
-  WebProxyTransport,
-  WebProxyTransportRequest,
-  WebProxyTransportResponse,
+import {
+  WebProxyTransportError,
+  type WebProxyTransport,
+  type WebProxyTransportRequest,
+  type WebProxyTransportResponse,
 } from "./transport";
 
 // Adapter from the broker's WebProxyTransport to a NetworkFetchSession on the host, reached
@@ -85,17 +86,9 @@ export type NetworkFetchErrorCode =
   | "credit_exceeded"
   | "upstream_error";
 
-export type NetworkFetchTransportReason =
-  | "credentials_unsupported"
-  | "not_allowed"
-  | "unreachable"
-  | "timeout"
-  | "tls_error"
-  | "limit"
-  | "transport_closed"
-  | "upstream_error";
-
-const REASON_BY_CODE: Record<NetworkFetchErrorCode, NetworkFetchTransportReason> = {
+// Failures reach the broker only as WebProxyTransportError: its message is fixed per reason, so
+// nothing from the upstream or the core reaches the content.
+const REASON_BY_CODE: Record<NetworkFetchErrorCode, BridgeErrorReason> = {
   invalid_request: "upstream_error",
   not_allowlisted: "not_allowed",
   credentials_unsupported: "credentials_unsupported",
@@ -166,22 +159,6 @@ const PROTOCOL_VIOLATIONS: readonly NetworkFetchProtocolViolation[] = [
   "body_not_expected",
   "credit_overflow",
 ];
-
-// The message is fixed per reason: nothing from the upstream or the core reaches the content.
-export class NetworkFetchTransportError extends Error {
-  constructor(readonly reason: NetworkFetchTransportReason) {
-    super(`Network fetch failed: ${reason}`);
-    this.name = "NetworkFetchTransportError";
-  }
-}
-
-// The core answered with a redirect outside the session scope; the 3xx is never delivered.
-export class NetworkFetchRedirectBlockedError extends NetworkFetchTransportError {
-  constructor() {
-    super("not_allowed");
-    this.name = "NetworkFetchRedirectBlockedError";
-  }
-}
 
 export class NetworkFetchOpenFailedError extends Error {
   constructor(readonly code: NetworkFetchOpenFailure) {
@@ -609,7 +586,8 @@ export function openNetworkFetchTransport(
     if (entry.cancelSent) return true;
     if (entry.phase !== "awaiting_head") return false;
     if (head.redirect?.allowed === false) {
-      cancel(entry, new NetworkFetchRedirectBlockedError());
+      // The core refused a redirect outside the session scope; the 3xx is never delivered.
+      cancel(entry, new WebProxyTransportError("not_allowed", "redirect_blocked"));
       return true;
     }
     deliverHead(entry, head);
@@ -639,7 +617,7 @@ export function openNetworkFetchTransport(
   }
 
   function cancelledError(entry: PendingRequest): unknown {
-    return entry.cancelError ?? new NetworkFetchTransportError("transport_closed");
+    return entry.cancelError ?? new WebProxyTransportError("transport_closed");
   }
 
   function onEnd(entry: PendingRequest): boolean {
@@ -659,14 +637,14 @@ export function openNetworkFetchTransport(
 
   function onFail(entry: PendingRequest, code: NetworkFetchErrorCode): void {
     if (entry.cancelSent) rememberLateCancel(entry.id);
-    release(entry, new NetworkFetchTransportError(REASON_BY_CODE[code]));
+    release(entry, new WebProxyTransportError(REASON_BY_CODE[code]));
   }
 
   // Without a cancel from the adapter, the host dropped the request on its own.
   function onCancelled(entry: PendingRequest): void {
     const error = entry.cancelSent
       ? cancelledError(entry)
-      : new NetworkFetchTransportError("transport_closed");
+      : new WebProxyTransportError("transport_closed");
     release(entry, error);
   }
 
@@ -740,7 +718,7 @@ export function openNetworkFetchTransport(
     state = "closed";
     clearTimeout(deadline);
     if (input.notifyHost) channel.send({ type: "close" });
-    const error = new NetworkFetchTransportError("transport_closed");
+    const error = new WebProxyTransportError("transport_closed");
     // release() deletes the visited entry, which Map iteration allows.
     for (const entry of active.values()) release(entry, error);
     channel.close();
@@ -752,18 +730,18 @@ export function openNetworkFetchTransport(
     input: WebProxyTransportRequest,
     signal: AbortSignal,
   ): Promise<WebProxyTransportResponse> {
-    if (state !== "open") throw new NetworkFetchTransportError("transport_closed");
+    if (state !== "open") throw new WebProxyTransportError("transport_closed");
     signal.throwIfAborted();
     const agreed = agreedLimits();
     const isInScope =
       input.initiator.boundOrigin === scope.origin && originOf(input.url) === scope.origin;
-    if (!isInScope) throw new NetworkFetchTransportError("not_allowed");
+    if (!isInScope) throw new WebProxyTransportError("not_allowed");
     const bodyLength = input.body?.byteLength ?? 0;
     const isOverLimit =
       bodyLength > agreed.maxRequestBodyBytes ||
       active.size >= agreed.maxConcurrentRequests ||
       lastRequestId >= Number.MAX_SAFE_INTEGER;
-    if (isOverLimit) throw new NetworkFetchTransportError("limit");
+    if (isOverLimit) throw new WebProxyTransportError("limit");
 
     lastRequestId += 1;
     let resolveHead: (response: WebProxyTransportResponse) => void = () => {};
