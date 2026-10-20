@@ -140,7 +140,10 @@ export type BridgeHostStep = "static" | "fixture" | "ws" | "tcp";
 
 /** Knobs for `bridge-host.test.ts` only; the Vitest command never accepts or forwards them. */
 export interface BridgeHostHarnessOptions {
+  /** Deadline for the hello frame and for a raw socket to finish its handshake. */
   helloTimeoutMs?: number;
+  /** How long a graceful close waits for the peer before the socket is destroyed. */
+  closeTimeoutMs?: number;
   maxOutboundBytes?: number;
   lookup?: TunnelLookup;
   /** Extra allowlist targets, for destinations that need a name lookup. */
@@ -213,6 +216,8 @@ export interface BridgeHostStats {
   sessionsOpened: number;
   fixtureQueries: number;
   activeSockets: number;
+  /** Sockets accepted on the bridge listeners and not yet closed, promoted or not. */
+  rawSockets: number;
   /** TCP peers that hung up in the middle of a frame; the partial bytes were never a frame. */
   truncatedFrames: number;
 }
@@ -341,6 +346,7 @@ interface BridgeRuntime {
   tlsCa: readonly string[] | null;
   lookup: TunnelLookup | undefined;
   helloTimeoutMs: number;
+  closeTimeoutMs: number;
   maxOutboundBytes: number;
   fixtureInfo: BridgeFixtureInfo;
   backend: WebProxyFixture;
@@ -438,12 +444,23 @@ async function openBridgeHost(
       fixtureQueries: 0,
       truncatedFrames: 0,
     };
+    const helloTimeoutMs = harness.helloTimeoutMs ?? BRIDGE_HELLO_TIMEOUT_MS;
+    // Two budgets with two owners. A raw socket holds a seat from accept until its own `close`,
+    // on either listener. A protocol reservation is taken only once a connection really exists and
+    // is given back by that connection, so an aborted handshake never consumes one (BT-1, BT-3).
+    const rawSockets = new Set<Socket>();
     let unauthenticated = 0;
-    // One answer for both listeners: the socket caps are shared, not per listener.
-    function canAccept(): boolean {
-      if (closing !== null) return false;
-      if (connections.size >= BRIDGE_MAX_CONNECTIONS) return false;
-      return unauthenticated < BRIDGE_MAX_UNAUTHENTICATED;
+    function admitRawSocket(socket: Socket): boolean {
+      if (closing !== null || rawSockets.size >= BRIDGE_MAX_CONNECTIONS) {
+        socket.destroy();
+        return false;
+      }
+      rawSockets.add(socket);
+      socket.once("close", () => rawSockets.delete(socket));
+      return true;
+    }
+    function reservationAvailable(): boolean {
+      return closing === null && unauthenticated < BRIDGE_MAX_UNAUTHENTICATED;
     }
     const runtime: BridgeRuntime = {
       token,
@@ -452,7 +469,8 @@ async function openBridgeHost(
       protectedPorts: new Set(listeners().map((server) => server.port)),
       tlsCa: backend.https ? [backend.https.caPem] : null,
       lookup: harness.lookup,
-      helloTimeoutMs: harness.helloTimeoutMs ?? BRIDGE_HELLO_TIMEOUT_MS,
+      helloTimeoutMs,
+      closeTimeoutMs: harness.closeTimeoutMs ?? BRIDGE_RELEASE_WAIT_MS,
       maxOutboundBytes: harness.maxOutboundBytes ?? BRIDGE_MAX_OUTBOUND_BYTES,
       fixtureInfo,
       backend,
@@ -473,6 +491,11 @@ async function openBridgeHost(
     });
     const wsPort = opened.ws.port;
     const wsHosts = new Set([`127.0.0.1:${wsPort}`, `localhost:${wsPort}`]);
+    wsServer.on("connection", (socket: Socket) => {
+      if (!admitRawSocket(socket)) return;
+      // A socket that never finishes its handshake is dropped on the same clock as a missing hello.
+      socket.setTimeout(helloTimeoutMs, () => socket.destroy());
+    });
     wsServer.on("request", answerPlainHttp);
     wsServer.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
       const refusal = upgradeRefusal(req, wsHosts, options.allowedOrigin);
@@ -480,25 +503,29 @@ async function openBridgeHost(
         refuse(socket, refusal);
         return;
       }
-      if (!canAccept()) {
+      if (!reservationAvailable()) {
         refuse(socket, 503);
         return;
       }
-      unauthenticated += 1;
+      // `ws` aborts a bad handshake (method, Upgrade, key) without calling back; nothing is reserved
+      // until it does, and without `verifyClient` the callback runs before `handleUpgrade` returns.
       wss.handleUpgrade(req, socket, head, (ws) => {
+        req.socket.setTimeout(0);
+        unauthenticated += 1;
         counters.connections += 1;
-        connections.add(attachConnection(webSocketTransport(ws), runtime));
+        connections.add(attachConnection(webSocketTransport(ws, runtime.closeTimeoutMs), runtime));
       });
     });
     opened.tcp?.server.on("connection", (socket: Socket) => {
-      // No handshake to answer on TCP: a socket past the caps is dropped before any byte is read.
-      if (!canAccept()) {
+      if (!admitRawSocket(socket)) return;
+      // No handshake to answer on TCP: a socket past the reservations is dropped before any read.
+      if (!reservationAvailable()) {
         socket.destroy();
         return;
       }
       unauthenticated += 1;
       counters.connections += 1;
-      connections.add(attachConnection(tcpTransport(socket), runtime));
+      connections.add(attachConnection(tcpTransport(socket, runtime.closeTimeoutMs), runtime));
     });
 
     return {
@@ -516,6 +543,7 @@ async function openBridgeHost(
           sessionsOpened: counters.sessionsOpened,
           fixtureQueries: counters.fixtureQueries,
           activeSockets: connections.size,
+          rawSockets: rawSockets.size,
           truncatedFrames: counters.truncatedFrames,
         };
       },
@@ -737,7 +765,8 @@ function pathOf(req: IncomingMessage): string {
 
 function answerPlainHttp(req: IncomingMessage, res: ServerResponse): void {
   const status = pathOf(req) === "/bridge" ? 426 : 404;
-  const headers: Record<string, string> = { "content-length": "0" };
+  // No keep-alive on the bridge listener: a plain HTTP socket must not sit on a raw-socket seat.
+  const headers: Record<string, string> = { "content-length": "0", connection: "close" };
   if (status === 426) headers.upgrade = "websocket";
   res.writeHead(status, headers);
   res.end();
@@ -1120,7 +1149,13 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
   return connection;
 }
 
-function webSocketTransport(ws: WebSocket): BridgeTransport {
+/** Destroys the socket if the peer has not completed the close within `ms`; cleared on close. */
+function armCloseDeadline(closed: Promise<void>, ms: number, destroy: () => void): void {
+  const timer = setTimeout(destroy, ms);
+  void closed.then(() => clearTimeout(timer));
+}
+
+function webSocketTransport(ws: WebSocket, closeTimeoutMs: number): BridgeTransport {
   const closed = new Promise<void>((resolve) => ws.once("close", () => resolve()));
   return {
     kind: "ws",
@@ -1137,7 +1172,11 @@ function webSocketTransport(ws: WebSocket): BridgeTransport {
     bufferedBytes: () => ws.bufferedAmount,
     outboundBytes: (payload) => Buffer.byteLength(payload),
     send: (payload) => ws.send(payload),
-    close: (code) => ws.close(code),
+    close: (code) => {
+      ws.close(code);
+      // `ws` would wait 30 s for the peer's close frame; the lab waits its own deadline.
+      armCloseDeadline(closed, closeTimeoutMs, () => ws.terminate());
+    },
     destroy: () => ws.terminate(),
     closed,
   };
@@ -1148,11 +1187,16 @@ function webSocketTransport(ws: WebSocket): BridgeTransport {
  * `length-prefixed.ts`. TCP carries no close code: a graceful end sends FIN after the last frame and
  * a violation drops the socket, which the peer can only tell apart by the missing `closed` frame.
  */
-function tcpTransport(socket: Socket): BridgeTransport {
+function tcpTransport(socket: Socket, closeTimeoutMs: number): BridgeTransport {
   let finished = false;
   const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
   function finish(): void {
     finished = true;
+  }
+  /** FIN from this side, and the socket is destroyed if the peer keeps its half open (BT-2). */
+  function endWithDeadline(afterFinish?: () => void): void {
+    socket.end(afterFinish);
+    armCloseDeadline(closed, closeTimeoutMs, () => socket.destroy());
   }
   return {
     kind: "tcp",
@@ -1194,7 +1238,7 @@ function tcpTransport(socket: Socket): BridgeTransport {
     close: (code) => {
       finish();
       if (code === 1000 || code === 1001) {
-        socket.end();
+        endWithDeadline();
         return;
       }
       if (code === 1013) {
@@ -1203,7 +1247,7 @@ function tcpTransport(socket: Socket): BridgeTransport {
         return;
       }
       // Let a `protocol_error` already queued reach the peer, then stop reading from it.
-      socket.end(() => socket.destroy());
+      endWithDeadline(() => socket.destroy());
     },
     destroy: () => {
       finish();
