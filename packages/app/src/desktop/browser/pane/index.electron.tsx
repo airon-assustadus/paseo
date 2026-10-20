@@ -10,7 +10,6 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type ReactNode,
   createElement,
 } from "react";
 import { createPortal } from "react-dom";
@@ -84,6 +83,7 @@ import {
   type BrowserElementSelection,
   type ElementSelectorOutcome,
 } from "./element-selector.electron";
+import { ToolbarButton } from "./toolbar-button";
 
 type ElectronWebview = HTMLElement & {
   canGoBack?: () => boolean;
@@ -433,46 +433,6 @@ function isDesktopBrowserShortcutEvent(payload: unknown): payload is DesktopBrow
   }
   const event = payload as Partial<DesktopBrowserShortcutEvent>;
   return event.action === "focus-url";
-}
-
-function ToolbarButton({
-  label,
-  children,
-  active,
-  disabled,
-  onPress,
-  style,
-}: {
-  label: string;
-  children: ReactNode;
-  active?: boolean;
-  disabled?: boolean;
-  onPress: () => void;
-  style: (state: { hovered?: boolean; pressed?: boolean }) => StyleProp<ViewStyle>;
-}) {
-  const accessibilityState = useMemo(
-    () => ({ disabled: Boolean(disabled), selected: Boolean(active) }),
-    [active, disabled],
-  );
-  return (
-    <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
-      <TooltipTrigger asChild disabled={disabled}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={label}
-          accessibilityState={accessibilityState}
-          disabled={disabled}
-          onPress={onPress}
-          style={style}
-        >
-          {children}
-        </Pressable>
-      </TooltipTrigger>
-      <TooltipContent side="bottom" align="center" offset={8}>
-        <Text style={styles.toolbarTooltipText}>{label}</Text>
-      </TooltipContent>
-    </Tooltip>
-  );
 }
 
 // Lucide icons themed via withUnistyles so their color stays theme-reactive

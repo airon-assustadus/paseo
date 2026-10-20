@@ -59,6 +59,7 @@ export const Image = StubIcon;
 export const Import = StubIcon;
 export const Inbox = StubIcon;
 export const Info = StubIcon;
+export const Keyboard = StubIcon;
 export const Layers = StubIcon;
 export const Link = StubIcon;
 export const Link2 = StubIcon;
