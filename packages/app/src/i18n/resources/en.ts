@@ -593,6 +593,7 @@ export const en = {
         stopLoading: "Stop loading",
         refresh: "Refresh",
         browserUrl: "Browser URL",
+        navigate: "Go",
         enterUrl: "Enter URL",
         openDevTools: "Open browser dev tools",
         cancelSelector: "Cancel element selector",

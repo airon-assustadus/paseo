@@ -13,6 +13,7 @@ import { normalizeWorkspaceBrowserUrl } from "@/desktop/browser/store";
 import { HostBadge } from "@/hosts/host-badge";
 import type { HostColor } from "@/hosts/appearance";
 import type { Theme } from "@/styles/theme";
+import { UrlForm } from "./url-form";
 
 export interface RemoteBrowserChromeProps {
   serverId: string;
@@ -95,9 +96,11 @@ export function RemoteBrowserChrome({
   }, [url]);
 
   const submitDraft = useCallback(() => {
+    if (disabled) return;
     const next = normalizeWorkspaceBrowserUrl(urlInputRef.current?.getText() ?? draftUrl);
+    urlInputRef.current?.blur();
     onNavigate(next);
-  }, [draftUrl, onNavigate]);
+  }, [disabled, draftUrl, onNavigate]);
 
   const badge = useMemo(
     () => ({
@@ -156,24 +159,35 @@ export function RemoteBrowserChrome({
         <View style={styles.badgeWrap}>
           <HostBadge badge={badge} />
         </View>
-        <ThemedUrlInput
-          accessibilityLabel={t("workspace.browser.controls.browserUrl")}
-          autoCapitalize="none"
-          autoCorrect={false}
-          editable={!disabled}
-          initialValue={draftUrl}
-          inputMode="url"
-          keyboardType="url"
-          onChangeText={setDraftUrl}
-          onSubmitEditing={submitDraft}
-          placeholder={t("workspace.browser.controls.enterUrl")}
-          ref={urlInputRef}
-          returnKeyType="go"
-          selectTextOnFocus
-          style={styles.urlInput}
-          testID="remote-browser-url"
-          uniProps={urlInputMapping}
-        />
+        <UrlForm onSubmit={submitDraft}>
+          <ThemedUrlInput
+            accessibilityLabel={t("workspace.browser.controls.browserUrl")}
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!disabled}
+            initialValue={draftUrl}
+            inputMode="url"
+            keyboardType="url"
+            onChangeText={setDraftUrl}
+            onSubmitEditing={submitDraft}
+            placeholder={t("workspace.browser.controls.enterUrl")}
+            ref={urlInputRef}
+            returnKeyType="go"
+            selectTextOnFocus
+            style={styles.urlInput}
+            testID="remote-browser-url"
+            uniProps={urlInputMapping}
+          />
+          <ToolbarButton
+            label={t("workspace.browser.controls.navigate")}
+            disabled={disabled}
+            onPress={submitDraft}
+            style={reloadStyle}
+            testID="remote-browser-go"
+          >
+            <ThemedArrowRight size={16} uniProps={mutedIcon} />
+          </ToolbarButton>
+        </UrlForm>
       </View>
       {keyboardShown === null ? null : (
         <View style={styles.chromeRight}>

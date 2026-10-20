@@ -12,6 +12,7 @@ import {
 } from "@getpaseo/client";
 import { i18n as testI18n } from "@/i18n/i18next";
 import { RemoteBrowserPane } from "./pane";
+import { RemoteBrowserChrome } from "./chrome";
 import { clearRemoteBrowserBindings } from "./registry";
 import { createFakeAttachment, createFakeClient, state } from "./test-utils/fake-remote-browser";
 
@@ -279,5 +280,86 @@ describe("remote browser pane in a real browser", () => {
     await userEvent.click(retry);
     await waitFor(() => expect(pane.opens).toHaveLength(2));
     expect(pane.view.getByTestId("remote-browser-busy")).toBeTruthy();
+  });
+});
+
+describe("remote browser address submission", () => {
+  function mountChrome(disabled = false) {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const onNavigate = vi.fn();
+    const noop = vi.fn();
+    act(() =>
+      root.render(
+        <RemoteBrowserChrome
+          serverId="host-1"
+          hostLabel="Terra"
+          hostColor="blue"
+          url="https://example.com"
+          canGoBack={false}
+          canGoForward={false}
+          isLoading={false}
+          keyboardShown={false}
+          disabled={disabled}
+          onBack={noop}
+          onForward={noop}
+          onReload={noop}
+          onStop={noop}
+          onToggleKeyboard={noop}
+          onNavigate={onNavigate}
+        />,
+      ),
+    );
+    mounted.push({ root, container });
+    const view = within(container);
+    const input = view.getByTestId("remote-browser-url") as HTMLInputElement;
+    const form = input.form;
+    if (!form) throw new Error("address input must support native form submission");
+    return { input, form, view, onNavigate };
+  }
+
+  it("submits the current DOM text once through the soft-keyboard form action", async () => {
+    const { input, form, onNavigate } = mountChrome();
+    input.focus();
+    input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    input.value = "http://127.0.0.1:18788/";
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        keyCode: 229,
+        isComposing: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(onNavigate).not.toHaveBeenCalled();
+    input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+    act(() => form.requestSubmit());
+    expect(onNavigate).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:18788/");
+    expect(document.activeElement).not.toBe(input);
+  });
+
+  it("normalizes a bare address when the visible Go control is tapped", async () => {
+    const { input, view, onNavigate } = mountChrome();
+    input.value = "127.0.0.1:18788";
+    await userEvent.click(view.getByTestId("remote-browser-go"));
+    expect(onNavigate).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:18788");
+  });
+
+  it("keeps physical Enter to one navigation without also submitting the form", async () => {
+    const { input, onNavigate } = mountChrome();
+    await userEvent.fill(input, "http://localhost:18788/");
+    await userEvent.keyboard("{Enter}");
+    expect(onNavigate).toHaveBeenCalledExactlyOnceWith("http://localhost:18788/");
+  });
+
+  it("does not submit through the form or Go control while disabled", () => {
+    const { form, view, onNavigate } = mountChrome(true);
+    act(() => form.requestSubmit());
+    const button = view.getByTestId("remote-browser-go") as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    button.click();
+    expect(onNavigate).not.toHaveBeenCalled();
   });
 });
