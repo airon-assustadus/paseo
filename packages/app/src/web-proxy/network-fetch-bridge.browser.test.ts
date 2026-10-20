@@ -1,9 +1,11 @@
 import { commands, page } from "vitest/browser";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  BRIDGE_CHANNEL_LIMITS,
   openBridgeChannel,
   type BridgeConnection,
   type BridgeHarness,
+  type FixtureEventKind,
 } from "./__fixtures__/bridge-channel";
 import { DEFAULT_BRIDGE_LIMITS, type BridgeLimits, type RequestMessage } from "./bridge-messages";
 import { attachWebProxyBroker, type WebProxyBroker } from "./broker.web";
@@ -25,6 +27,8 @@ const HARNESS_K3_LIMITS: BridgeLimits = {
   maxConcurrentRequests: 6,
 };
 const CORE_WINDOW_BYTES = 65_536;
+// Within the lab host's TTL ceiling (BF-3); the core itself accepts more.
+const SESSION_TTL_MS = 60_000;
 const LARGE_BYTES = 4_194_304;
 
 interface Stack {
@@ -96,7 +100,7 @@ async function openStack(): Promise<Stack> {
   const transport = await openNetworkFetchTransport({
     channel: connection.channel,
     capability,
-    ttlMs: 60_000,
+    ttlMs: SESSION_TTL_MS,
     limits: {},
     onClosed: (reason) => closedReasons.push(reason),
   });
@@ -106,7 +110,7 @@ async function openStack(): Promise<Stack> {
 }
 
 // Reads every recorded event of one kind, following the absolute cursor (D-HOST-7).
-async function eventsOf(harness: BridgeHarness, kind: string): Promise<unknown[]> {
+async function eventsOf(harness: BridgeHarness, kind: FixtureEventKind): Promise<unknown[]> {
   const events: unknown[] = [];
   let after = 0;
   for (;;) {
@@ -175,6 +179,15 @@ function k3Request(requestId: number, path: string): RequestMessage {
     headers: [],
     body: null,
     mode: "subresource",
+  };
+}
+
+function k3Post(requestId: number, path: string, body: string): RequestMessage {
+  return {
+    ...k3Request(requestId, path),
+    method: "POST",
+    headers: [["content-type", "text/plain"]],
+    body: new TextEncoder().encode(body).buffer,
   };
 }
 
@@ -338,6 +351,39 @@ describe("web proxy over the bridge host", () => {
     expect(content.received.reduce<number>((sum, message) => sum + chunkBytes(message), 0)).toBe(
       HARNESS_K3_LIMITS.windowBytes,
     );
+    expect(stack.closedReasons).toEqual([]);
+  }, 60_000);
+
+  it("finishes a POST the fixture held once the harness releases it, on a live session", async () => {
+    expect(SESSION_TTL_MS).toBeLessThanOrEqual(BRIDGE_CHANNEL_LIMITS.maxSessionTtlMs);
+    const stack = await openStack();
+    const { harness } = stack.connection;
+    const content = openK3(stack, HARNESS_K3_LIMITS);
+    const token = createNonce();
+    content.send(k3Post(1, `/post/${token}?hold=1&n=${token}`, "held body"));
+
+    await vi.waitFor(async () => {
+      const arrived = await eventsOf(harness, "post.arrived");
+      expect(arrived).toContainEqual(expect.objectContaining({ token, held: true }));
+    }, SLOW);
+    // The fixture holds the response: nothing has reached the content yet.
+    expect(content.received).toEqual([]);
+
+    expect(await harness.release(token)).toBe(1);
+    expect(await content.next()).toMatchObject({ type: "paseo.web.response.head", status: 200 });
+    expect(JSON.parse(await readK3Body(content, 1))).toEqual({ token, count: 1, held: true });
+    await vi.waitFor(async () => {
+      const released = await eventsOf(harness, "post.released");
+      expect(released).toContainEqual(expect.objectContaining({ token, delivered: true }));
+    }, SLOW);
+
+    // The release closed nothing: the same session and channel keep serving.
+    content.send(k3Request(2, `/api/echo?n=${token}`));
+    expect(await content.next()).toMatchObject({ type: "paseo.web.response.head", status: 200 });
+    expect(JSON.parse(await readK3Body(content, 2))).toMatchObject({ method: "GET" });
+    expect(await harness.release(token)).toBe(0);
+    const counted = await eventsOf(harness, "post.count");
+    expect(counted.filter((event) => isRecord(event) && event.token === token)).toHaveLength(1);
     expect(stack.closedReasons).toEqual([]);
   }, 60_000);
 });

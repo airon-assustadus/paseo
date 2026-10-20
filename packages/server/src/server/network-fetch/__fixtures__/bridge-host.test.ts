@@ -14,6 +14,7 @@ import {
   type BridgeOutboundFrame,
   type StartBridgeHostOptions,
 } from "./bridge-host.js";
+import { encodeLengthPrefixed, LengthPrefixedReader } from "./length-prefixed.js";
 import { FixtureRecorder, type FixtureEvent } from "./recorder.js";
 
 const closers: Array<() => Promise<void>> = [];
@@ -46,16 +47,72 @@ interface Closure {
 type FrameType = BridgeOutboundFrame["type"];
 type FrameOf<T extends FrameType> = Extract<BridgeOutboundFrame, { type: T }>;
 
-interface Client {
-  ws: WebSocket;
+interface FrameQueue {
   /** Frames received and not yet taken, in arrival order. */
   pending: BridgeOutboundFrame[];
-  send(frame: unknown): void;
-  sendRaw(data: string | Buffer): void;
+  push(text: string): void;
   take<T extends FrameType>(type: T): Promise<FrameOf<T>>;
   /** The next pending frame that names `requestId`, in arrival order. */
   takeFor(requestId: number): Promise<BridgeOutboundFrame>;
+}
+
+interface Client extends FrameQueue {
+  ws: WebSocket;
+  send(frame: unknown): void;
+  sendRaw(data: string | Buffer): void;
   closed: Promise<Closure>;
+}
+
+interface TcpClient extends FrameQueue {
+  socket: net.Socket;
+  send(frame: unknown): void;
+  sendRaw(bytes: Uint8Array): void;
+  /** The host sent FIN: a graceful end, as opposed to a dropped socket. */
+  ended: Promise<void>;
+  closed: Promise<void>;
+}
+
+function frameQueue(): FrameQueue {
+  const pending: BridgeOutboundFrame[] = [];
+  const waiters = new Set<() => void>();
+  function takeWhere(
+    label: string,
+    accept: (frame: BridgeOutboundFrame) => boolean,
+  ): Promise<BridgeOutboundFrame> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        waiters.delete(check);
+        reject(new Error(`No ${label} frame; pending: ${JSON.stringify(pending)}`));
+      }, WAIT_MS);
+      function check(): void {
+        const index = pending.findIndex(accept);
+        if (index === -1) return;
+        const [frame] = pending.splice(index, 1);
+        clearTimeout(timer);
+        waiters.delete(check);
+        resolve(frame);
+      }
+      waiters.add(check);
+      check();
+    });
+  }
+  async function take<T extends FrameType>(type: T): Promise<FrameOf<T>> {
+    const frame = await takeWhere(`"${type}"`, (candidate) => candidate.type === type);
+    if (!isFrameOf(frame, type)) throw new Error("Frame type changed under the cursor");
+    return frame;
+  }
+  return {
+    pending,
+    push: (text) => {
+      const frame: unknown = JSON.parse(text);
+      if (!isOutboundFrame(frame)) throw new Error(`Host sent a non-frame: ${text}`);
+      pending.push(frame);
+      for (const waiter of waiters) waiter();
+    },
+    take,
+    takeFor: (requestId) =>
+      takeWhere(`request ${requestId}`, (candidate) => namesRequest(candidate, requestId)),
+  };
 }
 
 function isFrameOf<T extends FrameType>(frame: BridgeOutboundFrame, type: T): frame is FrameOf<T> {
@@ -91,53 +148,19 @@ function openSocket(host: BridgeHost, options: ConnectOptions = {}): WebSocket {
 
 function connect(host: BridgeHost, options: ConnectOptions = {}): Promise<Client> {
   const ws = openSocket(host, options);
-  const pending: BridgeOutboundFrame[] = [];
-  const waiters = new Set<() => void>();
+  const queue = frameQueue();
   const closed = new Promise<Closure>((resolve) => {
     ws.once("close", (code, reason) => resolve({ code, reason: reason.toString("utf8") }));
   });
   ws.on("error", () => undefined);
   ws.on("message", (data) => {
-    const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
-    const frame: unknown = JSON.parse(text);
-    if (!isOutboundFrame(frame)) throw new Error(`Host sent a non-frame: ${text}`);
-    pending.push(frame);
-    for (const waiter of waiters) waiter();
+    queue.push(Buffer.isBuffer(data) ? data.toString("utf8") : String(data));
   });
-  function takeWhere(
-    label: string,
-    accept: (frame: BridgeOutboundFrame) => boolean,
-  ): Promise<BridgeOutboundFrame> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        waiters.delete(check);
-        reject(new Error(`No ${label} frame; pending: ${JSON.stringify(pending)}`));
-      }, WAIT_MS);
-      function check(): void {
-        const index = pending.findIndex(accept);
-        if (index === -1) return;
-        const [frame] = pending.splice(index, 1);
-        clearTimeout(timer);
-        waiters.delete(check);
-        resolve(frame);
-      }
-      waiters.add(check);
-      check();
-    });
-  }
-  async function take<T extends FrameType>(type: T): Promise<FrameOf<T>> {
-    const frame = await takeWhere(`"${type}"`, (candidate) => candidate.type === type);
-    if (!isFrameOf(frame, type)) throw new Error("Frame type changed under the cursor");
-    return frame;
-  }
   const client: Client = {
+    ...queue,
     ws,
-    pending,
     send: (frame) => ws.send(JSON.stringify(frame)),
     sendRaw: (data) => ws.send(data),
-    take,
-    takeFor: (requestId) =>
-      takeWhere(`request ${requestId}`, (candidate) => namesRequest(candidate, requestId)),
     closed,
   };
   return new Promise((resolve, reject) => {
@@ -146,6 +169,93 @@ function connect(host: BridgeHost, options: ConnectOptions = {}): Promise<Client
     ws.once("unexpected-response", (_req, res) =>
       reject(new Error(`Upgrade refused with ${res.statusCode}`)),
     );
+  });
+}
+
+function tcpPort(host: BridgeHost): number {
+  if (host.tcp === null) throw new Error("The host was started without its TCP listener");
+  return host.tcp.port;
+}
+
+interface TcpConnectOptions {
+  /** Keep our half open after the host's FIN, like a peer that never answers the close. */
+  allowHalfOpen?: boolean;
+}
+
+function connectTcp(host: BridgeHost, options: TcpConnectOptions = {}): Promise<TcpClient> {
+  const socket = net.connect({
+    host: "127.0.0.1",
+    port: tcpPort(host),
+    allowHalfOpen: options.allowHalfOpen ?? false,
+  });
+  const queue = frameQueue();
+  const reader = new LengthPrefixedReader({ onFrame: (text) => queue.push(text) });
+  socket.on("data", (chunk: Buffer) => reader.push(chunk));
+  socket.on("error", () => undefined);
+  const ended = new Promise<void>((resolve) => socket.once("end", () => resolve()));
+  const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+  const client: TcpClient = {
+    ...queue,
+    socket,
+    send: (frame) => {
+      socket.write(encodeLengthPrefixed(JSON.stringify(frame)));
+    },
+    sendRaw: (bytes) => {
+      socket.write(bytes);
+    },
+    ended,
+    closed,
+  };
+  return new Promise((resolve, reject) => {
+    socket.once("connect", () => resolve(client));
+    socket.once("error", reject);
+  });
+}
+
+/** A hand-built prefix, for bytes the encoder refuses to produce. */
+function prefixed(declaredLength: number, payload: Buffer = Buffer.alloc(0)): Buffer {
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(declaredLength);
+  return Buffer.concat([prefix, payload]);
+}
+
+async function authenticateTcp(host: BridgeHost): Promise<TcpClient> {
+  const client = await connectTcp(host);
+  client.send({ type: "harness.hello", token: host.token });
+  await client.take("harness.ready");
+  return client;
+}
+
+async function openTcpSession(host: BridgeHost): Promise<TcpClient> {
+  const client = await authenticateTcp(host);
+  client.send({
+    type: "session.open",
+    scope: { origin: host.fixture.http.origin, pathPrefix: "/" },
+    ttlMs: 60_000,
+  });
+  await client.take("session.opened");
+  return client;
+}
+
+/** Re-checks a host counter on every turn of the event loop until it holds, without a sleep. */
+function untilStats(
+  host: BridgeHost,
+  holds: (current: BridgeHost["stats"]) => boolean,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + WAIT_MS;
+    function check(): void {
+      if (holds(host.stats)) {
+        resolve();
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(new Error(`Stats never matched: ${JSON.stringify(host.stats)}`));
+        return;
+      }
+      setImmediate(check);
+    }
+    check();
   });
 }
 
@@ -217,8 +327,12 @@ async function drainBody(client: Client, requestId: number, bytes: number): Prom
   expect(received).toBe(bytes);
 }
 
+interface FrameSender extends FrameQueue {
+  send(frame: unknown): void;
+}
+
 /** Takes every frame of one request up to `end`, granting credit for each body chunk. */
-async function readToEnd(client: Client, requestId: number): Promise<Buffer> {
+async function readToEnd(client: FrameSender, requestId: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for (;;) {
     const frame = await client.takeFor(requestId);
@@ -231,7 +345,7 @@ async function readToEnd(client: Client, requestId: number): Promise<Buffer> {
   }
 }
 
-function pendingOfType(client: Client, type: FrameType): BridgeOutboundFrame[] {
+function pendingOfType(client: FrameQueue, type: FrameType): BridgeOutboundFrame[] {
   return client.pending.filter((frame) => frame.type === type);
 }
 
@@ -298,19 +412,65 @@ function connectionRefused(port: number): Promise<string> {
   });
 }
 
-/** Writes a raw upgrade request and reports whether the server answered before closing. */
-function rawUpgrade(port: number, hostHeader: string): Promise<string> {
+/** Writes raw bytes to a port and returns everything the server answered before closing. */
+function rawExchange(port: number, request: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: "127.0.0.1", port });
     const chunks: Buffer[] = [];
     socket.on("data", (chunk: Buffer) => chunks.push(chunk));
     socket.on("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    socket.on("error", reject);
+    socket.on("error", () => undefined);
     socket.on("connect", () => {
-      socket.write(
-        `GET /__paseo/bootstrap.js HTTP/1.1\r\nHost: ${hostHeader}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
-      );
+      socket.write(request);
     });
+    socket.once("error", reject);
+  });
+}
+
+/** Writes a raw upgrade request and reports whether the server answered before closing. */
+function rawUpgrade(port: number, hostHeader: string): Promise<string> {
+  return rawExchange(
+    port,
+    `GET /__paseo/bootstrap.js HTTP/1.1\r\nHost: ${hostHeader}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+  );
+}
+
+/** An upgrade request the `ws` library aborts itself, before the host's callback runs. */
+function abortedUpgrade(host: BridgeHost, method = "GET", key = ""): Promise<string> {
+  const port = Number(new URL(host.url).port);
+  const keyLine = key === "" ? "" : `Sec-WebSocket-Key: ${key}\r\n`;
+  return rawExchange(
+    port,
+    `${method} /bridge HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n${keyLine}Sec-WebSocket-Version: 13\r\n\r\n`,
+  );
+}
+
+interface RawSocket {
+  socket: net.Socket;
+  closed: Promise<void>;
+}
+
+/** A TCP connection that sends nothing: a seat on the listener and nothing else. */
+function rawSocket(port: number): Promise<RawSocket> {
+  const socket = net.connect({ host: "127.0.0.1", port });
+  socket.on("error", () => undefined);
+  const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+  return new Promise((resolve, reject) => {
+    socket.once("connect", () => resolve({ socket, closed }));
+    socket.once("error", reject);
+  });
+}
+
+/** The listener accepted the socket and dropped it before any handshake could happen. */
+async function droppedUpgrade(host: BridgeHost): Promise<void> {
+  const ws = openSocket(host);
+  ws.on("error", () => undefined);
+  await new Promise<void>((resolve, reject) => {
+    ws.once("error", () => resolve());
+    ws.once("open", () => reject(new Error("Upgrade was accepted")));
+    ws.once("unexpected-response", (_req, res) =>
+      reject(new Error(`Upgrade answered with ${res.statusCode}`)),
+    );
   });
 }
 
@@ -374,7 +534,10 @@ describe("startBridgeHost", () => {
       sessionsOpened: 0,
       fixtureQueries: 0,
       activeSockets: 0,
+      rawSockets: 0,
+      truncatedFrames: 0,
     });
+    expect(host.tcp).toBeNull();
   });
 });
 
@@ -439,15 +602,70 @@ describe("upgrade", () => {
     await third.take("harness.ready");
     const fourth = await connect(host);
     expect(host.stats.activeSockets).toBe(4);
-    const fifth = openSocket(host);
-    const failure = await new Promise<string>((resolve) => {
-      fifth.once("error", (error) => resolve(error.message));
-      fifth.once("open", () => resolve("opened"));
-    });
-    expect(failure).not.toBe("opened");
+    expect(host.stats.rawSockets).toBe(4);
+    await droppedUpgrade(host);
     for (const client of [first, second, third, fourth]) client.ws.close();
     await Promise.all([first.closed, second.closed, third.closed, fourth.closed]);
     expect(host.stats.sessionsOpened).toBe(0);
+  });
+
+  it("recovers from handshakes that ws aborts before the host is called back", async () => {
+    const host = await startHost({ tcp: true });
+    expect(await abortedUpgrade(host)).toMatch(/^HTTP\/1\.1 400 /);
+    expect(await abortedUpgrade(host)).toMatch(/^HTTP\/1\.1 400 /);
+    expect(await abortedUpgrade(host, "POST", "dGhlIHNhbXBsZSBub25jZQ==")).toMatch(
+      /^HTTP\/1\.1 405 /,
+    );
+    await untilStats(host, (current) => current.rawSockets === 0);
+    const ws = await authenticate(host);
+    const tcp = await authenticateTcp(host);
+    const extra = await authenticate(host);
+    expect(host.stats).toMatchObject({
+      connections: 3,
+      authenticatedConnections: 3,
+      activeSockets: 3,
+      rawSockets: 3,
+    });
+    ws.ws.close();
+    extra.ws.close();
+    tcp.socket.end();
+    await Promise.all([ws.closed, extra.closed, tcp.closed]);
+  });
+
+  it("caps raw sockets on the bridge listener and drops the idle ones at the deadline", async () => {
+    const host = await startHost({ tcp: true });
+    const port = Number(new URL(host.url).port);
+    const idle = await Promise.all([
+      rawSocket(port),
+      rawSocket(port),
+      rawSocket(port),
+      rawSocket(port),
+    ]);
+    await untilStats(host, (current) => current.rawSockets === 4);
+    const fifth = await rawSocket(port);
+    await fifth.closed;
+    const tcpDropped = await connectTcp(host);
+    await tcpDropped.closed;
+    expect(tcpDropped.pending).toEqual([]);
+    expect(host.stats.connections).toBe(0);
+    // The host, not the peers, ends the idle sockets once the hello deadline passes.
+    await Promise.all(idle.map((raw) => raw.closed));
+    await untilStats(host, (current) => current.rawSockets === 0);
+    const client = await authenticate(host);
+    client.ws.close();
+    await client.closed;
+  });
+
+  it("closes a plain HTTP socket instead of keeping it alive on a seat", async () => {
+    const host = await startHost();
+    const port = Number(new URL(host.url).port);
+    const answer = await rawExchange(
+      port,
+      `GET /bridge HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: keep-alive\r\n\r\n`,
+    );
+    expect(answer).toMatch(/^HTTP\/1\.1 426 /);
+    expect(answer.toLowerCase()).toContain("connection: close");
+    await untilStats(host, (current) => current.rawSockets === 0);
   });
 });
 
@@ -1176,5 +1394,292 @@ describe("close", () => {
     for (const port of ports) expect(await connectionRefused(port)).toBe("ECONNREFUSED");
     expect(host.stats.activeSockets).toBe(0);
     await host.close();
+  });
+});
+
+describe("tcp", () => {
+  it("stays off by default, opens a loopback port on request and closes it on a later failure", async () => {
+    const host = await startHost({ tcp: true });
+    expect(tcpPort(host)).toBeGreaterThan(0);
+    const attempt = startBridgeHost({
+      shell: SHELL,
+      allowedOrigin: ALLOWED_ORIGIN,
+      tcp: true,
+      harness: { failStep: "tcp" },
+    });
+    const error = await attempt.catch((caught: unknown) => caught);
+    if (!(error instanceof BridgeHostStartError)) throw new Error("Expected a start error");
+    expect(error.step).toBe("tcp");
+    expect(error.closedPorts).toHaveLength(8);
+    for (const port of error.closedPorts) {
+      expect(await connectionRefused(port)).toBe("ECONNREFUSED");
+    }
+  });
+
+  it("authenticates with the same token and streams a fixture page through the prefix", async () => {
+    const host = await startHost({ tcp: true });
+    const client = await connectTcp(host);
+    client.send({ type: "harness.hello", token: host.token });
+    const ready = await client.take("harness.ready");
+    expect(ready.fixture).toEqual(host.fixture);
+    expect(host.stats).toMatchObject({
+      connections: 1,
+      authenticatedConnections: 1,
+      activeSockets: 1,
+    });
+    client.send({
+      type: "session.open",
+      scope: { origin: host.fixture.http.origin, pathPrefix: "/" },
+      ttlMs: 60_000,
+      limits: { maxChunkBytes: 8192 },
+    });
+    const opened = await client.take("session.opened");
+    expect(opened.limits).toEqual({ ...BRIDGE_HARNESS_LIMITS, maxChunkBytes: 8192 });
+    client.send(requestFrame({ requestId: 1, url: `${host.fixture.http.origin}/?n=tcp-1` }));
+    expect((await client.take("head")).head.status).toBe(200);
+    const body = await readToEnd(client, 1);
+    expect(body.toString("utf8")).toContain("tcp-1");
+    expect(host.backend.events.ofKind("request").map((event) => event.nonce)).toEqual(["tcp-1"]);
+    expect(client.pending).toEqual([]);
+  });
+
+  it("drops the socket without a frame on a bad token, a silent peer or a bad prefix", async () => {
+    const host = await startHost({ tcp: true });
+    const wrongToken = `${host.token.slice(0, 42)}${host.token.endsWith("A") ? "B" : "A"}`;
+    const bad = await connectTcp(host);
+    bad.send({ type: "harness.hello", token: wrongToken });
+    await bad.closed;
+    const silent = await connectTcp(host);
+    await silent.closed;
+    const zero = await connectTcp(host);
+    zero.sendRaw(prefixed(0));
+    await zero.closed;
+    const oversized = await connectTcp(host);
+    oversized.sendRaw(prefixed(65_537));
+    await oversized.closed;
+    const text = await connectTcp(host);
+    text.sendRaw(prefixed(65_536, Buffer.from(`"${"a".repeat(65_534)}"`)));
+    await text.closed;
+    for (const client of [bad, silent, zero, oversized, text]) expect(client.pending).toEqual([]);
+    expect(host.stats).toMatchObject({
+      connections: 5,
+      authenticatedConnections: 0,
+      sessionsOpened: 0,
+      activeSockets: 0,
+      truncatedFrames: 0,
+    });
+  });
+
+  it("reassembles a frame written byte by byte and two frames written at once", async () => {
+    const host = await startHost({ tcp: true });
+    const client = await connectTcp(host);
+    const hello = encodeLengthPrefixed(
+      JSON.stringify({ type: "harness.hello", token: host.token }),
+    );
+    for (const byte of hello) client.sendRaw(Uint8Array.of(byte));
+    await client.take("harness.ready");
+    const open = encodeLengthPrefixed(
+      JSON.stringify({
+        type: "session.open",
+        scope: { origin: host.fixture.http.origin, pathPrefix: "/" },
+        ttlMs: 60_000,
+      }),
+    );
+    const events = encodeLengthPrefixed(JSON.stringify({ type: "fixture.events" }));
+    client.sendRaw(Buffer.concat([open, events]));
+    await client.take("session.opened");
+    expect(await client.take("fixture.events.result")).toMatchObject({ events: [], more: false });
+    expect(host.stats.fixtureQueries).toBe(1);
+  });
+
+  it("ignores the rest of a chunk once a frame closed the connection", async () => {
+    const host = await startHost({ tcp: true });
+    const events = encodeLengthPrefixed(JSON.stringify({ type: "fixture.events" }));
+
+    const graceful = await openTcpSession(host);
+    graceful.sendRaw(
+      Buffer.concat([encodeLengthPrefixed(JSON.stringify({ type: "close" })), events]),
+    );
+    expect(await graceful.take("closed")).toEqual({ type: "closed", reason: "closed" });
+    await graceful.ended;
+    await graceful.closed;
+
+    const malformed = await openTcpSession(host);
+    malformed.sendRaw(Buffer.concat([encodeLengthPrefixed('{"type":"nope"}'), events]));
+    await malformed.closed;
+
+    const violated = await openTcpSession(host);
+    violated.sendRaw(
+      Buffer.concat([
+        encodeLengthPrefixed(JSON.stringify({ type: "body", requestId: 7, data: "YQ==" })),
+        events,
+      ]),
+    );
+    expect(await violated.take("protocol_error")).toEqual({
+      type: "protocol_error",
+      violation: "unknown_request",
+    });
+    await violated.closed;
+
+    for (const client of [graceful, malformed, violated]) expect(client.pending).toEqual([]);
+    expect(host.stats.fixtureQueries).toBe(0);
+    expect(host.stats.activeSockets).toBe(0);
+  });
+
+  it("counts a peer that hangs up inside a frame as truncated and never acts on it", async () => {
+    const host = await startHost({ tcp: true, harness: { helloTimeoutMs: WAIT_MS } });
+    const hello = JSON.stringify({ type: "harness.hello", token: host.token });
+    const midFrame = await connectTcp(host);
+    midFrame.sendRaw(prefixed(Buffer.byteLength(hello), Buffer.from(hello).subarray(0, 10)));
+    midFrame.socket.end();
+    await midFrame.closed;
+    await untilStats(host, (current) => current.truncatedFrames === 1);
+    const midPrefix = await connectTcp(host);
+    midPrefix.sendRaw(Buffer.from([0, 0]));
+    midPrefix.socket.end();
+    await midPrefix.closed;
+    await untilStats(host, (current) => current.truncatedFrames === 2);
+    const clean = await connectTcp(host);
+    clean.socket.end();
+    await clean.closed;
+    await untilStats(host, (current) => current.activeSockets === 0);
+    expect(host.stats).toMatchObject({
+      truncatedFrames: 2,
+      authenticatedConnections: 0,
+      sessionsOpened: 0,
+    });
+  });
+
+  it("shares the unauthenticated and total socket caps with the WebSocket listener", async () => {
+    const host = await startHost({ tcp: true, harness: { helloTimeoutMs: WAIT_MS } });
+    const wsFirst = await connect(host);
+    const wsSecond = await connect(host);
+    const tcpRefused = await connectTcp(host);
+    await tcpRefused.closed;
+    expect(tcpRefused.pending).toEqual([]);
+
+    wsFirst.send({ type: "harness.hello", token: host.token });
+    await wsFirst.take("harness.ready");
+    const tcpFirst = await connectTcp(host);
+    await untilStats(host, (current) => current.activeSockets === 3);
+    expect(await refusedUpgrade(host)).toBe(503);
+
+    wsSecond.send({ type: "harness.hello", token: host.token });
+    await wsSecond.take("harness.ready");
+    tcpFirst.send({ type: "harness.hello", token: host.token });
+    await tcpFirst.take("harness.ready");
+    const tcpSecond = await authenticateTcp(host);
+    await untilStats(host, (current) => current.activeSockets === 4 && current.rawSockets === 4);
+    await droppedUpgrade(host);
+    const tcpFifth = await connectTcp(host);
+    await tcpFifth.closed;
+    expect(tcpFifth.pending).toEqual([]);
+
+    tcpSecond.socket.end();
+    await tcpSecond.closed;
+    await untilStats(host, (current) => current.activeSockets === 3 && current.rawSockets === 3);
+    const wsFourth = await connect(host);
+    wsFourth.send({ type: "harness.hello", token: host.token });
+    await wsFourth.take("harness.ready");
+
+    for (const client of [wsFirst, wsSecond, wsFourth]) client.ws.close();
+    tcpFirst.socket.end();
+    await Promise.all([wsFirst.closed, wsSecond.closed, wsFourth.closed, tcpFirst.closed]);
+    expect(host.stats.sessionsOpened).toBe(0);
+  });
+
+  it("drops a half-open peer at the close deadline and frees its seat", async () => {
+    const host = await startHost({ tcp: true, harness: { closeTimeoutMs: 200 } });
+    const stubborn = await connectTcp(host, { allowHalfOpen: true });
+    stubborn.send({ type: "harness.hello", token: host.token });
+    await stubborn.take("harness.ready");
+    stubborn.send({
+      type: "session.open",
+      scope: { origin: host.fixture.http.origin, pathPrefix: "/" },
+      ttlMs: 60_000,
+    });
+    await stubborn.take("session.opened");
+    stubborn.send({ type: "close" });
+    expect(await stubborn.take("closed")).toEqual({ type: "closed", reason: "closed" });
+    await stubborn.ended;
+    expect(stubborn.socket.destroyed).toBe(false);
+    // Our half stays open on purpose; only the host can tell that its side is gone.
+    await untilStats(host, (current) => current.activeSockets === 0 && current.rawSockets === 0);
+    expect(stubborn.socket.destroyed).toBe(false);
+    stubborn.socket.destroy();
+    const next = await authenticateTcp(host);
+    next.socket.end();
+    await next.closed;
+
+    const violator = await connectTcp(host, { allowHalfOpen: true });
+    violator.send({ type: "harness.hello", token: host.token });
+    await violator.take("harness.ready");
+    violator.send({ type: "fixture.events", kind: "nope" });
+    await violator.ended;
+    await untilStats(host, (current) => current.rawSockets === 0);
+    expect(violator.pending).toEqual([]);
+    violator.socket.destroy();
+  });
+
+  it("ends with FIN after the closed frame and drops the socket on a violation", async () => {
+    const host = await startHost({ tcp: true });
+    const graceful = await openTcpSession(host);
+    graceful.send({ type: "close" });
+    expect(await graceful.take("closed")).toEqual({ type: "closed", reason: "closed" });
+    await graceful.ended;
+    await graceful.closed;
+    const authenticatedOnly = await authenticateTcp(host);
+    authenticatedOnly.send({ type: "close" });
+    await authenticatedOnly.ended;
+    await authenticatedOnly.closed;
+    expect(authenticatedOnly.pending).toEqual([]);
+    const violated = await openTcpSession(host);
+    violated.send({ type: "grantCredit", requestId: 3, bytes: 1 });
+    expect(await violated.take("protocol_error")).toEqual({
+      type: "protocol_error",
+      violation: "unknown_request",
+    });
+    await violated.closed;
+    expect(violated.pending).toEqual([]);
+  });
+
+  it("drops the socket when a frame would exceed the outbound budget", async () => {
+    const host = await startHost({ tcp: true, harness: { maxOutboundBytes: 5_120 } });
+    const client = await openTcpSession(host);
+    client.send(
+      requestFrame({
+        requestId: 1,
+        url: `${host.fixture.http.origin}/large?bytes=33554432&n=tcp-large`,
+      }),
+    );
+    expect((await client.take("head")).head.status).toBe(200);
+    await client.closed;
+    expect(pendingOfType(client, "closed")).toEqual([]);
+    const closed = await host.backend.events.waitFor(
+      "large.closed",
+      (e) => e.nonce === "tcp-large",
+    );
+    expect(closed.completed).toBe(false);
+  });
+
+  it("closes TCP sessions with the host and refuses the port afterwards", async () => {
+    const host = await startHost({ tcp: true });
+    const client = await openTcpSession(host);
+    client.send(
+      requestFrame({
+        requestId: 1,
+        url: `${host.fixture.http.origin}/sse?count=1000&intervalMs=5&n=tcp-sse`,
+      }),
+    );
+    expect((await client.take("head")).head.status).toBe(200);
+    const port = tcpPort(host);
+    await host.close();
+    expect(await client.take("closed")).toEqual({ type: "closed", reason: "closed" });
+    await client.ended;
+    await client.closed;
+    expect(await connectionRefused(port)).toBe("ECONNREFUSED");
+    const sse = host.backend.events.ofKind("sse.closed").find((event) => event.nonce === "tcp-sse");
+    expect(sse?.completed).toBe(false);
+    expect(host.stats.activeSockets).toBe(0);
   });
 });
