@@ -10,7 +10,7 @@ import {
   normalizeAddress,
   type TunnelHost,
 } from "../network-tunnel/target-policy.js";
-import { findAllowedTarget, parseRequestUrl, type TrustedAllowlist } from "./allowlist.js";
+import { isWithinTarget, parseRequestUrl, type TrustedTarget } from "./allowlist.js";
 import {
   NetworkFetchError,
   NetworkFetchProtocolError,
@@ -29,15 +29,13 @@ export interface NetworkFetchRequest {
   method: NetworkFetchMethod;
   url: string;
   headers: HeaderList;
-  /** The document origin the trusted broker bound this request to; never a page claim. */
-  initiatorOrigin: string | null;
   redirect: NetworkFetchRedirectMode;
   body: NetworkFetchRequestBody;
 }
 
 export interface NetworkFetchRedirect {
   location: string;
-  /** Whether the session may follow it; widening the allowlist needs the trusted control. */
+  /** Whether the target stays inside the session scope; widening it needs the trusted control. */
   allowed: boolean;
 }
 
@@ -74,8 +72,10 @@ export interface ExchangeEvents {
 }
 
 export interface ExchangeEnvironment {
-  /** The session's allowlist; throws when the session stopped being current. */
-  allowlist(): TrustedAllowlist;
+  /** The one destination the session serves; it is also the `Origin` of unsafe requests. */
+  scope: TrustedTarget;
+  /** Throws, after closing the session, once its authority, TTL, or allowlist revision lapsed. */
+  assertCurrent(): void;
   protectedLocalPorts(): ReadonlySet<number>;
   localAddresses(): readonly string[];
   lookup?: TunnelLookup;
@@ -240,20 +240,20 @@ export class FetchExchange {
       url: this.url,
       method: this.input.method,
       headers: this.input.headers,
-      origin: this.input.initiatorOrigin,
+      origin: this.env.scope.origin,
       body: this.input.body,
     };
     for (let redirects = 0; ; redirects += 1) {
-      const allowlist = this.env.allowlist();
-      if (!findAllowedTarget(allowlist, hop.url)) {
+      this.env.assertCurrent();
+      if (!isWithinTarget(this.env.scope, hop.url)) {
         const code = redirects === 0 ? "not_allowlisted" : "redirect_not_allowlisted";
-        throw new NetworkFetchError(code, "Target is outside the session allowlist");
+        throw new NetworkFetchError(code, "Target is outside the session scope");
       }
       const response = await this.send(hop, redirects === 0);
       const location = redirectLocation(response, hop.url);
       if (!location || this.input.redirect === "manual") {
         const redirect = location
-          ? { location: location.href, allowed: findAllowedTarget(allowlist, location) !== null }
+          ? { location: location.href, allowed: isWithinTarget(this.env.scope, location) }
           : null;
         this.deliver({ response, url: hop.url, redirected: redirects > 0, redirect });
         return;
@@ -284,6 +284,13 @@ export class FetchExchange {
       throw new NetworkFetchError("request_head_too_large", "Request head exceeds the limit");
     }
     const socket = await this.connect(hop.url);
+    try {
+      // Nothing is written to a connection the session no longer authorizes.
+      this.env.assertCurrent();
+    } catch (error) {
+      socket.destroy();
+      throw error;
+    }
     if (this.settled) {
       socket.destroy();
       throw new NetworkFetchError("upstream_error", "Exchange settled while connecting");
@@ -323,7 +330,9 @@ export class FetchExchange {
         signal: this.abort.signal,
         lookup: this.env.lookup,
         dial: this.env.dial,
+        // Runs after the lookup and before any connect, so a lapse during DNS opens no socket.
         isDenied: (address, targetPort) => {
+          this.env.assertCurrent();
           const denied =
             protectedPorts.has(targetPort) && reachesThisHost(address, this.env.localAddresses());
           isSelfTarget ||= denied;
@@ -331,6 +340,7 @@ export class FetchExchange {
         },
       });
     } catch (error) {
+      if (error instanceof NetworkFetchProtocolError) throw error;
       if (isSelfTarget) {
         throw new NetworkFetchError("self_target_denied", "Target is a protected local listener");
       }

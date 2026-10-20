@@ -1,10 +1,12 @@
 /* eslint-disable max-nested-callbacks */
 import { createHash } from "node:crypto";
 import http from "node:http";
+import net from "node:net";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
+import type { TunnelDial } from "../network-tunnel/dial-target.js";
 import type { ResolvedTunnelAddress } from "../network-tunnel/target-policy.js";
-import { parseTrustedTarget, type TrustedAllowlist } from "./allowlist.js";
+import { parseTrustedTarget, type TrustedAllowlist, type TrustedTargetInput } from "./allowlist.js";
 import { NetworkFetchOpenError, NetworkFetchProtocolError } from "./errors.js";
 import type {
   NetworkFetchLimits,
@@ -176,9 +178,12 @@ function allowlistStore(targets: readonly string[]) {
 
 interface OpenInput {
   targets: readonly string[];
+  /** Defaults to the whole first target. */
+  scope?: TrustedTargetInput;
   limits?: Partial<NetworkFetchLimits>;
   protectedPorts?: readonly number[];
   lookup?: (hostname: string) => Promise<ResolvedTunnelAddress[]>;
+  dial?: TunnelDial;
   localAddresses?: readonly string[];
   ttlMs?: number;
   isAuthorized?: () => boolean;
@@ -190,12 +195,14 @@ function open(input: OpenInput) {
   const session = openNetworkFetchSession({
     allowlists: allowlists.store,
     allowlistRef: { id: "fixtures", revision: 1 },
+    scope: input.scope ?? { origin: input.targets[0], pathPrefix: "/" },
     ttlMs: input.ttlMs ?? 60_000,
     limits: input.limits,
     isAuthorized: input.isAuthorized ?? (() => true),
     protectedLocalPorts: () => new Set(input.protectedPorts ?? []),
     localAddresses: () => input.localAddresses ?? [],
     lookup: input.lookup,
+    dial: input.dial,
     sink: recording.sink,
   });
   recording.attach(session);
@@ -209,7 +216,6 @@ function get(requestId: number, url: string, extra: Partial<NetworkFetchRequest>
     method: "GET",
     url,
     headers: [],
-    initiatorOrigin: null,
     redirect: "follow",
     body: { kind: "none" },
     ...extra,
@@ -355,24 +361,29 @@ describe("network fetch session", () => {
     expect(fixture.connections()).toBe(0);
   });
 
-  it("refuses an initiator origin the allowlist does not bind and sends the bound one", async () => {
-    const origins: (string | undefined)[] = [];
+  it("sends the scope's destination origin as Origin whatever the request claims", async () => {
+    const seen: string[] = [];
     const fixture = await serve((request, response) => {
-      origins.push(request.headers.origin);
+      seen.push(`${request.method} ${request.url} ${request.headers.origin ?? "-"}`);
       response.end("ok");
     });
-    const { session, recording } = open({ targets: [fixture.origin] });
+    const { session, recording } = open({
+      targets: [fixture.origin],
+      scope: { origin: fixture.origin, pathPrefix: "/app/" },
+    });
+    const forged: [string, string][] = [
+      ["Origin", "http://content-origin.test"],
+      ["X-Paseo-Generation", "99"],
+    ];
 
-    session.request(
-      get(1, `${fixture.origin}/`, { method: "DELETE", initiatorOrigin: "http://evil.test" }),
-    );
-    session.request(
-      get(2, `${fixture.origin}/`, { method: "DELETE", initiatorOrigin: fixture.origin }),
-    );
+    session.request(get(1, `${fixture.origin}/app/item`, { method: "POST", headers: forged }));
+    session.request(get(2, `${fixture.origin}/admin`, { method: "POST", headers: forged }));
+    session.request(get(3, "http://content-origin.test/app/item", { method: "POST" }));
 
-    expect((await recording.outcome(1)).result).toBe("not_allowlisted");
-    expect((await recording.outcome(2)).result).toBe("end");
-    expect(origins).toEqual([fixture.origin]);
+    expect((await recording.outcome(1)).result).toBe("end");
+    expect((await recording.outcome(2)).result).toBe("not_allowlisted");
+    expect((await recording.outcome(3)).result).toBe("not_allowlisted");
+    expect(seen).toEqual([`POST /app/item ${fixture.origin}`]);
   });
 
   it("holds the response to the granted credit and pushes backpressure upstream", async () => {
@@ -500,12 +511,13 @@ describe("network fetch session", () => {
   it("announces revocation first, stops every stream, and refuses later calls", async () => {
     const first = heldResponder();
     const second = heldResponder();
-    const fixtureA = await serve(first.handler);
-    const fixtureB = await serve(second.handler);
-    const { session, recording } = open({ targets: [fixtureA.origin, fixtureB.origin] });
+    const fixture = await serve((request, response) =>
+      (request.url === "/first" ? first : second).handler(request, response),
+    );
+    const { session, recording } = open({ targets: [fixture.origin] });
 
-    session.request(get(1, `${fixtureA.origin}/`));
-    session.request(get(2, `${fixtureB.origin}/`));
+    session.request(get(1, `${fixture.origin}/first`));
+    session.request(get(2, `${fixture.origin}/second`));
     await recording.until(() => recording.deliveredBytes(1) > 0 && recording.deliveredBytes(2) > 0);
     const before = recording.events.length;
     session.revoke();
@@ -513,7 +525,7 @@ describe("network fetch session", () => {
     await settleIo();
 
     expect(recording.events.slice(before)).toEqual([{ type: "closed", reason: "revoked" }]);
-    expect(() => session.request(get(3, `${fixtureA.origin}/`))).toThrow(
+    expect(() => session.request(get(3, `${fixture.origin}/`))).toThrow(
       expect.objectContaining({ violation: "session_closed" }),
     );
     expect(() => session.grantCredit(1, 1)).toThrow(NetworkFetchProtocolError);
@@ -555,6 +567,7 @@ describe("network fetch session", () => {
     const allowlists = allowlistStore(["http://fixture.test"]);
     const base = {
       allowlists: allowlists.store,
+      scope: { origin: "http://fixture.test", pathPrefix: "/" },
       ttlMs: 1000,
       isAuthorized: () => true,
       protectedLocalPorts: () => new Set<number>(),
@@ -585,6 +598,292 @@ describe("network fetch session", () => {
       "revision_conflict",
     );
     expect(failure({ ...base, allowlistRef: { id: "fixtures", revision: 2 } })).toBe("opened");
+  });
+
+  describe("configuration", () => {
+    const store = {
+      get: (id: string): TrustedAllowlist | null =>
+        id === "fixtures"
+          ? {
+              id,
+              revision: 1,
+              targets: [parseTrustedTarget({ origin: "http://fixture.test", pathPrefix: "/app/" })],
+            }
+          : null,
+    };
+    const base: Parameters<typeof openNetworkFetchSession>[0] = {
+      allowlists: store,
+      allowlistRef: { id: "fixtures", revision: 1 },
+      scope: { origin: "http://fixture.test", pathPrefix: "/app/" },
+      ttlMs: 1000,
+      isAuthorized: () => true,
+      protectedLocalPorts: () => new Set<number>(),
+      sink: recordingSink().sink,
+    };
+    function openOutcome(overrides: Partial<Parameters<typeof openNetworkFetchSession>[0]>) {
+      try {
+        openNetworkFetchSession({ ...base, ...overrides }).close();
+        return "opened";
+      } catch (error) {
+        if (error instanceof NetworkFetchOpenError) return error.code;
+        throw error;
+      }
+    }
+
+    const invalid: [string, Partial<Parameters<typeof openNetworkFetchSession>[0]>][] = [
+      ["a NaN window", { limits: { initialWindowBytes: Number.NaN } }],
+      ["an infinite connect timeout", { limits: { connectTimeoutMs: Number.POSITIVE_INFINITY } }],
+      ["a negative body limit", { limits: { maxResponseBodyBytes: -1 } }],
+      ["a fractional chunk", { limits: { maxChunkBytes: 1.5 } }],
+      ["a zero window", { limits: { initialWindowBytes: 0 } }],
+      ["zero concurrency", { limits: { maxConcurrentRequests: 0 } }],
+      ["a zero head timeout", { limits: { responseHeadTimeoutMs: 0 } }],
+      ["a window smaller than the chunk", { limits: { initialWindowBytes: 1024 } }],
+      ["a zero TTL", { ttlMs: 0 }],
+      ["a fractional TTL", { ttlMs: 1.5 }],
+      ["a TTL past the timer ceiling", { ttlMs: 2 ** 31 }],
+      [
+        "a scope with a path in its origin",
+        { scope: { origin: "http://fixture.test/app", pathPrefix: "/" } },
+      ],
+    ];
+
+    it.each(invalid)("rejects %s before creating timers or sockets", (_case, overrides) => {
+      expect(openOutcome(overrides)).toBe("invalid_configuration");
+    });
+
+    it("accepts zero body and redirect limits and a window that equals the chunk", () => {
+      expect(
+        openOutcome({
+          limits: {
+            maxRequestBodyBytes: 0,
+            maxResponseBodyBytes: 0,
+            maxRedirects: 0,
+            initialWindowBytes: 512,
+            maxChunkBytes: 512,
+          },
+        }),
+      ).toBe("opened");
+    });
+
+    it("lets a scope narrow an allowlist entry but never widen it", () => {
+      expect(openOutcome({ scope: { origin: "http://fixture.test", pathPrefix: "/app/x/" } })).toBe(
+        "opened",
+      );
+      for (const scope of [
+        { origin: "http://fixture.test", pathPrefix: "/" },
+        { origin: "http://fixture.test", pathPrefix: "/application/" },
+        { origin: "http://other.test", pathPrefix: "/app/" },
+        { origin: "http://fixture.test:8080", pathPrefix: "/app/" },
+      ]) {
+        expect(openOutcome({ scope })).toBe("scope_not_allowlisted");
+      }
+    });
+  });
+
+  it("finishes a large response through a small valid window", async () => {
+    const fixture = await serve((_request, response) => response.end(Buffer.alloc(64 * 1024, 1)));
+    const { session, recording } = open({
+      targets: [fixture.origin],
+      limits: { initialWindowBytes: 1024, maxChunkBytes: 512 },
+    });
+
+    session.request(get(1, `${fixture.origin}/`));
+    const outcome = await recording.outcome(1);
+
+    expect(outcome).toMatchObject({ result: "end", bodyBytes: 64 * 1024 });
+    const sizes = recording
+      .eventsFor(1)
+      .flatMap((event) => (event.type === "body" ? [event.chunk.length] : []));
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(512);
+  });
+
+  it("applies reduced body and redirect limits", async () => {
+    const fixture = await serve((request, response) => {
+      request.resume();
+      if (request.url === "/redirect") response.writeHead(302, { Location: "/next" }).end();
+      else if (request.url === "/empty") response.writeHead(204).end();
+      else response.end("x");
+    });
+    const { session, recording } = open({
+      targets: [fixture.origin],
+      limits: { maxRequestBodyBytes: 10, maxResponseBodyBytes: 0, maxRedirects: 0 },
+    });
+
+    session.request(get(1, `${fixture.origin}/redirect`));
+    session.request(get(2, `${fixture.origin}/empty`));
+    session.request(get(3, `${fixture.origin}/full`));
+    session.request(
+      get(4, `${fixture.origin}/upload`, { method: "POST", body: { kind: "stream", length: 11 } }),
+    );
+    session.request(
+      get(5, `${fixture.origin}/upload`, {
+        method: "POST",
+        body: { kind: "stream", length: null },
+      }),
+    );
+    session.writeBody(5, Buffer.alloc(11));
+
+    expect((await recording.outcome(1)).result).toBe("redirect_limit");
+    expect(await recording.outcome(2)).toMatchObject({ result: "end", bodyBytes: 0 });
+    expect((await recording.outcome(3)).result).toBe("response_body_too_large");
+    expect((await recording.outcome(4)).result).toBe("request_body_too_large");
+    expect((await recording.outcome(5)).result).toBe("request_body_too_large");
+  });
+
+  describe("lapses while work is pending", () => {
+    function pendingLookup() {
+      let answer: (addresses: ResolvedTunnelAddress[]) => void = () => {};
+      let markStarted: () => void = () => {};
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const lookup = () =>
+        new Promise<ResolvedTunnelAddress[]>((resolve) => {
+          answer = resolve;
+          markStarted();
+        });
+      return { lookup, started, answer: (addresses: ResolvedTunnelAddress[]) => answer(addresses) };
+    }
+
+    function recordingDial() {
+      const attempts: string[] = [];
+      const dial: TunnelDial = ({ address, port }) => {
+        attempts.push(`${address.address}:${port}`);
+        return new Promise((resolve, reject) => {
+          const socket = net.connect({ host: address.address, port });
+          socket.once("connect", () => resolve(socket));
+          socket.once("error", reject);
+        });
+      };
+      return { dial, attempts };
+    }
+
+    function heldServer() {
+      let held: http.ServerResponse | null = null;
+      let markClosed: () => void = () => {};
+      const upstreamClosed = new Promise<void>((resolve) => {
+        markClosed = resolve;
+      });
+      let markArrived: () => void = () => {};
+      const arrived = new Promise<void>((resolve) => {
+        markArrived = resolve;
+      });
+      const handler: http.RequestListener = (request, response) => {
+        request.socket.once("close", () => markClosed());
+        held = response;
+        markArrived();
+      };
+      function release(): void {
+        if (held && !held.destroyed) held.end("late");
+      }
+      return { handler, arrived, upstreamClosed, release };
+    }
+
+    it.each([
+      ["an explicit revoke", "revoked"],
+      ["a lapsed authority with no revoke call", "revoked"],
+      ["a changed allowlist revision", "allowlist_changed"],
+    ])("opens no connection after %s during DNS resolution", async (cause, reason) => {
+      let authorized = true;
+      const dns = pendingLookup();
+      const dialer = recordingDial();
+      const fixture = await serve((_request, response) => response.end("late"));
+      const origin = `http://slow-dns.test:${fixture.port}`;
+      const { session, recording, allowlists } = open({
+        targets: [origin],
+        lookup: dns.lookup,
+        dial: dialer.dial,
+        isAuthorized: () => authorized,
+      });
+
+      session.request(get(1, `${origin}/`));
+      await dns.started;
+      if (cause === "an explicit revoke") session.revoke();
+      if (cause === "a lapsed authority with no revoke call") authorized = false;
+      if (cause === "a changed allowlist revision") allowlists.bumpRevision();
+      dns.answer([{ address: "127.0.0.1", family: 4 }]);
+      await recording.until(() => recording.closedReasons().length > 0);
+      await settleIo();
+
+      expect(recording.events).toEqual([{ type: "closed", reason }]);
+      expect(dialer.attempts).toEqual([]);
+      expect(fixture.connections()).toBe(0);
+    });
+
+    it("stops a pending TLS handshake on revoke", async () => {
+      let markConnected: () => void = () => {};
+      const connected = new Promise<void>((resolve) => {
+        markConnected = resolve;
+      });
+      let markClosed: () => void = () => {};
+      const closed = new Promise<void>((resolve) => {
+        markClosed = resolve;
+      });
+      const silent = net.createServer((socket) => {
+        socket.once("close", () => markClosed());
+        markConnected();
+      });
+      await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", resolve));
+      closers.push(() => new Promise<void>((resolve) => silent.close(() => resolve())));
+      const address = silent.address();
+      if (typeof address !== "object" || address === null) throw new Error("No port");
+      const origin = `https://127.0.0.1:${address.port}`;
+      const { session, recording } = open({ targets: [origin] });
+
+      session.request(get(1, `${origin}/`));
+      await connected;
+      session.revoke();
+      await closed;
+      await settleIo();
+
+      expect(recording.events).toEqual([{ type: "closed", reason: "revoked" }]);
+    });
+
+    it("stops a request waiting for headers on revoke", async () => {
+      const held = heldServer();
+      const fixture = await serve(held.handler);
+      const { session, recording } = open({ targets: [fixture.origin] });
+
+      session.request(get(1, `${fixture.origin}/`));
+      await held.arrived;
+      session.revoke();
+      await held.upstreamClosed;
+      held.release();
+      await settleIo();
+
+      expect(recording.events).toEqual([{ type: "closed", reason: "revoked" }]);
+    });
+
+    it("drops headers that resolve after the revision changed, with no frame in between", async () => {
+      const held = heldServer();
+      const fixture = await serve(held.handler);
+      const { session, recording, allowlists } = open({ targets: [fixture.origin] });
+
+      session.request(get(1, `${fixture.origin}/`));
+      await held.arrived;
+      allowlists.bumpRevision();
+      held.release();
+      await recording.until(() => recording.closedReasons().length > 0);
+      await held.upstreamClosed;
+
+      expect(recording.events).toEqual([{ type: "closed", reason: "allowlist_changed" }]);
+    });
+
+    it("expires a session whose body is paused for credit", async () => {
+      const held = heldResponder();
+      const fixture = await serve(held.handler);
+      const { session, recording } = open({ targets: [fixture.origin], ttlMs: 300 });
+      recording.setAutoCredit(false);
+
+      session.request(get(1, `${fixture.origin}/`));
+      await recording.until(() => recording.deliveredBytes(1) > 0);
+      const count = recording.eventsFor(1).length;
+      await held.upstreamClosed;
+
+      expect(recording.closedReasons()).toEqual(["expired"]);
+      expect(recording.eventsFor(1)).toHaveLength(count);
+    });
   });
 
   it("expires at its TTL", async () => {
@@ -643,17 +942,15 @@ describe("network fetch session", () => {
       `http://[::ffff:127.0.0.1]:${fixture.port}`,
       `http://lan-name.test:${fixture.port}`,
     ];
-    const { session, recording } = open({
-      targets,
-      protectedPorts: [fixture.port],
-      lookup: lookupTable({ "lan-name.test": ["192.0.2.10"] }),
-      localAddresses: ["192.0.2.10"],
-    });
-
-    targets.forEach((origin, index) => session.request(get(index + 1, `${origin}/api/health`)));
-
-    for (const requestId of [1, 2, 3, 4]) {
-      expect((await recording.outcome(requestId)).result).toBe("self_target_denied");
+    for (const origin of targets) {
+      const { session, recording } = open({
+        targets: [origin],
+        protectedPorts: [fixture.port],
+        lookup: lookupTable({ "lan-name.test": ["192.0.2.10"] }),
+        localAddresses: ["192.0.2.10"],
+      });
+      session.request(get(1, `${origin}/api/health`));
+      expect((await recording.outcome(1)).result).toBe("self_target_denied");
     }
     expect(fixture.connections()).toBe(0);
   });
@@ -662,18 +959,19 @@ describe("network fetch session", () => {
     const closed = await serve((_request, response) => response.end());
     const closedPort = closed.port;
     await closers.pop()?.();
-    const { session, recording } = open({
-      targets: ["http://mixed.test", "http://missing.test", `http://127.0.0.1:${closedPort}`],
-      lookup: lookupTable({ "mixed.test": ["127.0.0.1", "169.254.169.254"] }),
-    });
-
-    session.request(get(1, "http://mixed.test/"));
-    session.request(get(2, "http://missing.test/"));
-    session.request(get(3, `http://127.0.0.1:${closedPort}/`));
-
-    expect((await recording.outcome(1)).result).toBe("policy_denied");
-    expect((await recording.outcome(2)).result).toBe("host_not_found");
-    expect((await recording.outcome(3)).result).toBe("connection_refused");
+    const cases: [string, string][] = [
+      ["http://mixed.test", "policy_denied"],
+      ["http://missing.test", "host_not_found"],
+      [`http://127.0.0.1:${closedPort}`, "connection_refused"],
+    ];
+    for (const [origin, expected] of cases) {
+      const { session, recording } = open({
+        targets: [origin],
+        lookup: lookupTable({ "mixed.test": ["127.0.0.1", "169.254.169.254"] }),
+      });
+      session.request(get(1, `${origin}/`));
+      expect((await recording.outcome(1)).result).toBe(expected);
+    }
   });
 
   describe("redirects", () => {
@@ -700,55 +998,73 @@ describe("network fetch session", () => {
         response.writeHead(status, { Location: location }).end();
     }
 
-    it("follows hops inside the allowlist and reports the final URL", async () => {
-      let port = 0;
+    it("follows relative hops inside the scope's path and reports the final URL", async () => {
       const { fixture, log } = await redirectFixture({
-        "/start": redirectTo(302, "/middle"),
-        "/middle": (response) => redirectTo(301, `http://localhost:${port}/final`)(response),
-        "/final": (response) => response.end("done"),
+        "/app/start": redirectTo(302, "middle"),
+        "/app/middle": redirectTo(301, "/app/final"),
+        "/app/final": (response) => response.end("done"),
       });
-      port = fixture.port;
       const { session, recording } = open({
-        targets: [fixture.origin, `http://localhost:${port}`],
+        targets: [fixture.origin],
+        scope: { origin: fixture.origin, pathPrefix: "/app/" },
       });
 
-      session.request(get(1, `${fixture.origin}/start`));
+      session.request(get(1, `${fixture.origin}/app/start`));
       const outcome = await recording.outcome(1);
 
       expect(outcome).toMatchObject({ result: "end", body: "done" });
       expect(outcome.head).toMatchObject({
         status: 200,
-        url: `http://localhost:${port}/final`,
+        url: `${fixture.origin}/app/final`,
         redirected: true,
       });
-      expect(log).toEqual(["GET /start -", "GET /middle -", "GET /final -"]);
+      expect(log).toEqual(["GET /app/start -", "GET /app/middle -", "GET /app/final -"]);
     });
 
-    it("refuses a hop outside the allowlist without connecting to it", async () => {
-      const outside = await serve((_request, response) => response.end("outside"));
-      const { fixture } = await redirectFixture({
-        "/start": redirectTo(302, `${outside.origin}/`),
-      });
-      const { session, recording } = open({ targets: [fixture.origin] });
-
-      session.request(get(1, `${fixture.origin}/start`));
-
-      expect((await recording.outcome(1)).result).toBe("redirect_not_allowlisted");
-      expect(outside.connections()).toBe(0);
-    });
-
-    it("re-applies the dial policy to every hop", async () => {
-      const { fixture } = await redirectFixture({
-        "/start": redirectTo(302, "http://metadata.test/latest/meta-data/"),
+    it("never connects to an allowlisted origin the page's scope does not grant", async () => {
+      const other = await serve((_request, response) => response.end("other destination"));
+      const { fixture, log } = await redirectFixture({
+        "/app/cross": redirectTo(302, `${other.origin}/`),
+        "/app/up": redirectTo(302, "../admin"),
       });
       const { session, recording } = open({
-        targets: [fixture.origin, "http://metadata.test"],
-        lookup: lookupTable({ "metadata.test": ["169.254.169.254"] }),
+        targets: [fixture.origin, other.origin],
+        scope: { origin: fixture.origin, pathPrefix: "/app/" },
       });
 
-      session.request(get(1, `${fixture.origin}/start`));
+      session.request(get(1, `${fixture.origin}/app/cross`));
+      session.request(get(2, `${fixture.origin}/app/up`));
+      session.request(get(3, `${fixture.origin}/app/cross`, { redirect: "manual" }));
+      session.request(get(4, `${fixture.origin}/app/up`, { redirect: "manual" }));
+
+      expect((await recording.outcome(1)).result).toBe("redirect_not_allowlisted");
+      expect((await recording.outcome(2)).result).toBe("redirect_not_allowlisted");
+      expect((await recording.outcome(3)).head?.redirect).toEqual({
+        location: `${other.origin}/`,
+        allowed: false,
+      });
+      expect((await recording.outcome(4)).head?.redirect).toEqual({
+        location: `${fixture.origin}/admin`,
+        allowed: false,
+      });
+      expect(other.connections()).toBe(0);
+      expect(log.filter((line) => line.includes("/admin"))).toEqual([]);
+    });
+
+    it("re-resolves and re-applies the dial policy on every hop", async () => {
+      const answers = [["127.0.0.1"], ["169.254.169.254"]];
+      const { fixture } = await redirectFixture({ "/start": redirectTo(302, "/next") });
+      const origin = `http://rebind.test:${fixture.port}`;
+      const { session, recording } = open({
+        targets: [origin],
+        lookup: async () =>
+          (answers.shift() ?? []).map((address) => ({ address, family: 4 as const })),
+      });
+
+      session.request(get(1, `${origin}/start`));
 
       expect((await recording.outcome(1)).result).toBe("policy_denied");
+      expect(answers).toEqual([]);
     });
 
     it("stops a redirect loop at the redirect limit", async () => {
@@ -775,7 +1091,6 @@ describe("network fetch session", () => {
         get(1, `${fixture.origin}/submit`, {
           method: "POST",
           headers: [["Content-Type", "application/x-www-form-urlencoded"]],
-          initiatorOrigin: fixture.origin,
           body: { kind: "stream", length: 3 },
         }),
       );

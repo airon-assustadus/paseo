@@ -149,6 +149,7 @@ async function fetchOnce(input: {
     const session = openNetworkFetchSession({
       allowlists: { get: () => allowlist },
       allowlistRef: { id: "tls", revision: 1 },
+      scope: { origin: target.origin, pathPrefix: "/" },
       ttlMs: 10_000,
       isAuthorized: () => true,
       protectedLocalPorts: () => new Set(),
@@ -163,7 +164,6 @@ async function fetchOnce(input: {
       method: "GET",
       url: input.url,
       headers: [],
-      initiatorOrigin: null,
       redirect: "error",
       body: { kind: "none" },
     });

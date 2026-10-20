@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AllowlistEntryError,
-  findAllowedTarget,
+  isWithinTarget,
   parseRequestUrl,
   parseTrustedTarget,
   type TrustedAllowlist,
@@ -17,7 +17,8 @@ function allowlist(...targets: [string, string][]): TrustedAllowlist {
 }
 
 function allows(list: TrustedAllowlist, url: string): boolean {
-  return findAllowedTarget(list, parseRequestUrl(url)) !== null;
+  const parsed = parseRequestUrl(url);
+  return list.targets.some((target) => isWithinTarget(target, parsed));
 }
 
 describe("trusted allowlist", () => {

@@ -5,7 +5,15 @@ import {
   TUNNEL_MAX_STREAMS,
 } from "@getpaseo/protocol/network-tunnel/rpc-schemas";
 import type { TunnelDial, TunnelLookup } from "../network-tunnel/dial-target.js";
-import { isAllowedOrigin, type AllowlistStore, type TrustedAllowlist } from "./allowlist.js";
+import {
+  AllowlistEntryError,
+  coversTarget,
+  parseTrustedTarget,
+  type AllowlistStore,
+  type TrustedAllowlist,
+  type TrustedTarget,
+  type TrustedTargetInput,
+} from "./allowlist.js";
 import {
   NetworkFetchError,
   NetworkFetchOpenError,
@@ -66,10 +74,19 @@ export interface AllowlistRef {
 export interface OpenNetworkFetchSessionOptions {
   allowlists: AllowlistStore;
   allowlistRef: AllowlistRef;
+  /**
+   * The page's capability: one destination origin and path, set by the trusted control. It must
+   * equal or narrow an entry of the allowlist; every hop and redirect stays inside it.
+   */
+  scope: TrustedTargetInput;
+  /** Whole milliseconds, 1 to 2^31 - 1 (the timer ceiling). */
   ttlMs: number;
-  /** Each field can only lower the daemon's ceiling. */
+  /** Each field can only lower the daemon's ceiling; out-of-domain values reject the open. */
   limits?: Partial<NetworkFetchLimits>;
-  /** The session's `network.proxy` authority, rechecked on every operation. */
+  /**
+   * The session's `network.proxy` authority. Polled before every operation, hop, dial, and
+   * published event; the wiring still calls `revoke()` when it drops the permission.
+   */
   isAuthorized(): boolean;
   /** Ports of the daemon's own listeners; dialing them on this host is refused. */
   protectedLocalPorts(): ReadonlySet<number>;
@@ -93,15 +110,54 @@ export function openNetworkFetchSession(
   if (allowlist.revision !== options.allowlistRef.revision) {
     throw new NetworkFetchOpenError("revision_conflict", "Allowlist revision changed");
   }
-  return new NetworkFetchSession(options, allowlist);
+  if (!Number.isSafeInteger(options.ttlMs) || options.ttlMs < 1 || options.ttlMs > MAX_TIMER_MS) {
+    throw new NetworkFetchOpenError("invalid_configuration", "Session TTL is out of range");
+  }
+  const limits = agreeOnLimits(options.limits);
+  const scope = parseScope(options.scope);
+  if (!coversTarget(allowlist, scope)) {
+    throw new NetworkFetchOpenError("scope_not_allowlisted", "Scope is outside the allowlist");
+  }
+  return new NetworkFetchSession({ options, allowlist, scope, limits });
+}
+
+/** setTimeout fires immediately for delays above this. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** A zero body or redirect limit is a meaningful policy; a zero window or timeout never progresses. */
+const LIMIT_MINIMUMS: Record<keyof NetworkFetchLimits, number> = {
+  initialWindowBytes: 1,
+  maxChunkBytes: 1,
+  maxConcurrentRequests: 1,
+  connectTimeoutMs: 1,
+  maxRequestHeadBytes: 1,
+  maxResponseHeadBytes: 1,
+  responseHeadTimeoutMs: 1,
+  maxRequestBodyBytes: 0,
+  maxResponseBodyBytes: 0,
+  maxRedirects: 0,
+};
+
+function parseScope(input: TrustedTargetInput): TrustedTarget {
+  try {
+    return parseTrustedTarget(input);
+  } catch (error) {
+    if (!(error instanceof AllowlistEntryError)) throw error;
+    throw new NetworkFetchOpenError("invalid_configuration", "Scope is not an exact target");
+  }
 }
 
 function agreeOnLimits(requested: Partial<NetworkFetchLimits> = {}): NetworkFetchLimits {
   function lower(key: keyof NetworkFetchLimits): number {
     const ceiling = DEFAULT_NETWORK_FETCH_LIMITS[key];
-    return Math.min(ceiling, requested[key] ?? ceiling);
+    const value = requested[key];
+    if (value === undefined) return ceiling;
+    if (!Number.isSafeInteger(value) || value < LIMIT_MINIMUMS[key]) {
+      throw new NetworkFetchOpenError("invalid_configuration", `Limit ${key} is out of range`);
+    }
+    return Math.min(ceiling, value);
   }
-  return {
+  const limits: NetworkFetchLimits = {
     initialWindowBytes: lower("initialWindowBytes"),
     maxChunkBytes: lower("maxChunkBytes"),
     maxConcurrentRequests: lower("maxConcurrentRequests"),
@@ -113,6 +169,18 @@ function agreeOnLimits(requested: Partial<NetworkFetchLimits> = {}): NetworkFetc
     maxResponseBodyBytes: lower("maxResponseBodyBytes"),
     maxRedirects: lower("maxRedirects"),
   };
+  // Every chunk must fit the window, or an upload chunk could never be accepted.
+  if (limits.maxChunkBytes > limits.initialWindowBytes) {
+    throw new NetworkFetchOpenError("invalid_configuration", "Chunk limit exceeds the window");
+  }
+  return limits;
+}
+
+interface SessionInit {
+  options: OpenNetworkFetchSessionOptions;
+  allowlist: TrustedAllowlist;
+  scope: TrustedTarget;
+  limits: NetworkFetchLimits;
 }
 
 /**
@@ -121,6 +189,8 @@ function agreeOnLimits(requested: Partial<NetworkFetchLimits> = {}): NetworkFetc
  */
 export class NetworkFetchSession {
   readonly limits: NetworkFetchLimits;
+  private readonly options: OpenNetworkFetchSessionOptions;
+  private readonly allowlist: TrustedAllowlist;
   private state: "open" | "closed" = "open";
   private lastRequestId = 0;
   private readonly exchanges = new Map<number, FetchExchange>();
@@ -128,18 +198,15 @@ export class NetworkFetchSession {
   private readonly expiry: ReturnType<typeof setTimeout>;
   private readonly environment: ExchangeEnvironment;
 
-  constructor(
-    private readonly options: OpenNetworkFetchSessionOptions,
-    private readonly allowlist: TrustedAllowlist,
-  ) {
-    this.limits = agreeOnLimits(options.limits);
+  constructor({ options, allowlist, scope, limits }: SessionInit) {
+    this.options = options;
+    this.allowlist = allowlist;
+    this.limits = limits;
     this.expiresAt = Date.now() + options.ttlMs;
     this.expiry = setTimeout(() => this.shutdown("expired"), options.ttlMs);
     this.environment = {
-      allowlist: () => {
-        this.assertOpen();
-        return this.allowlist;
-      },
+      scope,
+      assertCurrent: () => this.assertOpen(),
       protectedLocalPorts: options.protectedLocalPorts,
       localAddresses: options.localAddresses ?? hostInterfaceAddresses,
       lookup: options.lookup,
@@ -167,10 +234,6 @@ export class NetworkFetchSession {
     try {
       if (this.exchanges.size >= this.limits.maxConcurrentRequests) {
         throw new NetworkFetchError("stream_limit", "Too many concurrent requests");
-      }
-      const origin = request.initiatorOrigin;
-      if (origin !== null && !isAllowedOrigin(this.allowlist, origin)) {
-        throw new NetworkFetchError("not_allowlisted", "Initiator origin is not a target");
       }
       const url = validateRequest(request, this.limits);
       const exchange = new FetchExchange(
@@ -227,15 +290,25 @@ export class NetworkFetchSession {
   }
 
   private assertOpen(): void {
-    if (this.state === "open") {
-      const current = this.options.allowlists.get(this.allowlist.id);
-      if (!this.options.isAuthorized()) this.shutdown("revoked");
-      else if (Date.now() >= this.expiresAt) this.shutdown("expired");
-      else if (current?.revision !== this.allowlist.revision) this.shutdown("allowlist_changed");
-    }
-    if (this.state === "closed") {
+    if (!this.isCurrent()) {
       throw new NetworkFetchProtocolError("session_closed", "Network fetch session is closed");
     }
+  }
+
+  /** Closes the session the first time it finds the authority, TTL, or revision lapsed. */
+  private isCurrent(): boolean {
+    if (this.state === "closed") return false;
+    const lapse = this.lapse();
+    if (lapse) this.shutdown(lapse);
+    return lapse === null;
+  }
+
+  private lapse(): Exclude<NetworkFetchClosedReason, "closed"> | null {
+    if (!this.options.isAuthorized()) return "revoked";
+    if (Date.now() >= this.expiresAt) return "expired";
+    const current = this.options.allowlists.get(this.allowlist.id);
+    if (current?.revision !== this.allowlist.revision) return "allowlist_changed";
+    return null;
   }
 
   private shutdown(reason: NetworkFetchClosedReason): void {
@@ -250,7 +323,8 @@ export class NetworkFetchSession {
 
   private eventsFor(requestId: number, exchange: () => FetchExchange): ExchangeEvents {
     const { sink } = this.options;
-    const isLive = () => this.state === "open" && this.exchanges.get(requestId) === exchange();
+    // Results that resolve after a lapse are dropped even when no frame arrived in between.
+    const isLive = () => this.isCurrent() && this.exchanges.get(requestId) === exchange();
     const settle = () => {
       const live = isLive();
       if (live) this.exchanges.delete(requestId);

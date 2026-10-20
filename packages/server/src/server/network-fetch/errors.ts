@@ -56,7 +56,9 @@ export class NetworkFetchProtocolError extends Error {
 export type NetworkFetchOpenFailure =
   | "permission_denied"
   | "allowlist_not_found"
-  | "revision_conflict";
+  | "revision_conflict"
+  | "invalid_configuration"
+  | "scope_not_allowlisted";
 
 export class NetworkFetchOpenError extends Error {
   constructor(

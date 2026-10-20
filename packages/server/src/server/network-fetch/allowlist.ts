@@ -98,12 +98,15 @@ export function parseRequestUrl(raw: string): URL {
   return url;
 }
 
-export function findAllowedTarget(allowlist: TrustedAllowlist, url: URL): TrustedTarget | null {
-  for (const target of allowlist.targets) {
-    if (target.origin !== url.origin) continue;
-    if (staysUnderPrefix(url.pathname, target.pathPrefix)) return target;
-  }
-  return null;
+export function isWithinTarget(target: TrustedTarget, url: URL): boolean {
+  return target.origin === url.origin && staysUnderPrefix(url.pathname, target.pathPrefix);
+}
+
+/** A scope may narrow an allowlist entry's path, never widen its origin or path. */
+export function coversTarget(allowlist: TrustedAllowlist, scope: TrustedTarget): boolean {
+  return allowlist.targets.some(
+    (target) => target.origin === scope.origin && scope.pathPrefix.startsWith(target.pathPrefix),
+  );
 }
 
 /**
@@ -122,8 +125,4 @@ function staysUnderPrefix(pathname: string, prefix: string): boolean {
     return false;
   }
   return !decoded.split("/").some((segment) => DOT_SEGMENT.test(segment));
-}
-
-export function isAllowedOrigin(allowlist: TrustedAllowlist, origin: string): boolean {
-  return allowlist.targets.some((target) => target.origin === origin);
 }
