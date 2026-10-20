@@ -35,6 +35,8 @@ export interface WsTapOverflow {
 
 export interface WsTapSummary {
   connections: number;
+  /** Pairs still open; zero after every downstream and upstream closed. */
+  openPairs: number;
   messages: number;
   bytes: Record<WsTapDirection, number>;
   sha256: Record<WsTapDirection, string>;
@@ -59,16 +61,36 @@ export class WsTapOverflowError extends Error {
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_MESSAGES = 10_000;
 const CLOSE_TOO_BIG = 1009;
+const CLOSE_GOING_AWAY = 1001;
 
 interface Pair {
   downstream: WebSocket;
   upstream: WebSocket;
+  /** Messages received before the upstream handshake completed; dropped if the pair closes first. */
+  queued: Array<{ data: Buffer; isBinary: boolean }>;
+  closed: boolean;
+}
+
+function assertCap(name: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${name} must be a positive integer`);
+  }
+}
+
+/** `close()` is only legal on an open socket; a connecting one is aborted with `terminate()`. */
+function shutDown(socket: WebSocket, code: number, reason: string): void {
+  if (socket.readyState === WebSocket.OPEN) socket.close(code, reason);
+  else if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
 }
 
 export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
   const targetHost = options.targetHost ?? "127.0.0.1";
   const maxBytes = options.maxBytesPerDirection ?? DEFAULT_MAX_BYTES;
   const maxMessages = options.maxMessages ?? DEFAULT_MAX_MESSAGES;
+  // Validated before any listener exists: NaN or Infinity must not disable a cap.
+  assertCap("maxBytesPerDirection", maxBytes);
+  assertCap("maxMessages", maxMessages);
+  assertCap("targetPort", options.targetPort);
   const captured: Record<WsTapDirection, Buffer[]> = { toTarget: [], fromTarget: [] };
   const bytes: Record<WsTapDirection, number> = { toTarget: 0, fromTarget: 0 };
   const messages: WsTapMessage[] = [];
@@ -79,14 +101,32 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
   const server = http.createServer((_request, response) => {
     response.writeHead(426, { connection: "close" }).end();
   });
-  const wss = new WebSocketServer({ noServer: true });
+  // The library refuses a single message above the cap before `message` fires; that refusal is
+  // surfaced as an overflow too, so a proof never loses bytes silently.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: maxBytes });
+
+  function closePair(pair: Pair, code: number, reason: string): void {
+    if (pair.closed) return;
+    pair.closed = true;
+    pair.queued.length = 0;
+    pairs.delete(pair);
+    shutDown(pair.downstream, code, reason);
+    shutDown(pair.upstream, code, reason);
+  }
+
+  function markOverflow(direction: WsTapDirection, limit: number, pair: Pair): void {
+    overflow ??= { direction, limit };
+    closePair(pair, CLOSE_TOO_BIG, "tap limit");
+  }
 
   function record(direction: WsTapDirection, data: Buffer, isBinary: boolean, pair: Pair): boolean {
-    if (overflow) return false;
-    if (bytes[direction] + data.length > maxBytes || messages.length >= maxMessages) {
-      overflow = { direction, limit: messages.length >= maxMessages ? maxMessages : maxBytes };
-      pair.downstream.close(CLOSE_TOO_BIG, "tap limit");
-      pair.upstream.close(CLOSE_TOO_BIG, "tap limit");
+    if (overflow || pair.closed) return false;
+    if (bytes[direction] + data.length > maxBytes) {
+      markOverflow(direction, maxBytes, pair);
+      return false;
+    }
+    if (messages.length >= maxMessages) {
+      markOverflow(direction, maxMessages, pair);
       return false;
     }
     bytes[direction] += data.length;
@@ -107,36 +147,41 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
       const upstream = new WebSocket(
         `ws://${targetHost}:${options.targetPort}${request.url ?? "/"}`,
         protocols ? protocols.split(",").map((value) => value.trim()) : [],
+        { maxPayload: maxBytes },
       );
-      const pair: Pair = { downstream, upstream };
+      const pair: Pair = { downstream, upstream, queued: [], closed: false };
       pairs.add(pair);
-      const queued: Array<{ data: Buffer; isBinary: boolean }> = [];
       downstream.on("message", (data, isBinary) => {
         const buffer = toBuffer(data);
         if (!record("toTarget", buffer, isBinary, pair)) return;
         if (upstream.readyState === WebSocket.OPEN) upstream.send(buffer, { binary: isBinary });
-        else queued.push({ data: buffer, isBinary });
+        else pair.queued.push({ data: buffer, isBinary });
       });
       upstream.on("open", () => {
-        for (const item of queued.splice(0)) upstream.send(item.data, { binary: item.isBinary });
+        // The downstream may have gone while the handshake was pending: nothing is flushed then.
+        if (pair.closed) {
+          upstream.terminate();
+          return;
+        }
+        for (const item of pair.queued.splice(0)) {
+          upstream.send(item.data, { binary: item.isBinary });
+        }
       });
       upstream.on("message", (data, isBinary) => {
         const buffer = toBuffer(data);
         if (!record("fromTarget", buffer, isBinary, pair)) return;
         if (downstream.readyState === WebSocket.OPEN) downstream.send(buffer, { binary: isBinary });
       });
-      const closeBoth = (code: number, reason: Buffer) => {
-        pairs.delete(pair);
-        const text = reason.toString("utf8");
-        if (downstream.readyState === WebSocket.OPEN) downstream.close(portableCode(code), text);
-        if (upstream.readyState === WebSocket.OPEN) upstream.close(portableCode(code), text);
+      const onClose = (code: number, reason: Buffer) =>
+        closePair(pair, portableCode(code), reason.toString("utf8"));
+      downstream.on("close", onClose);
+      upstream.on("close", onClose);
+      const onError = (direction: WsTapDirection) => (error: Error) => {
+        if (isPayloadTooLarge(error)) markOverflow(direction, maxBytes, pair);
+        else closePair(pair, CLOSE_GOING_AWAY, "tap peer error");
       };
-      downstream.on("close", closeBoth);
-      upstream.on("close", closeBoth);
-      downstream.on("error", () => undefined);
-      upstream.on("error", () => {
-        if (downstream.readyState === WebSocket.OPEN) downstream.close(1011, "upstream error");
-      });
+      downstream.on("error", onError("toTarget"));
+      upstream.on("error", onError("fromTarget"));
     });
   });
 
@@ -162,6 +207,7 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
     },
     summary: () => ({
       connections,
+      openPairs: pairs.size,
       messages: messages.length,
       bytes: { ...bytes },
       sha256: {
@@ -171,7 +217,9 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
       overflow,
     }),
     async close() {
-      for (const pair of pairs) {
+      for (const pair of Array.from(pairs)) {
+        pair.closed = true;
+        pair.queued.length = 0;
         pair.downstream.terminate();
         pair.upstream.terminate();
       }
@@ -187,6 +235,10 @@ function toBuffer(data: WebSocket.RawData): Buffer {
   if (Buffer.isBuffer(data)) return data;
   if (Array.isArray(data)) return Buffer.concat(data);
   return Buffer.from(data);
+}
+
+function isPayloadTooLarge(error: Error): boolean {
+  return "code" in error && error.code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH";
 }
 
 function handshakeType(data: Buffer): WsTapMessage["plaintextHandshake"] {
