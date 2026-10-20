@@ -37,6 +37,8 @@ export class AllowlistEntryError extends Error {
 }
 
 const ENCODED_SEPARATOR = /%2f|%5c/i;
+const DOUBLE_ENCODING = /%25/;
+const DOT_SEGMENT = /^\.+(;.*)?$/;
 
 export function parseTrustedTarget(input: TrustedTargetInput): TrustedTarget {
   let url: URL;
@@ -99,12 +101,27 @@ export function parseRequestUrl(raw: string): URL {
 export function findAllowedTarget(allowlist: TrustedAllowlist, url: URL): TrustedTarget | null {
   for (const target of allowlist.targets) {
     if (target.origin !== url.origin) continue;
-    if (!url.pathname.startsWith(target.pathPrefix)) continue;
-    // A server may decode %2F after this check and walk out of the prefix.
-    if (target.pathPrefix !== "/" && ENCODED_SEPARATOR.test(url.pathname)) continue;
-    return target;
+    if (staysUnderPrefix(url.pathname, target.pathPrefix)) return target;
   }
   return null;
+}
+
+/**
+ * WHATWG normalization is not the server's. Under a narrower prefix, refuse every form a server
+ * could still turn into a separator or dot segment after this check: encoded slashes, double
+ * encoding (`%252f`), and path-parameter dot segments (`..;` in Tomcat and Spring).
+ */
+function staysUnderPrefix(pathname: string, prefix: string): boolean {
+  if (!pathname.startsWith(prefix)) return false;
+  if (prefix === "/") return true;
+  if (ENCODED_SEPARATOR.test(pathname) || DOUBLE_ENCODING.test(pathname)) return false;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return false;
+  }
+  return !decoded.split("/").some((segment) => DOT_SEGMENT.test(segment));
 }
 
 export function isAllowedOrigin(allowlist: TrustedAllowlist, origin: string): boolean {

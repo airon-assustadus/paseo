@@ -68,6 +68,11 @@ describe("trusted allowlist", () => {
     }
   });
 
+  it("lets the root prefix pass any path the URL parser normalized", () => {
+    const list = allowlist(["http://fixture.test", "/"]);
+    expect(allows(list, "http://fixture.test/a/..;/b%252f")).toBe(true);
+  });
+
   it("keeps requests inside the path prefix, encoded separators included", () => {
     const list = allowlist(["http://fixture.test", "/app/"]);
     expect(allows(list, "http://fixture.test/app/page")).toBe(true);
@@ -76,6 +81,12 @@ describe("trusted allowlist", () => {
     expect(allows(list, "http://fixture.test/app/..%2Fadmin")).toBe(false);
     expect(allows(list, "http://fixture.test/app/..%5cadmin")).toBe(false);
     expect(allows(list, "http://fixture.test/application")).toBe(false);
+    expect(allows(list, "http://fixture.test/app/..;/admin")).toBe(false);
+    expect(allows(list, "http://fixture.test/app/%2e%2e;jsessionid=1/admin")).toBe(false);
+    expect(allows(list, "http://fixture.test/app/.;/x")).toBe(false);
+    expect(allows(list, "http://fixture.test/app/..%252fadmin")).toBe(false);
+    expect(allows(list, "http://fixture.test/app/%E0%A4%A")).toBe(false);
+    expect(allows(list, "http://fixture.test/app/item;v=1/caf%C3%A9")).toBe(true);
   });
 
   it("drops the fragment and refuses credentials or a trailing dot in request URLs", () => {
