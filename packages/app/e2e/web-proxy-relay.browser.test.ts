@@ -75,9 +75,11 @@ const HARNESS_K3_LIMITS: BridgeLimits = {
 };
 const SESSION_TTL_MS = 60_000;
 // The fixture's http.createServer keeps Node's default maxHeaderSize; the margin leaves room for the
-// request line and the headers the core adds (host, origin, connection).
+// request line and the headers the core adds (host, accept-encoding, connection).
 const FIXTURE_HEADER_BLOCK_BYTES = 16_384;
 const FIXTURE_HEADER_MARGIN_BYTES = 4_096;
+// R2-4's outbound request frame, measured at the codec: at least this large.
+const MIN_LARGE_OUT_FRAME_BYTES = 24_576;
 // RV-14: the only module URL the page imports.
 const CODEC_MODULE_URL =
   /^\/@fs\/[^?#]+\/packages\/server\/src\/server\/network-fetch\/__fixtures__\/length-prefixed\.ts$/;
@@ -689,22 +691,34 @@ describe("web proxy over the local legacy relay (R2)", () => {
       const content = openK3(connection.transport, connection.capability);
       const nonce = createNonce();
 
-      // Outbound: a request frame whose header of quotes doubles under JSON escaping. Below the K3
-      // header budget and the session's head limit, and below the fixture's HTTP server, which keeps
-      // Node's default 16 KiB for the whole header block (request line and the core's own headers
-      // included), so no side refuses it.
+      // Outbound: a request frame whose header of quotes doubles under JSON escaping. The header is
+      // user-agent: the core forwards only its FORWARDED_REQUEST_HEADERS (network-fetch/headers.ts)
+      // and drops the rest, and the fixture records this one's value, so the destination's copy is
+      // compared with what was sent. Below the K3 header budget and the session's head limit, and
+      // below the fixture's HTTP server, which keeps Node's default 16 KiB for the whole header block
+      // (request line and the core's own headers included), so no side refuses it.
       const headBudget = Math.min(
         HARNESS_K3_LIMITS.maxHeaderBytes,
         connection.transport.limits.maxRequestHeadBytes,
         FIXTURE_HEADER_BLOCK_BYTES,
       );
       const pad = '"'.repeat(headBudget - FIXTURE_HEADER_MARGIN_BYTES);
-      content.send(k3Request(1, `/api/echo?n=${nonce}`, [["x-pad", pad]]));
+      expect(2 * pad.length).toBeGreaterThanOrEqual(MIN_LARGE_OUT_FRAME_BYTES);
+      content.send(k3Request(1, `/api/echo?n=${nonce}`, [["user-agent", pad]]));
       expect(await content.next()).toMatchObject({ type: "paseo.web.response.head", status: 200 });
       const echoed: unknown = JSON.parse(await readK3Body(content, 1));
+      const echoedHeaders = isRecord(echoed) && isRecord(echoed.headers) ? echoed.headers : null;
       expect(isRecord(echoed) && Array.isArray(echoed.headerNames)).toBe(true);
-      expect((echoed as { headerNames: unknown[] }).headerNames).toContain("x-pad");
-      expect(connection.meter.maxOutFrameBytes).toBeGreaterThanOrEqual(2 * pad.length);
+      expect((echoed as { headerNames: unknown[] }).headerNames).toContain("user-agent");
+      // Booleans and a length: a diff of the 12 KiB value would only bury the failure.
+      expect(echoedHeaders?.userAgent === pad).toBe(true);
+      const recorded = (await eventsOf(connection.connection.harness, "request")).filter(
+        (event): event is Record<string, unknown> => isRecord(event) && event.nonce === nonce,
+      );
+      expect(recorded.length).toBe(1);
+      const recordedHeaders = recorded[0]?.headers;
+      expect(isRecord(recordedHeaders) && recordedHeaders.userAgent === pad).toBe(true);
+      expect(connection.meter.maxOutFrameBytes).toBeGreaterThanOrEqual(MIN_LARGE_OUT_FRAME_BYTES);
 
       // Inbound: a multi-byte UTF-8 body echoed back as several body frames, compared whole.
       const body = "ação-".repeat(8_192);
@@ -719,6 +733,7 @@ describe("web proxy over the local legacy relay (R2)", () => {
       task.meta.r2 = {
         tunnelInitialWindowBytes: limits.initialWindowBytes,
         tunnelMaxDataBytes: limits.maxDataBytes,
+        userAgentBytes: pad.length,
         maxOutFrameBytes: connection.meter.maxOutFrameBytes,
         maxInPayloadBytes: connection.meter.maxInPayloadBytes,
         outFrames: connection.meter.outFrames,
