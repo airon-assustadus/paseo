@@ -6,6 +6,7 @@ import { FixtureRecorder, type FixtureListenerName } from "./recorder.js";
 import {
   createRequestListener,
   DEFAULT_FIXTURE_LIMITS,
+  releaseHeldPosts,
   type FixtureLimits,
   type FixtureState,
 } from "./routes.js";
@@ -67,6 +68,8 @@ export interface WebProxyFixture {
   readonly canary: FixtureListener | null;
   readonly events: FixtureRecorder;
   postCount(token: string): number;
+  /** Opens the `hold=1` barrier for `token`; returns how many held responses were released. */
+  releasePost(token: string): number;
   close(): Promise<void>;
 }
 
@@ -110,11 +113,16 @@ export async function startWebProxyFixture(
     allowedOrigins: new Set(options.peerOrigins ?? []),
     issuedCookieValues: new Set(),
     postCounts: new Map(),
+    heldPosts: [],
   };
   const managed: ManagedListener[] = [];
   let closing: Promise<void> | null = null;
   const close = () => {
-    closing ??= Promise.all(managed.map(closeListener)).then(() => undefined);
+    // Held responses die with their sockets; forget them so a late release cannot write.
+    closing ??= Promise.all(managed.map(closeListener)).then(() => {
+      state.heldPosts.length = 0;
+      return undefined;
+    });
     return closing;
   };
   const open = async (args: OpenListenerArgs) => {
@@ -151,6 +159,7 @@ export async function startWebProxyFixture(
       canary: canary?.info ?? null,
       events: state.recorder,
       postCount: (token) => state.postCounts.get(token) ?? 0,
+      releasePost: (token) => releaseHeldPosts(state, token),
       close,
     };
   } catch (error) {

@@ -110,6 +110,26 @@ export interface PostCountEvent extends FixtureEventBase {
   count: number;
 }
 
+/** A POST reached the route, before its body: the arrival detector for replay tests. */
+export interface PostArrivedEvent extends FixtureEventBase {
+  kind: "post.arrived";
+  token: string;
+  held: boolean;
+}
+
+/** A held POST response was released by the test; `delivered` is false if the client had left. */
+export interface PostReleasedEvent extends FixtureEventBase {
+  kind: "post.released";
+  token: string;
+  delivered: boolean;
+}
+
+/** A held POST lost its client before the test released it. */
+export interface PostAbandonedEvent extends FixtureEventBase {
+  kind: "post.abandoned";
+  token: string;
+}
+
 export type FixtureEvent =
   | RequestEvent
   | CanaryHitEvent
@@ -121,7 +141,10 @@ export type FixtureEvent =
   | WsClosedEvent
   | RedirectLandingEvent
   | ProbeReportEvent
-  | PostCountEvent;
+  | PostCountEvent
+  | PostArrivedEvent
+  | PostReleasedEvent
+  | PostAbandonedEvent;
 
 export type FixtureEventKind = FixtureEvent["kind"];
 export type FixtureEventOf<K extends FixtureEventKind> = Extract<FixtureEvent, { kind: K }>;
