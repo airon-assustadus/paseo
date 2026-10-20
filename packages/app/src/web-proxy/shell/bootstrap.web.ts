@@ -164,8 +164,13 @@ function startRelay(input: {
     toBroker(request, request.body === null ? [] : [request.body]);
   }
 
+  // Runs once; afterwards every worker request gets the same answer at once, not a timeout.
   function revoke(reason: BridgeRevokeReason): void {
+    if (revokedReason !== null) return;
     revokedReason = reason;
+    grant.port.removeEventListener("message", onBrokerMessage);
+    grant.port.removeEventListener("close", onBrokerPortClosed);
+    grant.port.removeEventListener("messageerror", onBrokerMessageError);
     for (const workerPort of pending.values()) toWorker(workerPort, revokeMessage(reason));
     pending.clear();
     grant.port.close();
@@ -190,8 +195,19 @@ function startRelay(input: {
     toWorker(workerPort, message);
   }
 
+  // The broker always announces a revocation; a port that dies without one is treated the same.
+  function onBrokerPortClosed(): void {
+    revoke("port_closed");
+  }
+
+  function onBrokerMessageError(): void {
+    revoke("protocol_error");
+  }
+
   options.window.navigator.serviceWorker.addEventListener("message", onWorkerMessage);
   grant.port.addEventListener("message", onBrokerMessage);
+  grant.port.addEventListener("close", onBrokerPortClosed);
+  grant.port.addEventListener("messageerror", onBrokerMessageError);
   grant.port.start();
 }
 

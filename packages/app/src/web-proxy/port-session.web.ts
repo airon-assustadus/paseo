@@ -218,10 +218,11 @@ export function startPortSession(options: PortSessionOptions): PortSession {
     }
     // Late acks and cancels race with the end of a request; they are not violations.
     const entry = inFlight.get(message.requestId);
-    if (!entry) return;
+    if (!entry || entry.abort.signal.aborted) return;
     if (message.type === "paseo.web.cancel") {
+      // The slot stays taken until serve() returns: a transport that honours the abort late
+      // still holds the request and its body, and that work must count toward the limit.
       abortEntry(entry);
-      inFlight.delete(message.requestId);
       return;
     }
     if (message.bytes > entry.unackedBytes) {

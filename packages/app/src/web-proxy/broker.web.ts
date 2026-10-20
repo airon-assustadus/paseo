@@ -29,17 +29,21 @@ export interface WebProxyBrokerOptions {
 }
 
 export interface WebProxyBroker {
-  frame: HTMLIFrameElement;
+  // The frame of the current generation; null once the generation ended. Every generation gets
+  // a fresh element, so no late event of a previous document can be mistaken for the next one.
+  getFrame(): HTMLIFrameElement | null;
   getState(): WebProxyBrokerState;
-  // Ends the current grant and blanks the frame. Terminal until reopen(), which loads the
-  // bootstrap again and hands out a new generation.
+  // Ends the current grant and removes the frame. Terminal until reopen(), which loads the
+  // bootstrap in a new frame and hands out a new generation.
   revoke(reason: BridgeRevokeReason): void;
   reopen(): void;
   dispose(): void;
 }
 
 export class WebProxyBrokerSetupError extends Error {
-  constructor(readonly problem: "detached_container" | "bootstrap_off_origin") {
+  constructor(
+    readonly problem: "detached_container" | "bootstrap_off_origin" | "content_origin_is_control",
+  ) {
     super(`Web proxy broker cannot start: ${problem}`);
     this.name = "WebProxyBrokerSetupError";
   }
@@ -63,18 +67,19 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
   const capability = createCapability(options.capability);
   const limits = validateBridgeLimits(options.limits ?? DEFAULT_BRIDGE_LIMITS);
   const ownerWindow = getOwnerWindow(options.container);
+  // Content on the control origin would read the control's DOM and storage. Same registrable
+  // site cannot be checked here (no PSL); that stays a deployment gate.
+  if (capability.contentOrigin === ownerWindow.location.origin) {
+    throw new WebProxyBrokerSetupError("content_origin_is_control");
+  }
   const bootstrapUrl = new URL(options.bootstrapPath, capability.contentOrigin);
   if (bootstrapUrl.origin !== capability.contentOrigin) {
     throw new WebProxyBrokerSetupError("bootstrap_off_origin");
   }
 
-  // oxlint-disable-next-line react/iframe-missing-sandbox -- set on the next line, before src.
-  const frame = options.container.ownerDocument.createElement("iframe");
-  frame.setAttribute("sandbox", FRAME_SANDBOX);
-  frame.referrerPolicy = "no-referrer";
   let state: WebProxyBrokerState = { status: "loading", generation: 0 };
+  let frame: HTMLIFrameElement | null = null;
   let session: PortSession | null = null;
-  let expectingLoad = false;
   let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 
   function setState(next: WebProxyBrokerState): void {
@@ -82,13 +87,17 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     options.onStateChange?.(next);
   }
 
-  // Ending a generation also unloads whatever the content origin left in the frame.
-  function terminate(next: WebProxyBrokerState): void {
+  function clearHandshakeTimer(): void {
     if (handshakeTimer !== null) clearTimeout(handshakeTimer);
     handshakeTimer = null;
-    expectingLoad = false;
+  }
+
+  // Ending a generation also unloads whatever the content origin left in the frame.
+  function terminate(next: WebProxyBrokerState): void {
+    clearHandshakeTimer();
     setState(next);
-    frame.src = "about:blank";
+    frame?.remove();
+    frame = null;
   }
 
   function revoke(reason: BridgeRevokeReason): void {
@@ -99,34 +108,46 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     terminate({ status: "revoked", generation: state.generation, reason });
   }
 
-  function navigate(): void {
-    expectingLoad = true;
-    setState({ status: "loading", generation: state.generation + 1 });
-    frame.src = bootstrapUrl.href;
+  function createFrame(): HTMLIFrameElement {
+    // oxlint-disable-next-line react/iframe-missing-sandbox -- set on the next line, before src.
+    const created = options.container.ownerDocument.createElement("iframe");
+    created.setAttribute("sandbox", FRAME_SANDBOX);
+    created.referrerPolicy = "no-referrer";
+    let awaitingBootstrap = true;
+    created.addEventListener("load", () => {
+      if (created !== frame || isTerminal(state)) return;
+      if (!awaitingBootstrap) {
+        // The content origin navigated its own top frame. The new document never gets the
+        // current port, and its hello is ignored until the control reopens.
+        revoke("frame_navigated");
+        return;
+      }
+      // Before the bootstrap commits, the only readable document is the element's initial
+      // about:blank, which belongs to this origin; the bootstrap (another origin) never is.
+      if (created.contentDocument !== null) return;
+      awaitingBootstrap = false;
+      setState({ status: "awaiting_hello", generation: state.generation });
+    });
+    return created;
   }
 
-  function onLoad(): void {
-    // A readable document is the control's own about:blank; content-origin and opaque
-    // documents are never readable from here.
-    if (isTerminal(state) || frame.contentDocument !== null) return;
-    if (!expectingLoad) {
-      // The content origin navigated its own top frame. The new document never gets the
-      // current port, and its hello is ignored until the control reopens.
-      revoke("frame_navigated");
-      return;
-    }
-    expectingLoad = false;
-    setState({ status: "awaiting_hello", generation: state.generation });
+  // The deadline covers loading and the hello: a bootstrap that never loads fails too.
+  function navigate(): void {
+    const generation = state.generation + 1;
+    setState({ status: "loading", generation });
+    frame = createFrame();
     handshakeTimer = setTimeout(() => {
       handshakeTimer = null;
-      if (state.status !== "awaiting_hello") return;
-      terminate({ status: "failed", generation: state.generation, reason: "handshake_timeout" });
+      if (state.status !== "loading" && state.status !== "awaiting_hello") return;
+      terminate({ status: "failed", generation, reason: "handshake_timeout" });
     }, options.handshakeTimeoutMs);
+    // src before insertion, so the first navigation the element performs is the bootstrap's.
+    frame.src = bootstrapUrl.href;
+    options.container.appendChild(frame);
   }
 
   function grant(target: Window): void {
-    if (handshakeTimer !== null) clearTimeout(handshakeTimer);
-    handshakeTimer = null;
+    clearHandshakeTimer();
     const channel = new MessageChannel();
     const generation = state.generation;
     const granted = startPortSession({
@@ -152,7 +173,7 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
 
   function onWindowMessage(event: MessageEvent): void {
     if (parseHello(event.data) === null) return;
-    const target = frame.contentWindow;
+    const target = frame?.contentWindow ?? null;
     const isOwnFrame =
       event.origin === capability.contentOrigin && target !== null && event.source === target;
     if (!isOwnFrame || state.status !== "awaiting_hello") return;
@@ -161,19 +182,17 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
 
   function dispose(): void {
     revoke("disposed");
+    clearHandshakeTimer();
+    frame?.remove();
+    frame = null;
     ownerWindow.removeEventListener("message", onWindowMessage);
-    frame.removeEventListener("load", onLoad);
-    frame.remove();
   }
 
   ownerWindow.addEventListener("message", onWindowMessage);
-  frame.addEventListener("load", onLoad);
-  // src before insertion: the frame's first load event is the bootstrap's, not about:blank's.
   navigate();
-  options.container.appendChild(frame);
 
   return {
-    frame,
+    getFrame: () => frame,
     getState: () => state,
     revoke,
     reopen: () => {

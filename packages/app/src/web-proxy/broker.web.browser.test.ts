@@ -8,7 +8,12 @@ import {
   type FixtureTransport,
 } from "./__fixtures__/fixture-transport";
 import { HARNESS, harnessContentOrigin } from "./__fixtures__/shell/harness";
-import { attachWebProxyBroker, type WebProxyBroker, type WebProxyBrokerState } from "./broker.web";
+import {
+  attachWebProxyBroker,
+  WebProxyBrokerSetupError,
+  type WebProxyBroker,
+  type WebProxyBrokerState,
+} from "./broker.web";
 
 // Control = this test page on "localhost"; content = "wp-a.localhost"; adversary =
 // "wp-b.localhost". Separate origins on one server: this proves origin checks and forwarding,
@@ -67,8 +72,6 @@ function mount(input: {
     handshakeTimeoutMs: input.handshakeTimeoutMs ?? 10_000,
     onStateChange: (state) => states.push(state),
   });
-  broker.frame.style.width = "800px";
-  broker.frame.style.height = "600px";
   mounted.push(broker);
   return { broker, transport, states };
 }
@@ -84,6 +87,12 @@ function buttonPosition(report: unknown): { x: number; y: number } {
   const { x, y } = button;
   if (typeof x !== "number" || typeof y !== "number") throw new Error("malformed button position");
   return { x, y };
+}
+
+function currentFrame(broker: WebProxyBroker): HTMLIFrameElement {
+  const frame = broker.getFrame();
+  if (frame === null) throw new Error("broker has no frame in this generation");
+  return frame;
 }
 
 function requestedUrls(transport: FixtureTransport): string[] {
@@ -109,6 +118,9 @@ beforeEach(() => {
   received = [];
   window.addEventListener("message", record);
   container = document.createElement("div");
+  const sizing = document.createElement("style");
+  sizing.textContent = "iframe { width: 800px; height: 600px; }";
+  container.append(sizing);
   document.body.append(container);
 });
 
@@ -146,7 +158,7 @@ describe("web proxy broker and shell", () => {
     // A real pointer click from the browser, aimed at the button inside the proxied document.
     // Vitest's frame locator enters one frame level; the app frame is clicked at the position
     // the app reported for its own button.
-    const shell = page.frameLocator(page.elementLocator(broker.frame));
+    const shell = page.frameLocator(page.elementLocator(currentFrame(broker)));
     const position = buttonPosition(report);
     await shell.getByTestId("paseo-web-proxy-app").click({ position });
     expect(await waitForMessages(CONTENT_A, "fixture.clicked", 1)).toEqual([
@@ -204,6 +216,54 @@ describe("web proxy broker and shell", () => {
     expect(paths).not.toContain("/pixel.png");
   }, 30_000);
 
+  it("refuses the control origin as content origin before creating a frame or a port", () => {
+    const transport = createFixtureTransport({ index: "app" });
+    expect(() =>
+      attachWebProxyBroker({
+        capability: {
+          contentOrigin: location.origin,
+          destinationOrigin: FIXTURE_DESTINATION_ORIGIN,
+          pathPrefix: "/",
+        },
+        transport,
+        container,
+        bootstrapPath: HARNESS.bootstrapPath,
+        handshakeTimeoutMs: 1_000,
+      }),
+    ).toThrow(new WebProxyBrokerSetupError("content_origin_is_control"));
+    expect(container.querySelector("iframe")).toBeNull();
+    expect(transport.requests).toEqual([]);
+  });
+
+  it("fails with handshake_timeout when the bootstrap origin never answers", async () => {
+    const states: WebProxyBrokerState[] = [];
+    const broker = attachWebProxyBroker({
+      // Nothing listens on port 9 of the loopback: the frame never runs a bootstrap.
+      capability: {
+        contentOrigin: "http://wp-a.localhost:9",
+        destinationOrigin: FIXTURE_DESTINATION_ORIGIN,
+        pathPrefix: "/",
+      },
+      transport: createFixtureTransport({ index: "app" }),
+      container,
+      bootstrapPath: HARNESS.bootstrapPath,
+      handshakeTimeoutMs: 2_000,
+      onStateChange: (state) => states.push(state),
+    });
+    mounted.push(broker);
+    await vi.waitFor(
+      () =>
+        expect(broker.getState()).toEqual({
+          status: "failed",
+          generation: 1,
+          reason: "handshake_timeout",
+        }),
+      SLOW,
+    );
+    expect(grants(states)).toEqual([]);
+    expect(broker.getFrame()).toBeNull();
+  }, 30_000);
+
   it("ignores hellos from another origin and from another frame of the content origin", async () => {
     const { broker, transport } = mount({
       index: "app",
@@ -253,19 +313,21 @@ describe("web proxy broker and shell", () => {
         }),
       SLOW,
     );
-    await vi.waitFor(() => expect(broker.frame.contentDocument?.URL).toBe("about:blank"), SLOW);
+    expect(broker.getFrame()).toBeNull();
+    expect(container.querySelector("iframe")).toBeNull();
     expect(grants(states)).toEqual([{ status: "granted", generation: 1 }]);
     expect(broker.getState().status).toBe("revoked");
     expect(transport.requests.map((request) => new URL(request.url).pathname)).toEqual(["/"]);
   }, 30_000);
 
-  it("aborts the host request and blanks the frame on revocation", async () => {
+  it("aborts the host request and removes the frame on revocation", async () => {
     const { broker, transport } = mount({ index: "hang" });
     await transport.waitForHangRequest();
     broker.revoke("disposed");
     await transport.waitForHangAbort();
     expect(broker.getState()).toEqual({ status: "revoked", generation: 1, reason: "disposed" });
-    await vi.waitFor(() => expect(broker.frame.contentDocument?.URL).toBe("about:blank"), SLOW);
+    expect(broker.getFrame()).toBeNull();
+    expect(container.querySelector("iframe")).toBeNull();
   }, 30_000);
 
   it("answers bridge_timeout to the page and cancels the host request when no head arrives", async () => {

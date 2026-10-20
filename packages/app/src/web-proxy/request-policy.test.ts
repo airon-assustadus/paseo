@@ -52,6 +52,11 @@ describe("resolveDestinationUrl", () => {
     ["encoded dot segments", "/app/%2e%2e/admin"],
     ["an encoded slash", "/app/..%2fadmin"],
     ["an encoded backslash", "/app/..%5Cadmin"],
+    ["a path-parameter dot segment", "/app/..;/admin"],
+    ["an encoded path-parameter dot segment", "/app/%2e%2e;/admin"],
+    ["a triple-dot segment", "/app/.../x"],
+    ["double encoding", "/app/..%252fadmin"],
+    ["a malformed escape", "/app/%E0%A4%A"],
   ])("refuses %s outside the prefix", (_label, path) => {
     expect(resolveDestinationUrl(SCOPED, path)).toEqual({ kind: "path_not_allowed" });
   });
@@ -72,6 +77,8 @@ describe("createCapability", () => {
     ["pathPrefix", { ...ROOT, pathPrefix: "//app/" }],
     ["pathPrefix", { ...ROOT, pathPrefix: "/a/../b/" }],
     ["pathPrefix", { ...ROOT, pathPrefix: "/a%2fb/" }],
+    ["pathPrefix", { ...ROOT, pathPrefix: "/a/..;/" }],
+    ["pathPrefix", { ...ROOT, pathPrefix: "/a/.../" }],
   ] as const)("rejects an invalid %s", (field, capability) => {
     expect(() => createCapability(capability)).toThrow(new InvalidCapabilityError(field));
   });
@@ -120,6 +127,43 @@ describe("filterResponseHeaders", () => {
       }),
     ).toEqual({ kind: "pass", headers: [["content-type", "text/html"]] });
   });
+
+  it("drops report-only policies and reporting endpoints but keeps the destination's CSP", () => {
+    expect(
+      filterResponseHeaders({
+        status: 200,
+        headers: [
+          ["Reporting-Endpoints", 'main="https://reports.invalid/"'],
+          ["Content-Security-Policy-Report-Only", "default-src 'none'; report-uri /r"],
+          [
+            "Content-Security-Policy",
+            "default-src 'self'; report-uri https://reports.invalid/; report-to main, " +
+              "img-src 'none';REPORT-URI /r",
+          ],
+          ["Content-Security-Policy", "report-uri https://reports.invalid/"],
+        ],
+        requestUrl,
+        capability: ROOT,
+      }),
+    ).toEqual({
+      kind: "pass",
+      headers: [["content-security-policy", "default-src 'self', img-src 'none'"]],
+    });
+  });
+
+  it.each(["/app/..;/admin", "/app/..%252fadmin"])(
+    "blocks a redirect to %s under a narrower prefix",
+    (location) => {
+      expect(
+        filterResponseHeaders({
+          status: 302,
+          headers: [["location", location]],
+          requestUrl,
+          capability: SCOPED,
+        }),
+      ).toEqual({ kind: "redirect_blocked" });
+    },
+  );
 
   it("turns a redirect inside the capability into a path", () => {
     expect(

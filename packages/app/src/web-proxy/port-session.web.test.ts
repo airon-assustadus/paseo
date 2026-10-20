@@ -420,6 +420,31 @@ describe("startPortSession", () => {
     expect(await harness.next()).toMatchObject({ type: "paseo.web.response.end" });
   });
 
+  it("keeps a cancelled request's slot until the transport lets go of it", async () => {
+    const releases: Array<() => void> = [];
+    const harness = start({
+      // A transport that honours the abort only later, like a cancel crossing a relay.
+      respond: () =>
+        new Promise((resolve) => {
+          releases.push(() => resolve(ok(null)));
+        }),
+      limits: { ...DEFAULT_BRIDGE_LIMITS, maxConcurrentRequests: 2 },
+    });
+    for (const requestId of [1, 2]) {
+      send(harness.content, requestMessage({ requestId }));
+      send(harness.content, { type: "paseo.web.cancel", v: 1, generation: 1, requestId });
+    }
+    send(harness.content, requestMessage({ requestId: 3 }));
+    expect(await harness.next()).toMatchObject({ requestId: 3, code: "too_many_requests" });
+    expect(abortedFlags(harness)).toEqual([true, true]);
+
+    for (const release of releases.splice(0)) release();
+    send(harness.content, requestMessage({ requestId: 4 }));
+    await vi.waitFor(() => expect(releases).toHaveLength(1));
+    for (const release of releases.splice(0)) release();
+    expect(await harness.next()).toMatchObject({ type: "paseo.web.response.head", requestId: 4 });
+  });
+
   it("answers too_many_requests above the concurrency limit", async () => {
     const harness = start({
       respond: hanging,

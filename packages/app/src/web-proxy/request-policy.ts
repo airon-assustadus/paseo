@@ -24,13 +24,23 @@ function isExactHttpOrigin(value: string): boolean {
   return isHttp && url.origin === value;
 }
 
+// Same rules as the transport core (network-fetch/allowlist.ts): WHATWG normalization is not the
+// server's, so under a narrower prefix refuse every form a server could still turn into a
+// separator or dot segment after this check.
 const ENCODED_SEPARATOR = /%(2f|5c)/i;
+const DOUBLE_ENCODING = /%25/;
+// "..", "...", "..;x", ".;" — Tomcat and Spring read "..;" as "..".
+const DOT_SEGMENT = /^\.+(;.*)?$/;
+
+function hasDotSegment(path: string): boolean {
+  return path.split("/").some((segment) => DOT_SEGMENT.test(segment));
+}
 
 // The prefix must already be in the form URL parsing produces, so a comparison on the
 // normalized request path is exact.
 function isCanonicalPathPrefix(prefix: string): boolean {
   if (!prefix.startsWith("/") || !prefix.endsWith("/") || prefix.startsWith("//")) return false;
-  if (prefix.includes("%") || prefix.includes("\\")) return false;
+  if (prefix.includes("%") || prefix.includes("\\") || hasDotSegment(prefix)) return false;
   return new URL(prefix, "http://prefix.invalid").pathname === prefix;
 }
 
@@ -65,9 +75,19 @@ export type DestinationUrlResult =
   | { kind: "path_not_allowed" };
 
 function isInsidePrefix(url: URL, capability: WebProxyCapability): boolean {
+  const { pathname } = url;
+  if (!pathname.startsWith(capability.pathPrefix)) return false;
   if (capability.pathPrefix === "/") return true;
-  // Encoded separators could be decoded upstream into a path outside the prefix.
-  return url.pathname.startsWith(capability.pathPrefix) && !ENCODED_SEPARATOR.test(url.pathname);
+  if (ENCODED_SEPARATOR.test(pathname) || DOUBLE_ENCODING.test(pathname)) return false;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch (error) {
+    // A malformed escape is not a path any server agrees on.
+    if (error instanceof URIError) return false;
+    throw error;
+  }
+  return !hasDotSegment(decoded);
 }
 
 export function resolveDestinationUrl(
@@ -117,10 +137,32 @@ const DROPPED_RESPONSE_HEADERS = new Set([
   "public-key-pins",
   "public-key-pins-report-only",
   "report-to",
+  "reporting-endpoints",
   "nel",
+  "content-security-policy-report-only",
   "clear-site-data",
   "location",
 ]);
+
+// Reports would leave the phone straight to the destination's endpoint, outside the host.
+// Every other directive of the destination's policy stays in force.
+const REPORTING_DIRECTIVES = new Set(["report-uri", "report-to"]);
+
+function withoutReporting(policyList: string): string | null {
+  const policies: string[] = [];
+  for (const policy of policyList.split(",")) {
+    const directives = policy
+      .split(";")
+      .map((directive) => directive.trim())
+      .filter((directive) => directive !== "");
+    const kept = directives.filter((directive) => {
+      const [name = ""] = directive.split(/\s+/, 1);
+      return !REPORTING_DIRECTIVES.has(name.toLowerCase());
+    });
+    if (kept.length > 0) policies.push(kept.join("; "));
+  }
+  return policies.length > 0 ? policies.join(", ") : null;
+}
 
 function isDroppedRequestHeader(name: string): boolean {
   return DROPPED_REQUEST_HEADERS.has(name) || name.startsWith("sec-") || name.startsWith("proxy-");
@@ -171,9 +213,13 @@ export function filterResponseHeaders(input: {
   for (const [rawName, value] of input.headers) {
     const name = rawName.toLowerCase();
     if (name === "location") location = value;
-    if (!DROPPED_RESPONSE_HEADERS.has(name) && !name.startsWith("proxy-")) {
-      kept.push([name, value]);
+    if (DROPPED_RESPONSE_HEADERS.has(name) || name.startsWith("proxy-")) continue;
+    if (name === "content-security-policy") {
+      const policy = withoutReporting(value);
+      if (policy !== null) kept.push([name, policy]);
+      continue;
     }
+    kept.push([name, value]);
   }
   if (location === null) return { kind: "pass", headers: kept };
   if (!REDIRECT_STATUSES.has(input.status)) return { kind: "pass", headers: kept };
