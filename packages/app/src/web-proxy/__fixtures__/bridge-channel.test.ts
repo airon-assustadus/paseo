@@ -6,6 +6,7 @@ import {
   BridgeChannelUsageError,
   openBridgeChannel,
   type BridgeConnection,
+  type BridgeHarness,
   type BridgeSocket,
   type BridgeSocketHandlers,
 } from "./bridge-channel";
@@ -31,6 +32,11 @@ const FIXTURE = {
   canary: { origin: "http://127.0.0.1:4205" },
 };
 const READY = { type: "harness.ready", fixture: FIXTURE };
+
+// What a caller outside the type system could pass, e.g. a kind the host does not know.
+function untypedEvents(harness: BridgeHarness, query: Record<string, unknown>): Promise<unknown> {
+  return Reflect.apply(harness.events, harness, [query]);
+}
 
 function utf8Bytes(text: string): number {
   return new TextEncoder().encode(text).byteLength;
@@ -575,6 +581,61 @@ describe("harness queries", () => {
     });
     await expect(first).rejects.toEqual(new BridgeChannelError("violation"));
     expect(listening.lost.count).toBe(1);
+  });
+
+  it("returns the host's release count for the token it asked about", async () => {
+    const listening = await connect();
+    const release = listening.connection.harness.release("post-1");
+    expect(JSON.parse(listening.fake.sent.at(-1) ?? "")).toEqual({
+      type: "fixture.release",
+      token: "post-1",
+    });
+    receive(listening, { type: "fixture.release.result", token: "post-1", released: 1 });
+    expect(await release).toBe(1);
+
+    const none = listening.connection.harness.release("post-2");
+    receive(listening, { type: "fixture.release.result", token: "post-2", released: 0 });
+    expect(await none).toBe(0);
+    expect(listening.lost.count).toBe(0);
+  });
+
+  it.each([
+    ["another token", { token: "post-9", released: 1 }],
+    ["a boolean count", { token: "post-1", released: true }],
+    ["a negative count", { token: "post-1", released: -1 }],
+    ["a fractional count", { token: "post-1", released: 1.5 }],
+    ["a count above the host's held limit", { token: "post-1", released: 65 }],
+    ["no token", { released: 1 }],
+    ["an extra field", { token: "post-1", released: 1, count: 1 }],
+  ])("ends the channel on a release result with %s", async (_label, result) => {
+    const listening = await connect();
+    const release = listening.connection.harness.release("post-1");
+    receive(listening, { type: "fixture.release.result", ...result });
+    await expect(release).rejects.toEqual(new BridgeChannelError("violation"));
+    expect(listening.lost.count).toBe(1);
+  });
+
+  it.each([
+    [
+      "an unknown event kind",
+      (harness: BridgeHarness) => untypedEvents(harness, { kind: "post.arive" }),
+    ],
+    ["a negative cursor", (harness: BridgeHarness) => harness.events({ after: -1 })],
+    ["a release token with a space", (harness: BridgeHarness) => harness.release("post 1")],
+    ["an empty release token", (harness: BridgeHarness) => harness.release("")],
+    [
+      "a release token over 64 characters",
+      (harness: BridgeHarness) => harness.release("a".repeat(65)),
+    ],
+    ["a stats id of zero", (harness: BridgeHarness) => harness.stats(0)],
+  ])("refuses %s locally, without a frame and without ending the channel", async (_label, ask) => {
+    const listening = await connect();
+    await expect(ask(listening.connection.harness)).rejects.toEqual(
+      new BridgeChannelUsageError("invalid_query"),
+    );
+    expect(listening.fake.sent).toHaveLength(1);
+    expect(listening.lost.count).toBe(0);
+    expect(listening.fake.closes).toEqual([]);
   });
 
   it("rejects pending queries when the socket closes", async () => {
