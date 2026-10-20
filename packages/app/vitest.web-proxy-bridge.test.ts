@@ -342,6 +342,41 @@ function legEvidence(extra: Record<string, unknown> = {}) {
   };
 }
 
+/** `BridgeHost.stats` as the stack copies it, plus members it must never pass on. */
+function hostTotals(extra: Record<string, unknown> = {}) {
+  return { connections: 3, authenticatedConnections: 2, sessionsOpened: 2, ...extra };
+}
+
+/** Host stats members outside the decided totals, and an authority value, that must not cross. */
+const HOST_STATS_EXTRAS = {
+  fixtureQueries: 5,
+  activeSockets: 1,
+  rawSockets: 1,
+  truncatedFrames: 0,
+  token: HOST_TOKEN,
+};
+
+const HOST_TOTAL_FIELDS = ["connections", "authenticatedConnections", "sessionsOpened"] as const;
+
+const INVALID_TOTALS: [string, unknown][] = [
+  ["negative", -1],
+  ["fractional", 1.5],
+  ["above MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER + 1],
+  ["NaN", Number.NaN],
+  ["Infinity", Number.POSITIVE_INFINITY],
+  ["a numeric string", "3"],
+  ["a bigint", 3n],
+  ["null", null],
+  ["missing", undefined],
+];
+
+const INVALID_HOST_TOTALS = HOST_TOTAL_FIELDS.flatMap((field) =>
+  INVALID_TOTALS.map(([label, value]): [string, Record<string, unknown>] => [
+    `${field} ${label}`,
+    hostTotals({ [field]: value }),
+  ]),
+);
+
 /** A stack shaped as relay-r2-backend-contract.md publishes it, Node-only members included. */
 function canonicalStack(log: string[], overrides: Record<string, unknown> = {}) {
   return {
@@ -356,7 +391,11 @@ function canonicalStack(log: string[], overrides: Record<string, unknown> = {}) 
     },
     evidence: (markers: { nonce: string }) => {
       log.push(`evidence:${JSON.stringify(markers)}`);
-      return { clientLeg: legEvidence(), daemonLeg: legEvidence({ connections: 2 }) };
+      return {
+        clientLeg: legEvidence(),
+        daemonLeg: legEvidence({ connections: 2 }),
+        host: hostTotals(),
+      };
     },
     close: async () => {
       log.push("stack-close");
@@ -798,8 +837,13 @@ describe("webProxyRelayRestart command", () => {
 });
 
 describe("webProxyRelayEvidence command", () => {
-  it("passes the nonce and copies both legs field by field", async () => {
-    const raw = { clientLeg: legEvidence({ payload: "AAAA" }), daemonLeg: legEvidence() };
+  it("passes the nonce and copies both legs and the host totals field by field", async () => {
+    const raw = {
+      clientLeg: legEvidence({ payload: "AAAA" }),
+      daemonLeg: legEvidence(),
+      host: hostTotals(HOST_STATS_EXTRAS),
+      offer: { serverId: SERVER_ID },
+    };
     const received: unknown[] = [];
     const { run, commands } = await startedRelay({
       evidence: (markers: unknown) => {
@@ -811,7 +855,15 @@ describe("webProxyRelayEvidence command", () => {
     const evidence = await commands.webProxyRelayEvidence(run.context, NONCE);
 
     expect(received).toEqual([{ nonce: NONCE }]);
-    expect(evidence).toEqual({ clientLeg: legEvidence(), daemonLeg: legEvidence() });
+    expect(evidence).toEqual({
+      clientLeg: legEvidence(),
+      daemonLeg: legEvidence(),
+      host: { connections: 3, authenticatedConnections: 2, sessionsOpened: 2 },
+    });
+    const serialized = JSON.stringify(evidence);
+    expect(serialized).not.toContain(HOST_TOKEN);
+    expect(serialized).not.toContain(SERVER_ID);
+    expect(evidence.host).not.toBe(raw.host);
     expect(evidence.clientLeg.contains.token).not.toBe(raw.clientLeg.contains.token);
     expect(evidence.clientLeg.handshake).not.toBe(raw.clientLeg.handshake);
   });
@@ -868,7 +920,11 @@ describe("webProxyRelayEvidence command", () => {
     ],
   ])("refuses evidence with %s", async (_case, patch) => {
     const { run, commands } = await startedRelay({
-      evidence: () => ({ clientLeg: legEvidence(patch), daemonLeg: legEvidence() }),
+      evidence: () => ({
+        clientLeg: legEvidence(patch),
+        daemonLeg: legEvidence(),
+        host: hostTotals(),
+      }),
     });
 
     await expect(commands.webProxyRelayEvidence(run.context, NONCE)).rejects.toMatchObject({
@@ -879,12 +935,55 @@ describe("webProxyRelayEvidence command", () => {
   it("accepts an overflow with its direction and limit", async () => {
     const overflow = { direction: "fromTarget", limit: 1_048_576 };
     const { run, commands } = await startedRelay({
-      evidence: () => ({ clientLeg: legEvidence({ overflow }), daemonLeg: legEvidence() }),
+      evidence: () => ({
+        clientLeg: legEvidence({ overflow }),
+        daemonLeg: legEvidence(),
+        host: hostTotals(),
+      }),
     });
 
     const evidence = await commands.webProxyRelayEvidence(run.context, NONCE);
 
     expect(evidence.clientLeg.overflow).toEqual(overflow);
+  });
+
+  it.each([
+    ["zero", 0],
+    ["MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER],
+  ])("accepts host totals of %s", async (_case, value) => {
+    const host = { connections: value, authenticatedConnections: value, sessionsOpened: value };
+    const { run, commands } = await startedRelay({
+      evidence: () => ({ clientLeg: legEvidence(), daemonLeg: legEvidence(), host }),
+    });
+
+    const evidence = await commands.webProxyRelayEvidence(run.context, NONCE);
+
+    expect(evidence.host).toEqual(host);
+  });
+
+  it.each(INVALID_HOST_TOTALS)("refuses host totals with %s", async (_case, host) => {
+    const { run, commands } = await startedRelay({
+      evidence: () => ({ clientLeg: legEvidence(), daemonLeg: legEvidence(), host }),
+    });
+
+    await expect(commands.webProxyRelayEvidence(run.context, NONCE)).rejects.toMatchObject({
+      problem: "relay_result_invalid",
+    });
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["null", null],
+    ["a number", 3],
+    ["an array of the totals", [3, 2, 2]],
+  ])("refuses evidence whose host is %s", async (_case, host) => {
+    const { run, commands } = await startedRelay({
+      evidence: () => ({ clientLeg: legEvidence(), daemonLeg: legEvidence(), host }),
+    });
+
+    await expect(commands.webProxyRelayEvidence(run.context, NONCE)).rejects.toMatchObject({
+      problem: "relay_result_invalid",
+    });
   });
 });
 

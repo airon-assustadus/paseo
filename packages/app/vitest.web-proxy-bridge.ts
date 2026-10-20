@@ -65,9 +65,20 @@ export interface WebProxyRelayLegEvidence {
   contains: Record<"nonce" | "token" | "hello", Record<RelayTapDirection, boolean>>;
 }
 
+/**
+ * Host totals across both listeners; the host does not count per transport. The page compares them
+ * with the channel openings and sessions it made itself through the tunnel (RV-7).
+ */
+export interface WebProxyRelayHostTotals {
+  connections: number;
+  authenticatedConnections: number;
+  sessionsOpened: number;
+}
+
 export interface WebProxyRelayEvidence {
   clientLeg: WebProxyRelayLegEvidence;
   daemonLeg: WebProxyRelayLegEvidence;
+  host: WebProxyRelayHostTotals;
 }
 
 declare module "vitest/browser" {
@@ -486,11 +497,21 @@ function parseLeg(value: unknown): WebProxyRelayLegEvidence | null {
   };
 }
 
+function parseHostTotals(value: unknown): WebProxyRelayHostTotals | null {
+  if (!isRecord(value)) return null;
+  const { connections, authenticatedConnections, sessionsOpened } = value;
+  if (!isCount(connections) || !isCount(authenticatedConnections) || !isCount(sessionsOpened)) {
+    return null;
+  }
+  return { connections, authenticatedConnections, sessionsOpened };
+}
+
 function parseEvidence(value: unknown): WebProxyRelayEvidence | null {
   if (!isRecord(value)) return null;
   const clientLeg = parseLeg(value.clientLeg);
   const daemonLeg = parseLeg(value.daemonLeg);
-  return clientLeg && daemonLeg ? { clientLeg, daemonLeg } : null;
+  const host = parseHostTotals(value.host);
+  return clientLeg && daemonLeg && host ? { clientLeg, daemonLeg, host } : null;
 }
 
 /** The three operations the commands use; host, daemon, relay and taps stay out of reach. */
