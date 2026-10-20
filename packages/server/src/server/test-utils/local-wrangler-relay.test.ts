@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +9,7 @@ import { createProcessTable, type ProcessIdentity } from "../remote-browser/proc
 import {
   LocalRelayError,
   WRANGLER_DECLARING_PACKAGE,
+  assertWranglerConfigIsolated,
   relayEnvironment,
   resolveWrangler,
   sanitizeRelayOutput,
@@ -223,6 +224,8 @@ describe.skipIf(process.platform !== "linux")("owned relay process lifecycle", (
     for (const identity of owned) expect(await running(identity)).toBe(true);
     expect(started.instance).toEqual(owned[0]);
     expect(existsSync(started.workDir)).toBe(true);
+    expect(context.dirs.config).toBe(path.join(started.workDir, "config"));
+    expect(existsSync(context.dirs.config)).toBe(true);
 
     await started.stop();
     await started.stop();
@@ -230,6 +233,7 @@ describe.skipIf(process.platform !== "linux")("owned relay process lifecycle", (
     for (const identity of owned) expect(await running(identity)).toBe(false);
     expect(await portAccepts(context.port)).toBe(false);
     expect(existsSync(started.workDir)).toBe(false);
+    expect(existsSync(context.dirs.config)).toBe(false);
     expect(started.exited).toBe(true);
     expect(() => started.instance).toThrow(expect.objectContaining({ problem: "stopped" }));
   });
@@ -385,7 +389,13 @@ describe("wrangler resolution and launch", () => {
     const context: RelayLaunchContext = {
       port: 41_234,
       inspectorPort: 41_235,
-      dirs: { state: "/w/state", logs: "/w/logs", registry: "/w/registry", cache: "/w/cache" },
+      dirs: {
+        state: "/w/state",
+        logs: "/w/logs",
+        registry: "/w/registry",
+        cache: "/w/cache",
+        config: "/w/config",
+      },
     };
     const installation = {
       version: "4.105.0",
@@ -418,13 +428,33 @@ describe("wrangler resolution and launch", () => {
     ]);
   });
 
+  it("refuses to start when a legacy ~/.wrangler would bypass XDG_CONFIG_HOME", async () => {
+    const isolatedHome = await scratchDir();
+    const legacyHome = await scratchDir();
+    await mkdir(path.join(legacyHome, ".wrangler"));
+    await mkdir(path.join(isolatedHome, ".config"));
+
+    expect(() => assertWranglerConfigIsolated(isolatedHome)).not.toThrow();
+    expect(() => assertWranglerConfigIsolated(legacyHome)).toThrow(
+      expect.objectContaining({ problem: "global_config_not_isolated" }),
+    );
+    expect(existsSync(path.join(legacyHome, ".wrangler"))).toBe(true);
+  });
+
   it("passes an explicit environment without inherited credentials", () => {
-    const dirs = { state: "/w/state", logs: "/w/logs", registry: "/w/registry", cache: "/w/cache" };
+    const dirs = {
+      state: "/w/state",
+      logs: "/w/logs",
+      registry: "/w/registry",
+      cache: "/w/cache",
+      config: "/w/config",
+    };
     const source = {
       PATH: "/usr/bin",
       HOME: "/home/someone",
       LANG: "C.UTF-8",
       CLOUDFLARE_API_TOKEN: "cf-secret",
+      XDG_CONFIG_HOME: "/home/someone/.config",
       CLOUDFLARE_ACCOUNT_ID: "account",
       CF_API_KEY: "cf-key",
       ANTHROPIC_API_KEY: "provider-secret",
@@ -438,6 +468,8 @@ describe("wrangler resolution and launch", () => {
       LANG: "C.UTF-8",
       WRANGLER_SEND_METRICS: "false",
       WRANGLER_SEND_ERROR_REPORTS: "false",
+      WRANGLER_HIDE_BANNER: "true",
+      XDG_CONFIG_HOME: "/w/config",
       WRANGLER_LOG_PATH: "/w/logs",
       WRANGLER_REGISTRY_PATH: "/w/registry",
       WRANGLER_CACHE_DIR: "/w/cache",
