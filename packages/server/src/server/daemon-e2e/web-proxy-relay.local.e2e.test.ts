@@ -1,5 +1,7 @@
 /* eslint-disable max-nested-callbacks */
 import { randomBytes } from "node:crypto";
+import { Writable } from "node:stream";
+import pino from "pino";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import {
@@ -57,12 +59,21 @@ interface Evidence {
   [key: string]: unknown;
 }
 
+type FrameOf<T extends BridgeOutboundFrame["type"]> = Extract<BridgeOutboundFrame, { type: T }>;
+
 interface BridgeStream {
   send(frame: Record<string, unknown>): void;
+  /** Raw bytes, for frames the encoder refuses to build; still split by the tunnel data limit. */
+  sendRaw(bytes: Uint8Array): void;
+  /** One waiter for one of `types`; never race two `next` calls, a losing waiter would steal frames. */
+  nextOf<T extends BridgeOutboundFrame["type"]>(
+    types: readonly T[],
+    predicate?: (frame: FrameOf<T>) => boolean,
+  ): Promise<FrameOf<T>>;
   next<T extends BridgeOutboundFrame["type"]>(
     type: T,
-    predicate?: (frame: Extract<BridgeOutboundFrame, { type: T }>) => boolean,
-  ): Promise<Extract<BridgeOutboundFrame, { type: T }>>;
+    predicate?: (frame: FrameOf<T>) => boolean,
+  ): Promise<FrameOf<T>>;
   frames(): readonly BridgeOutboundFrame[];
   readonly closed: Promise<number>;
   close(): void;
@@ -142,9 +153,14 @@ relaySuite(SUITE_NAME, () => {
     async () => {
       const { host, stream } = await openBridge();
       const nonce = `r1-3-${randomBytes(6).toString("hex")}`;
+      // Bytes, not frame counts: the core slices the last piece at the window boundary, so the
+      // window can arrive as five frames; the invariant is the byte total.
       let bodies = 0;
+      let bodyBytes = 0;
       const counting = (frame: BridgeOutboundFrame) => {
-        if (frame.type === "body" && frame.requestId === 1) bodies += 1;
+        if (frame.type !== "body" || frame.requestId !== 1) return;
+        bodies += 1;
+        bodyBytes += Buffer.from(frame.data, "base64").byteLength;
       };
       watchFrames(stream, counting);
 
@@ -152,7 +168,9 @@ relaySuite(SUITE_NAME, () => {
       await stream.next("head", (frame) => frame.requestId === 1);
       const atWindow = await statsWhen(stream, 1, (stats) => stats.delivered === WINDOW_BYTES);
       expect(atWindow.credited).toBe(0);
-      expect(bodies).toBe(WINDOW_BYTES / CHUNK_BYTES);
+      await stream.nextOf(["body"], () => bodyBytes >= WINDOW_BYTES).catch(() => undefined);
+      expect(bodyBytes).toBe(WINDOW_BYTES);
+      const framesAtWindow = bodies;
 
       stream.send({ type: "grantCredit", requestId: 1, bytes: CHUNK_BYTES });
       const afterGrant = await statsWhen(
@@ -161,42 +179,49 @@ relaySuite(SUITE_NAME, () => {
         (stats) => stats.delivered === WINDOW_BYTES + CHUNK_BYTES,
       );
       expect(afterGrant.credited).toBe(CHUNK_BYTES);
-      expect(bodies).toBe(WINDOW_BYTES / CHUNK_BYTES + 1);
+      await stream
+        .nextOf(["body"], () => bodyBytes >= WINDOW_BYTES + CHUNK_BYTES)
+        .catch(() => undefined);
+      expect(bodyBytes).toBe(WINDOW_BYTES + CHUNK_BYTES);
+      expect(bodies).toBeGreaterThan(framesAtWindow);
       const still = await statsWhen(stream, 1, () => true);
       expect(still.delivered).toBe(WINDOW_BYTES + CHUNK_BYTES);
 
       stream.send({ type: "cancel", requestId: 1 });
       await stream.next("cancelled", (frame) => frame.requestId === 1);
-      logEvidence("R1-3", { ...relayEvidence(), bodies });
+      logEvidence("R1-3", { ...relayEvidence(), bodies, bodyBytes });
     },
     TEST_TIMEOUT_MS,
   );
 
   it(
-    "accepts a frame at the ceiling and drops the connection one byte above it (R1-4)",
+    "drops only the connection that sent an oversized frame and keeps serving the host (R1-4)",
     async () => {
+      // No legal request reaches the 65 536-byte ceiling: the host refuses a header sum above
+      // 16 KiB at the frame boundary, so acceptance at the ceiling is proven by the codec and the
+      // host's own TCP tests. Through the tunnel the relevant facts are isolation and continuity.
       const { host, stream } = await openBridge();
-      const atCeiling = requestFrame(1, `${host.fixture.http.origin}/api/echo?n=r1-4-ok`, {
-        headers: [["Accept", "x".repeat(ceilingPadding())]],
-      });
-      stream.send(atCeiling);
-      const outcome = await Promise.race([
-        stream.next("head", (frame) => frame.requestId === 1).then(() => "head" as const),
-        stream.next("fail", (frame) => frame.requestId === 1).then((f) => f.code),
-      ]);
-      expect(["head", "request_head_too_large"]).toContain(outcome);
-
       const { stream: second } = await openBridge(host);
       const closing = second.closed;
-      second.send(
-        requestFrame(1, `${host.fixture.http.origin}/api/echo?n=r1-4-big`, {
-          headers: [["Accept", "x".repeat(ceilingPadding() + 1)]],
-        }),
+      second.sendRaw(
+        rawFrame(
+          JSON.stringify(
+            requestFrame(1, `${host.fixture.http.origin}/api/echo?n=r1-4-big`, {
+              headers: [["Accept", "x".repeat(ceilingPadding() + 1)]],
+            }),
+          ),
+        ),
       );
       await closing;
       expect(second.frames().some((frame) => frame.type === "head")).toBe(false);
       expect(host.backend.events.ofKind("request").map((e) => e.nonce)).not.toContain("r1-4-big");
-      logEvidence("R1-4", relayEvidence());
+
+      stream.send(requestFrame(1, `${host.fixture.http.origin}/api/echo?n=r1-4-ok`));
+      const head = await stream.next("head", (frame) => frame.requestId === 1);
+      expect(head.head.status).toBe(200);
+      await collectBody(stream, 1);
+      expect(host.backend.events.ofKind("request").map((e) => e.nonce)).toContain("r1-4-ok");
+      logEvidence("R1-4", { ...relayEvidence(), activeSockets: host.stats.activeSockets });
     },
     TEST_TIMEOUT_MS,
   );
@@ -321,27 +346,63 @@ interface OpenedBridge {
   stream: BridgeStream;
 }
 
+const startedAt = Date.now();
+function mark(step: string, detail: Record<string, unknown> = {}): void {
+  // Timeline of the harness steps; values are counts and labels only.
+  // eslint-disable-next-line no-console
+  console.info(`[relay-r1] +${Date.now() - startedAt}ms ${step} ${JSON.stringify(detail)}`);
+}
+
 async function openBridge(
   existingHost?: BridgeHost,
   options: { reuseDaemon?: TestPaseoDaemon } = {},
 ): Promise<OpenedBridge> {
   const host = existingHost ?? (await startHost());
+  mark("host ready", { tcp: host.tcp !== null });
   const daemon = options.reuseDaemon ?? (await startDaemon());
+  mark("daemon started");
+  await waitForRelayRegistration(daemon);
+  mark("daemon relay control connected");
   const offer = await offerFor(daemon);
+  mark("offer parsed");
   const client = await connectClient(offer);
+  mark("client connected through relay");
   const tunnel = await client.openNetworkTunnel();
+  mark("tunnel opened");
   closers.push(() => tunnel.close());
   if (host.tcp === null) throw new Error("Bridge host started without its TCP listener");
   const stream = await openBridgeStream(tunnel, host.tcp.port);
+  mark("tcp stream connected");
   stream.send({ type: "harness.hello", token: host.token });
   await stream.next("harness.ready");
+  mark("harness ready");
   stream.send({
     type: "session.open",
     scope: { origin: host.fixture.http.origin, pathPrefix: "/" },
     ttlMs: 60_000,
   });
   await stream.next("session.opened");
+  mark("session opened");
   return { host, daemon, client, tunnel, stream };
+}
+
+const daemonLogs = new WeakMap<TestPaseoDaemon, string[]>();
+
+/** The daemon registers with the relay asynchronously after start; a client before that cannot be routed. */
+async function waitForRelayRegistration(daemon: TestPaseoDaemon): Promise<void> {
+  const lines = daemonLogs.get(daemon) ?? [];
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (lines.some((line) => line.includes("relay_control_connected"))) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const relayEvents = lines
+    .filter((line) => line.includes("relay_"))
+    .map((line) => line.match(/"event":"([a-z_]+)"/)?.[1] ?? "?")
+    .slice(-10);
+  throw new Error(
+    `Daemon did not register with the relay; recent relay events: ${relayEvents.join(",")}`,
+  );
 }
 
 async function startHost(): Promise<BridgeHost> {
@@ -355,7 +416,18 @@ async function startHost(): Promise<BridgeHost> {
 }
 
 async function startDaemon(): Promise<TestPaseoDaemon> {
+  const lines: string[] = [];
+  const logger = pino(
+    { level: "debug" },
+    new Writable({
+      write(chunk, _encoding, callback) {
+        lines.push(chunk.toString("utf8"));
+        callback();
+      },
+    }),
+  );
   const daemon = await createTestPaseoDaemon({
+    logger,
     listen: "127.0.0.1",
     mcpEnabled: false,
     relayEnabled: true,
@@ -363,6 +435,7 @@ async function startDaemon(): Promise<TestPaseoDaemon> {
     relayUseTls: false,
     relayPublicUseTls: false,
   });
+  daemonLogs.set(daemon, lines);
   closers.push(() => daemon.close());
   return daemon;
 }
@@ -405,10 +478,15 @@ async function connectClient(offer: ConnectionOffer): Promise<DaemonClient> {
     });
     try {
       await client.connect();
+      mark("client websocket+e2ee connected", { attempts });
       await client.fetchAgents();
       closers.push(() => client.close().catch(() => undefined));
       return client;
     } catch (error) {
+      mark("client connect attempt failed", {
+        attempts,
+        error: error instanceof Error ? error.name : "unknown",
+      });
       await client.close().catch(() => undefined);
       if (Date.now() >= deadline) {
         throw new Error(`Relay client could not connect after ${attempts} attempts`, {
@@ -421,11 +499,12 @@ async function connectClient(offer: ConnectionOffer): Promise<DaemonClient> {
 }
 
 function openBridgeStream(tunnel: NetworkTunnel, port: number): Promise<BridgeStream> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve, rejectOpen) => {
     const frames: BridgeOutboundFrame[] = [];
     const waiters = new Set<() => void>();
     const listeners = new Set<(frame: BridgeOutboundFrame) => void>();
     let resolveClosed: (reason: number) => void = () => undefined;
+    let streamClosedReason: number | null = null;
     const closed = new Promise<number>((settle) => {
       resolveClosed = settle;
     });
@@ -439,22 +518,50 @@ function openBridgeStream(tunnel: NetworkTunnel, port: number): Promise<BridgeSt
       },
     });
     const handle: BridgeStream = {
-      send: (frame) => stream.write(encodeLengthPrefixed(JSON.stringify(frame))),
-      next: (type, predicate = () => true) =>
-        new Promise((settle) => {
+      // A bridge frame of up to 65 540 bytes crosses the tunnel as more than one Data frame; the
+      // reader on the other side reassembles by the length prefix, never by Data boundaries.
+      send: (frame) => handle.sendRaw(encodeLengthPrefixed(JSON.stringify(frame))),
+      sendRaw: (bytes) => {
+        const step = tunnel.limits.maxDataBytes;
+        for (let offset = 0; offset < bytes.length; offset += step) {
+          stream.write(bytes.subarray(offset, offset + step));
+        }
+      },
+      nextOf: (types, predicate = () => true) =>
+        new Promise((settle, fail) => {
+          const wanted = new Set<string>(types);
+          // A frame that ends the exchange or the session while something else is awaited is a
+          // failure with a reason, never a silent timeout.
           const check = () => {
             const match = frames.find(
-              (frame): frame is Extract<BridgeOutboundFrame, { type: typeof type }> =>
-                frame.type === type && predicate(frame as never),
+              (frame): frame is FrameOf<(typeof types)[number]> =>
+                wanted.has(frame.type) && predicate(frame as never),
             );
-            if (!match) return;
-            waiters.delete(check);
-            frames.splice(frames.indexOf(match), 1);
-            settle(match);
+            if (match) {
+              waiters.delete(check);
+              frames.splice(frames.indexOf(match), 1);
+              settle(match);
+              return;
+            }
+            const terminal = frames.find(
+              (frame) =>
+                frame.type === "protocol_error" ||
+                (frame.type === "fail" && !wanted.has("fail")) ||
+                (frame.type === "closed" && !wanted.has("closed")),
+            );
+            if (terminal || streamClosedReason !== null) {
+              waiters.delete(check);
+              fail(
+                new Error(
+                  `Waiting for ${types.join("|")}; got ${JSON.stringify(terminal ?? { streamClosed: streamClosedReason })}; seen ${frames.map((f) => f.type).join(",")}`,
+                ),
+              );
+            }
           };
           waiters.add(check);
           check();
         }),
+      next: (type, predicate) => handle.nextOf([type], predicate),
       frames: () => frames,
       closed,
       close: () => stream.close(),
@@ -471,8 +578,10 @@ function openBridgeStream(tunnel: NetworkTunnel, port: number): Promise<BridgeSt
         },
         onCredit: () => undefined,
         onClose: (reason) => {
+          streamClosedReason = reason;
           resolveClosed(reason);
-          reject(new Error(`Tunnel stream closed before connecting (reason ${reason})`));
+          for (const waiter of waiters) waiter();
+          rejectOpen(new Error(`Tunnel stream closed before connecting (reason ${reason})`));
         },
       },
     );
@@ -508,10 +617,7 @@ function requestFrame(
 async function collectBody(stream: BridgeStream, requestId: number): Promise<string> {
   const chunks: Buffer[] = [];
   for (;;) {
-    const frame = await Promise.race([
-      stream.next("body", (f) => f.requestId === requestId),
-      stream.next("end", (f) => f.requestId === requestId),
-    ]);
+    const frame = await stream.nextOf(["body", "end"], (f) => f.requestId === requestId);
     if (frame.type === "end") break;
     const bytes = Buffer.from(frame.data, "base64");
     chunks.push(bytes);
@@ -532,6 +638,15 @@ async function statsWhen(
     if (predicate(stats)) return stats;
     if (Date.now() >= deadline) throw new Error(`stats never matched: ${JSON.stringify(stats)}`);
   }
+}
+
+/** A length-prefixed frame built by hand, so an oversized payload can be sent to the receiver. */
+function rawFrame(text: string): Uint8Array {
+  const payload = Buffer.from(text, "utf8");
+  const frame = new Uint8Array(4 + payload.length);
+  new DataView(frame.buffer).setUint32(0, payload.length, false);
+  frame.set(payload, 4);
+  return frame;
 }
 
 /** Bytes of `Accept` that put the serialized request frame exactly at the 65 536-byte ceiling. */
