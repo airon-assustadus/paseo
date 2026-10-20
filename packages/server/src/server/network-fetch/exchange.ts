@@ -184,6 +184,8 @@ export class FetchExchange {
       throw new NetworkFetchProtocolError("body_not_expected", "Request does not accept a body");
     }
     if (this.settled || !this.uploadOpen) return;
+    // An empty chunk carries no bytes to credit back; a zero-byte `uploadCredit` is protocol noise.
+    if (chunk.byteLength === 0) return;
     const { limits } = this.env;
     if (chunk.byteLength > limits.maxChunkBytes) {
       this.failWith(new NetworkFetchError("invalid_request", "Body chunk exceeds the chunk limit"));

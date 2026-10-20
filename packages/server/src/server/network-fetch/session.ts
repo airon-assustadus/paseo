@@ -278,7 +278,11 @@ export class NetworkFetchSession {
     this.shutdown(reason);
   }
 
-  /** `null` for a request that already finished: its late frames are dropped, not punished. */
+  /**
+   * `null` for an id at or below the watermark that is no longer active: a late frame for a
+   * finished, cancelled, or never-opened lower id is dropped, not punished. The session keeps no
+   * record of which ids were opened; the watermark only rejects late effects.
+   */
   private exchangeFor(requestId: number): FetchExchange | null {
     this.assertOpen();
     const exchange = this.exchanges.get(requestId);
