@@ -16,8 +16,12 @@ import { SessionDelivery, type OwnedSubscription } from "./session/owned-subscri
 import {
   NETWORK_TUNNEL_FAMILY,
   NetworkTunnelSession,
-  TunnelProtocolError,
 } from "./network-tunnel/network-tunnel-session.js";
+import {
+  REMOTE_BROWSER_FAMILY,
+  RemoteBrowserSession,
+  type RemoteBrowserLauncher,
+} from "./remote-browser/remote-browser-session.js";
 import { v4 as uuidv4 } from "uuid";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { basename, resolve, sep } from "path";
@@ -443,8 +447,20 @@ const nodeSessionFileSystem: SessionFileSystem = {
 // Stub types for features under development (modules not yet available)
 type AgentMcpTransportFactory = () => Promise<unknown>;
 
+const UNAVAILABLE_REMOTE_BROWSERS: RemoteBrowserLauncher = {
+  available: false,
+  launch: () => Promise.reject(new Error("Remote browser is unavailable")),
+  closeBrowser: () => Promise.resolve(),
+};
+
+function remoteBrowserLauncher(launcher: RemoteBrowserLauncher | null | undefined) {
+  return launcher ?? UNAVAILABLE_REMOTE_BROWSERS;
+}
+
 export interface SessionOptions {
   browserToolsBroker?: BrowserToolsBroker | null;
+  /** Daemon-wide remote browser manager; absent means the feature is unavailable. */
+  remoteBrowsers?: RemoteBrowserLauncher | null;
   clientId: string;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
@@ -784,6 +800,7 @@ export class Session {
   private readonly resolveScriptHealth: ((hostname: string) => ScriptHealthState | null) | null;
   private readonly terminalController: TerminalSessionController;
   private readonly networkTunnelSession: NetworkTunnelSession;
+  private readonly remoteBrowserSession: RemoteBrowserSession;
   private inflightRequests = 0;
   private peakInflightRequests = 0;
   private readonly workspaceSetupSnapshots: Map<string, WorkspaceSetupSnapshot>;
@@ -908,6 +925,17 @@ export class Session {
         allowsNetworkProxy: () => this.authorization.allowsPermission("network.proxy"),
       },
       logger: this.sessionLogger,
+    });
+    this.remoteBrowserSession = new RemoteBrowserSession({
+      host: {
+        emit: (msg) => this.emit(msg),
+        begin: (stop) => this.delivery.begin(REMOTE_BROWSER_FAMILY, undefined, stop),
+        currentSource: () => this.delivery.currentSource,
+        isModernSource: (source) => this.delivery.isModern(source),
+        allowsNetworkProxy: () => this.authorization.allowsPermission("network.proxy"),
+      },
+      logger: this.sessionLogger,
+      launcher: remoteBrowserLauncher(options.remoteBrowsers),
     });
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
@@ -2198,6 +2226,11 @@ export class Session {
         .catch((error) =>
           this.sessionLogger.error({ err: error }, "Failed to release revoked network tunnels"),
         );
+      void this.remoteBrowserSession
+        .revoke()
+        .catch((error) =>
+          this.sessionLogger.error({ err: error }, "Failed to close revoked remote browsers"),
+        );
     }
     this.authorization.replacePermissions(permissions);
     if (!this.authorization.allowsPermission("workspace.write")) {
@@ -2298,6 +2331,8 @@ export class Session {
     }
     if (msg.type === "network.tunnel.close.request")
       return this.networkTunnelSession.handleCloseRequest(msg);
+    const remoteBrowser = this.dispatchRemoteBrowserMessage(msg);
+    if (remoteBrowser) return remoteBrowser;
     if (msg.type === "browser.automation.execute.response") {
       if (source)
         this.browserToolsBroker?.receiveResponse(
@@ -3122,17 +3157,42 @@ export class Session {
     return this.sessionId;
   }
 
+  private dispatchRemoteBrowserMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "browser.remote.open.request":
+        return this.remoteBrowserSession.handleOpen(msg);
+      case "browser.remote.attach.request":
+        return this.remoteBrowserSession.handleAttach(msg);
+      case "browser.remote.detach.request":
+        return this.remoteBrowserSession.handleDetach(msg);
+      case "browser.remote.close.request":
+        return this.remoteBrowserSession.handleClose(msg);
+      case "browser.remote.list.request":
+        this.remoteBrowserSession.handleList(msg);
+        return Promise.resolve();
+      case "browser.remote.navigate.request":
+        return this.remoteBrowserSession.handleNavigate(msg);
+      case "browser.remote.dispatch_input.request":
+        return this.remoteBrowserSession.handleDispatchInput(msg);
+      case "browser.remote.resize.request":
+        return this.remoteBrowserSession.handleResize(msg);
+      case "browser.remote.set_visibility.request":
+        return this.remoteBrowserSession.handleSetVisibility(msg);
+      default:
+        return undefined;
+    }
+  }
+
   public async handleBinaryFrame(binaryFrame: BinaryFrame, source: object): Promise<void> {
     // Tunnels carry network.proxy authority of their own; the workspace.write gate below is for terminals and files.
     if (binaryFrame.kind === "tunnel") {
       await this.networkTunnelSession.handleFrame(binaryFrame.frame, source);
       return;
     }
+    // Remote browser acks carry network.proxy authority of their own, like tunnel frames.
     if (binaryFrame.kind === "remote_browser") {
-      // No remote browser runs before features.remoteBrowser is advertised, so no ack has an owner.
-      throw new TunnelProtocolError(
-        "Remote browser frame does not belong to an owned subscription",
-      );
+      await this.remoteBrowserSession.handleFrameAck(binaryFrame.frame, source);
+      return;
     }
     if (!this.authorization.allowsPermission("workspace.write")) {
       return;
@@ -8506,6 +8566,7 @@ export class Session {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
     await this.delivery.close();
+    await this.remoteBrowserSession.closeAll();
 
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();

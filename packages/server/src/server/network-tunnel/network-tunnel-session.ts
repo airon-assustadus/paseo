@@ -1,5 +1,4 @@
-import { lookup as dnsLookup } from "node:dns/promises";
-import net from "node:net";
+import type net from "node:net";
 import type pino from "pino";
 import {
   TunnelCloseReason,
@@ -19,15 +18,8 @@ import {
 } from "@getpaseo/protocol/network-tunnel/rpc-schemas";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.js";
 import type { OwnedSubscription } from "../session/owned-subscriptions/index.js";
-import {
-  TunnelTargetError,
-  approveAddresses,
-  closeReasonForError,
-  describeTunnelTarget,
-  loopbackForLocalhostName,
-  normalizeAddress,
-  type ResolvedTunnelAddress,
-} from "./target-policy.js";
+import { closeReasonForError, describeTunnelTarget } from "./target-policy.js";
+import { dialTarget, type TunnelDial, type TunnelLookup } from "./dial-target.js";
 
 type TunnelOpenRequest = Extract<SessionInboundMessage, { type: "network.tunnel.open.request" }>;
 type TunnelCloseRequest = Extract<SessionInboundMessage, { type: "network.tunnel.close.request" }>;
@@ -40,12 +32,6 @@ export const MAX_TUNNEL_SUBSCRIPTIONS_PER_SESSION = 4;
 const GRACEFUL_CLOSE_TIMEOUT_MS = 5_000;
 /** Frames still in flight for a subscription this connection recently lost are dropped, not punished. */
 const RECENTLY_CLOSED_PER_SOURCE = 32;
-// dns.lookup shares libuv's worker pool with filesystem work. Keep two default-pool
-// workers available to the rest of the daemon, across all sessions and subscriptions.
-const MAX_CONCURRENT_LOOKUPS = 2;
-let activeLookups = 0;
-const lookupWaiters = new Set<() => void>();
-
 export interface NetworkTunnelHost {
   emit(message: SessionOutboundMessage): void;
   /** Wraps `delivery.begin(NETWORK_TUNNEL_FAMILY, undefined, stop)` for the current request. */
@@ -55,21 +41,6 @@ export interface NetworkTunnelHost {
   isModernSource(source: object): boolean;
   supportsTunnel(source: object): boolean;
   allowsNetworkProxy(): boolean;
-}
-
-export type TunnelLookup = (hostname: string) => Promise<ResolvedTunnelAddress[]>;
-export interface TunnelDialInput {
-  address: ResolvedTunnelAddress;
-  port: number;
-  deadline: number;
-  signal: AbortSignal;
-}
-
-export type TunnelDial = (input: TunnelDialInput) => Promise<net.Socket>;
-
-interface DialAnyInput extends Omit<TunnelDialInput, "address"> {
-  addresses: readonly ResolvedTunnelAddress[];
-  dialAddress: TunnelDial;
 }
 
 export interface NetworkTunnelSessionOptions {
@@ -136,74 +107,6 @@ function agreeOnLimits(
   };
 }
 
-async function defaultLookup(hostname: string): Promise<ResolvedTunnelAddress[]> {
-  const results = await dnsLookup(hostname, { all: true });
-  return results.map((entry) => normalizeAddress(entry.address));
-}
-
-function acquireLookupSlot(deadline: number, signal: AbortSignal): Promise<() => void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new TunnelTargetError(TunnelCloseReason.Ok, "Stream cancelled"));
-      return;
-    }
-    if (Date.now() >= deadline) {
-      reject(new TunnelTargetError(TunnelCloseReason.Timeout, "Timed out resolving host"));
-      return;
-    }
-    const cleanup = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-      lookupWaiters.delete(grant);
-    };
-    const grant = () => {
-      cleanup();
-      activeLookups += 1;
-      resolve(() => {
-        activeLookups -= 1;
-        lookupWaiters.values().next().value?.();
-      });
-    };
-    const onAbort = () => {
-      cleanup();
-      reject(new TunnelTargetError(TunnelCloseReason.Ok, "Stream cancelled"));
-    };
-    const timer = setTimeout(
-      () => {
-        cleanup();
-        reject(new TunnelTargetError(TunnelCloseReason.Timeout, "Timed out resolving host"));
-      },
-      Math.max(0, deadline - Date.now()),
-    );
-    signal.addEventListener("abort", onAbort, { once: true });
-    if (activeLookups < MAX_CONCURRENT_LOOKUPS) grant();
-    else lookupWaiters.add(grant);
-  });
-}
-
-async function lookupWithDeadline(
-  lookup: TunnelLookup,
-  hostname: string,
-  deadline: number,
-  signal: AbortSignal,
-): Promise<ResolvedTunnelAddress[]> {
-  const release = await acquireLookupSlot(deadline, signal);
-  // Only the actual resolver completion releases the worker slot. Expiration or
-  // cancellation of the stream stops waiting but cannot cancel system DNS work.
-  const pending = (async () => {
-    try {
-      if (signal.aborted) throw new TunnelTargetError(TunnelCloseReason.Ok, "Stream cancelled");
-      if (Date.now() >= deadline) {
-        throw new TunnelTargetError(TunnelCloseReason.Timeout, "Timed out resolving host");
-      }
-      return await lookup(hostname);
-    } finally {
-      release();
-    }
-  })();
-  return withDeadline(pending, deadline, signal);
-}
-
 /**
  * Owns every network tunnel of one session. A tunnel is an owned subscription;
  * its streams are TCP sockets dialed from the daemon host. Both directions are
@@ -216,8 +119,8 @@ export class NetworkTunnelSession {
   private readonly logger: pino.Logger;
   private readonly limits: NetworkTunnelLimits;
   private readonly maxSubscriptions: number;
-  private readonly lookup: TunnelLookup;
-  private readonly dial: TunnelDial;
+  private readonly lookup: TunnelLookup | undefined;
+  private readonly dial: TunnelDial | undefined;
   private readonly drainTimeoutMs: number;
   private readonly subscriptions = new Map<string, TunnelSubscription>();
   private readonly recentlyClosed = new WeakMap<object, string[]>();
@@ -232,8 +135,8 @@ export class NetworkTunnelSession {
       connectTimeoutMs: options.limits?.connectTimeoutMs ?? TUNNEL_CONNECT_TIMEOUT_MS,
     };
     this.maxSubscriptions = options.maxSubscriptions ?? MAX_TUNNEL_SUBSCRIPTIONS_PER_SESSION;
-    this.lookup = options.lookup ?? defaultLookup;
-    this.dial = options.dial ?? dial;
+    this.lookup = options.lookup;
+    this.dial = options.dial;
     this.drainTimeoutMs = options.drainTimeoutMs ?? GRACEFUL_CLOSE_TIMEOUT_MS;
   }
 
@@ -416,24 +319,13 @@ export class NetworkTunnelSession {
     const described = describeTunnelTarget(target);
     const hostLabel = described.kind === "literal" ? described.address.address : described.hostname;
     try {
-      const candidates =
-        described.kind === "literal"
-          ? [described.address]
-          : (loopbackForLocalhostName(described.hostname) ??
-            (await lookupWithDeadline(
-              this.lookup,
-              described.hostname,
-              deadline,
-              stream.cancel.signal,
-            )));
-      const approved = approveAddresses(candidates);
-      if (stream.state !== "connecting") return;
-      const socket = await dialAny({
-        addresses: approved,
+      const socket = await dialTarget({
+        host: described,
         port: target.port,
         deadline,
         signal: stream.cancel.signal,
-        dialAddress: this.dial,
+        lookup: this.lookup,
+        dial: this.dial,
       });
       if (stream.state !== "connecting") {
         socket.destroy();
@@ -678,91 +570,4 @@ function destroySocket(socket: net.Socket): void {
   detachSocket(socket);
   socket.setTimeout(0);
   socket.destroy();
-}
-
-async function withDeadline<T>(
-  promise: Promise<T>,
-  deadline: number,
-  signal: AbortSignal,
-): Promise<T> {
-  if (signal.aborted) {
-    // Observe the resolver even when cancellation won before the guard was installed.
-    void promise.catch(() => {});
-    throw new TunnelTargetError(TunnelCloseReason.Ok, "Stream cancelled");
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
-  const guard = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(
-      () => reject(new TunnelTargetError(TunnelCloseReason.Timeout, "Timed out resolving host")),
-      Math.max(0, deadline - Date.now()),
-    );
-    onAbort = () => reject(new TunnelTargetError(TunnelCloseReason.Ok, "Stream cancelled"));
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-  try {
-    return await Promise.race([promise, guard]);
-  } finally {
-    clearTimeout(timer);
-    if (onAbort) signal.removeEventListener("abort", onAbort);
-  }
-}
-
-/** `localhost` often resolves to ::1 first while the service listens on 127.0.0.1; try every approved answer. */
-async function dialAny({
-  addresses,
-  port,
-  deadline,
-  signal,
-  dialAddress,
-}: DialAnyInput): Promise<net.Socket> {
-  let lastError: unknown;
-  for (const [index, address] of addresses.entries()) {
-    if (signal.aborted) throw new TunnelTargetError(TunnelCloseReason.Ok, "Stream cancelled");
-    const now = Date.now();
-    const remaining = deadline - now;
-    if (remaining <= 0) {
-      throw new TunnelTargetError(TunnelCloseReason.Timeout, "Connect timed out");
-    }
-    const attemptDeadline = now + Math.ceil(remaining / (addresses.length - index));
-    try {
-      return await dialAddress({ address, port, deadline: attemptDeadline, signal });
-    } catch (error) {
-      lastError = error;
-      const reason = closeReasonForError(error);
-      if (reason === TunnelCloseReason.Ok) break;
-    }
-  }
-  throw lastError;
-}
-
-/** Dials the approved literal only; no second resolution can swap the target underneath the policy check. */
-function dial({ address, port, deadline, signal }: TunnelDialInput): Promise<net.Socket> {
-  return new Promise<net.Socket>((resolve, reject) => {
-    const remaining = Math.max(1, deadline - Date.now());
-    const socket = net.connect({ host: address.address, port, family: address.family });
-    const settle = (outcome: { socket: net.Socket } | { error: unknown }) => {
-      socket.removeListener("connect", onConnect);
-      socket.removeListener("error", onError);
-      socket.removeListener("timeout", onTimeout);
-      signal.removeEventListener("abort", onAbort);
-      if ("socket" in outcome) {
-        resolve(outcome.socket);
-        return;
-      }
-      socket.destroy();
-      reject(outcome.error);
-    };
-    const onConnect = () => settle({ socket });
-    const onError = (error: Error) => settle({ error });
-    const onTimeout = () =>
-      settle({ error: new TunnelTargetError(TunnelCloseReason.Timeout, "Connect timed out") });
-    const onAbort = () =>
-      settle({ error: new TunnelTargetError(TunnelCloseReason.Ok, "Stream cancelled") });
-    socket.setTimeout(remaining);
-    socket.once("connect", onConnect);
-    socket.once("error", onError);
-    socket.once("timeout", onTimeout);
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
 }

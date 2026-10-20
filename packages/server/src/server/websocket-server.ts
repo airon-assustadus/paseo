@@ -98,6 +98,7 @@ import {
 } from "./lifecycle-reasons.js";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { TunnelProtocolError } from "./network-tunnel/network-tunnel-session.js";
+import { RemoteBrowserManager } from "./remote-browser/remote-browser-manager.js";
 
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
@@ -588,6 +589,8 @@ export class VoiceAssistantWebSocketServer {
   private unsubscribeDaemonConfigChange: (() => void) | null = null;
   private unsubscribeTerminalActivity: (() => void) | null = null;
   private readonly browserToolsBroker: BrowserToolsBroker | null;
+  /** Daemon-wide remote browsers; sessions own their browsers, this owns limits and shutdown. */
+  private readonly remoteBrowsers: RemoteBrowserManager;
   private readonly hubRelationships: HubRelationshipManagement | null;
   private connectionLifecycle: "starting" | "accepting" | "stopping" = "accepting";
   private readonly advertiseDaemonStatusRpc: boolean;
@@ -675,6 +678,7 @@ export class VoiceAssistantWebSocketServer {
     this.credentialSource = auth;
     this.daemonRuntimeConfig = daemonRuntimeConfig;
     this.browserToolsBroker = browserToolsBroker ?? null;
+    this.remoteBrowsers = new RemoteBrowserManager({ logger: this.logger });
     this.hubRelationships = hubRelationships ?? null;
     this.pluginRuntime = pluginRuntime;
     this.orchestrationSkills = orchestrationSkills;
@@ -1132,6 +1136,8 @@ export class VoiceAssistantWebSocketServer {
     }
 
     await Promise.all(cleanupPromises);
+    // Sessions closed their browsers above; this also waits for opens still in progress.
+    await this.remoteBrowsers.close();
     this.providerSnapshotManager.destroy();
     this.checkoutDiffManager.dispose();
     await this.workspaceGitService.dispose();
@@ -1456,6 +1462,7 @@ export class VoiceAssistantWebSocketServer {
   private createSocketSession(options: SocketSessionOptions): Session {
     return new Session({
       browserToolsBroker: this.browserToolsBroker,
+      remoteBrowsers: this.remoteBrowsers,
       clientId: options.clientId,
       appVersion: options.appVersion,
       clientCapabilities: options.clientCapabilities,
@@ -1948,6 +1955,8 @@ export class VoiceAssistantWebSocketServer {
         agentConfigApply: true,
         // COMPAT(networkTunnel): added in v0.12.0, remove after 2027-10-08 once daemon floor >= v0.12.0.
         networkTunnel: true,
+        // COMPAT(remoteBrowser): added in v0.11.5, remove after 2027-04-19 once daemon floor includes browser.remote.*.
+        remoteBrowser: this.remoteBrowsers.available,
       },
     };
   }
