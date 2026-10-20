@@ -429,6 +429,17 @@ function relayCommands(
   });
 }
 
+/** True once `promise` has settled, checked after pending microtasks and one macrotask ran. */
+async function hasSettled(promise: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  const mark = () => {
+    settled = true;
+  };
+  promise.then(mark, mark);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  return settled;
+}
+
 /** A run whose stack already started. */
 async function startedRelay(overrides: Record<string, unknown> = {}) {
   const log: string[] = [];
@@ -695,18 +706,75 @@ describe("webProxyRelay commands", () => {
     expect(log).not.toContain("stack-close");
   });
 
-  it("close a stack that finishes starting after the run closed", async () => {
+  it("hold the run's close until a start in flight has started and closed its stack", async () => {
     const log: string[] = [];
-    const pending = deferred<unknown>();
-    const run = fakeRun({ module: stackModule(log, () => pending.promise), log });
+    const started = deferred<unknown>();
+    const stackClosed = deferred<void>();
+    const stack = canonicalStack(log, {
+      close: async () => {
+        log.push("stack-close");
+        await stackClosed.promise;
+        log.push("stack-closed");
+      },
+    });
+    const run = fakeRun({ module: stackModule(log, () => started.promise), log });
+    const commands = relayCommands(log);
 
-    const call = relayCommands(log).webProxyRelayBridge(run.context);
+    const call = commands.webProxyRelayBridge(run.context);
+    const rejected = expect(call).rejects.toMatchObject({ problem: "closed_during_start" });
     await expect.poll(() => log.includes("stack-start")).toBe(true);
-    await run.close();
-    pending.resolve(canonicalStack(log));
+    const closing = run.close();
 
-    await expect(call).rejects.toMatchObject({ problem: "closed_during_start" });
-    expect(log.at(-1)).toBe("stack-close");
+    expect(await hasSettled(closing)).toBe(false);
+    started.resolve(stack);
+    await expect.poll(() => log.includes("stack-close")).toBe(true);
+    expect(await hasSettled(closing)).toBe(false);
+    stackClosed.resolve();
+    await closing;
+
+    expect(log.slice(-2)).toEqual(["stack-close", "stack-closed"]);
+    await rejected;
+    await expect(commands.webProxyRelayBridge(run.context)).rejects.toMatchObject({
+      problem: "closed_during_start",
+    });
+    await expect(commands.webProxyRelayRestart(run.context)).rejects.toMatchObject({
+      problem: "relay_closed",
+    });
+    expect(log.filter((entry) => entry === "stack-start")).toHaveLength(1);
+    expect(log.filter((entry) => entry === "stack-close")).toHaveLength(1);
+  });
+
+  it("hold the run's close until a failing start in flight has unwound, keeping its sanitized error", async () => {
+    const log: string[] = [];
+    const unwound = deferred<void>();
+    const failure = Object.assign(new Error("/tmp/paseo-home 42000"), { step: "registration" });
+    const module = stackModule(log, async () => {
+      await unwound.promise;
+      log.push("stack-unwound");
+      throw failure;
+    });
+    const run = fakeRun({ module, log });
+    const commands = relayCommands(log);
+
+    const call = commands.webProxyRelayBridge(run.context);
+    const rejected = expect(call).rejects.toMatchObject({
+      problem: "relay_start_failed",
+      message: 'The relay stack failed at step "registration"',
+    });
+    await expect.poll(() => log.includes("stack-start")).toBe(true);
+    const closing = run.close();
+
+    expect(await hasSettled(closing)).toBe(false);
+    unwound.resolve();
+    await closing;
+
+    expect(log).toContain("stack-unwound");
+    await rejected;
+    await expect(commands.webProxyRelayBridge(run.context)).rejects.toMatchObject({
+      problem: "relay_start_failed",
+    });
+    expect(log.filter((entry) => entry === "stack-start")).toHaveLength(1);
+    expect(log).not.toContain("stack-close");
   });
 
   it("never start the stack when the run closed while the shell was bundling", async () => {
@@ -716,8 +784,10 @@ describe("webProxyRelay commands", () => {
 
     const call = relayCommands(log, { bundle: bundle.promise }).webProxyRelayBridge(run.context);
     await expect.poll(() => log.includes(`bundle:${PAGE_ORIGIN}`)).toBe(true);
-    await run.close();
+    const closing = run.close();
+    expect(await hasSettled(closing)).toBe(false);
     bundle.resolve();
+    await closing;
 
     await expect(call).rejects.toMatchObject({ problem: "closed_during_start" });
     expect(log).not.toContain("stack-start");

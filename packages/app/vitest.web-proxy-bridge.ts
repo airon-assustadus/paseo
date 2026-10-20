@@ -588,13 +588,29 @@ function unexpectedArguments(command: string): WebProxyBridgeError {
 export function createWebProxyRelayCommands(options: WebProxyRelayOptions) {
   const runs = new WeakMap<object, { run: RelayRun; info: Promise<WebProxyRelayInfo> }>();
 
-  async function start(context: BridgeCommandContext, run: RelayRun): Promise<WebProxyRelayInfo> {
-    // Registered before anything opens, so a run that ends mid-start still releases the stack.
+  function start(context: BridgeCommandContext, run: RelayRun): Promise<WebProxyRelayInfo> {
+    // Replaced below in the same synchronous turn, before Vitest can call the close handler.
+    let settled: Promise<void> = Promise.resolve();
+    // Registered before anything opens, so a run that ends mid-start still releases the stack. Vitest
+    // exits the process teardownTimeout after close begins, and the relay runs detached: close must
+    // not resolve before the start in flight has shut down what it opened.
     context.project.vitest.onClose(async () => {
       const previous = run.phase;
       run.phase = { state: "closed" };
-      if ("stack" in previous) await previous.stack?.close();
+      if (previous.state === "starting") await settled;
+      else if ("stack" in previous) await previous.stack?.close();
     });
+    const opening = open(context, run);
+    // Settles either way and never rejects, so the close handler waits on it without a catch.
+    settled = opening.then(
+      () => undefined,
+      () => undefined,
+    );
+    return opening;
+  }
+
+  /** Opens the stack; on seeing the run closed it shuts down what it opened before rejecting. */
+  async function open(context: BridgeCommandContext, run: RelayRun): Promise<WebProxyRelayInfo> {
     try {
       const allowedOrigin = browserOrigin(context);
       const codecModuleUrl = resolveCodecModuleUrl(options.codecModulePath, options.servedRoot);
