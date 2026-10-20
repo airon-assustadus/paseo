@@ -60,6 +60,23 @@ const LIMIT_KEYS: readonly (keyof NetworkFetchLimits)[] = [
 // The session TTL shares the core's ceiling: setTimeout fires at once above it.
 const MAX_TTL_MS = 2 ** 31 - 1;
 
+// Bounds of the request frame itself (adapter-contract.md §5.4), in the units the host checks:
+// string length of the URL and header names, and name.length + value.length summed against the
+// session's maxRequestHeadBytes. The host closes the whole connection on a frame beyond them, so a
+// request that would cross them fails alone, here, before it takes an id.
+const MAX_REQUEST_URL_CHARS = 8_192;
+const MAX_REQUEST_HEADER_NAME_CHARS = 256;
+
+function fitsRequestFrame(input: WebProxyTransportRequest, maxRequestHeadBytes: number): boolean {
+  if (input.url.length > MAX_REQUEST_URL_CHARS) return false;
+  let headBytes = 0;
+  for (const [name, value] of input.headers) {
+    if (name.length > MAX_REQUEST_HEADER_NAME_CHARS) return false;
+    headBytes += name.length + value.length;
+  }
+  return headBytes <= maxRequestHeadBytes;
+}
+
 export type NetworkFetchErrorCode =
   | "invalid_request"
   | "not_allowlisted"
@@ -738,6 +755,7 @@ export function openNetworkFetchTransport(
     if (!isInScope) throw new WebProxyTransportError("not_allowed");
     const bodyLength = input.body?.byteLength ?? 0;
     const isOverLimit =
+      !fitsRequestFrame(input, agreed.maxRequestHeadBytes) ||
       bodyLength > agreed.maxRequestBodyBytes ||
       active.size >= agreed.maxConcurrentRequests ||
       lastRequestId >= Number.MAX_SAFE_INTEGER;
