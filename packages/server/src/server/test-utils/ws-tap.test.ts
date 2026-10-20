@@ -1,5 +1,5 @@
 import http from "node:http";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import { startWsTap, type WsTap } from "./ws-tap.js";
@@ -52,6 +52,14 @@ function nextMessage(socket: WebSocket): Promise<{ data: Buffer; isBinary: boole
       resolve({ data: Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer), isBinary }),
     ),
   );
+}
+
+function closeServer(server: net.Server): Promise<void> {
+  return new Promise((resolve) => server.close(() => resolve()));
+}
+
+function socketClosed(socket: net.Socket): Promise<void> {
+  return new Promise((resolve) => socket.once("close", () => resolve()));
 }
 
 function closed(socket: WebSocket): Promise<number> {
@@ -108,6 +116,62 @@ describe("ws tap", () => {
     expect(await closing).toBe(1009);
     expect(tap.summary().overflow).toEqual({ direction: "toTarget", limit: 100 });
     expect(tap.summary().bytes.toTarget).toBe(60);
+  });
+
+  it("records an overflow when a single message is refused before it is delivered (RT-1)", async () => {
+    const target = await echoServer();
+    const tap = await tapFor(target.port, { maxBytesPerDirection: 100 });
+    const socket = await connect(`ws://127.0.0.1:${tap.port}/relay`);
+    closers.push(async () => socket.terminate());
+    await nextMessage(socket);
+    const closing = closed(socket);
+    socket.send(Buffer.alloc(150, 3), { binary: true });
+
+    expect(await closing).toBe(1009);
+    expect(tap.summary().overflow).toEqual({ direction: "toTarget", limit: 100 });
+    expect(tap.summary().bytes.toTarget).toBe(0);
+    expect(tap.summary().openPairs).toBe(0);
+  });
+
+  it.each([
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["zero", 0],
+    ["fraction", 10.5],
+  ])("refuses a %s cap before listening (RT-1)", async (_name, cap) => {
+    await expect(startWsTap({ targetPort: 9, maxBytesPerDirection: cap })).rejects.toThrow(
+      RangeError,
+    );
+    await expect(startWsTap({ targetPort: 9, maxMessages: cap })).rejects.toThrow(RangeError);
+  });
+
+  it("aborts a connecting upstream and drops the queue when the downstream leaves first (RT-2)", async () => {
+    let markHeld: (socket: net.Socket) => void = () => undefined;
+    const held = new Promise<net.Socket>((resolve) => {
+      markHeld = resolve;
+    });
+    // Accepts TCP, discards what arrives and never answers the WebSocket handshake, so the
+    // upstream stays CONNECTING; reading is what lets the peer's FIN surface as `close`.
+    const silent = net.createServer((socket) => {
+      socket.resume();
+      markHeld(socket);
+    });
+    await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", resolve));
+    closers.push(() => closeServer(silent));
+    const tap = await tapFor((silent.address() as AddressInfo).port);
+    const socket = await connect(`ws://127.0.0.1:${tap.port}/relay`);
+    socket.send(Buffer.from("queued-before-upstream-open"), { binary: true });
+    const upstreamSocket = await held;
+    const upstreamClosed = socketClosed(upstreamSocket);
+    expect(tap.summary().openPairs).toBe(1);
+
+    socket.close(1000, "leaving");
+    await upstreamClosed;
+
+    expect(tap.summary().openPairs).toBe(0);
+    expect(tap.summary().messages).toBe(1);
+    expect(tap.contains("queued-before-upstream-open").toTarget).toBe(true);
+    expect(upstreamSocket.destroyed).toBe(true);
   });
 
   it("closes its listener and pairs on close", async () => {
