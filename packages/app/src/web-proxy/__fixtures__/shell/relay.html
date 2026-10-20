@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Foreign ancestor</title>
+  </head>
+  <body>
+    <script>
+      // A foreign origin placing a proxied document under itself.
+      const frame = document.createElement("iframe");
+      frame.src = new URLSearchParams(location.search).get("target");
+      document.body.append(frame);
+    </script>
+  </body>
+</html>
