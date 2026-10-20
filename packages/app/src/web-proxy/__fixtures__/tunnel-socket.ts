@@ -36,7 +36,7 @@ export const TUNNEL_CODEC_VECTOR = {
   bytes: [0, 0, 0, 2, 0x7b, 0x7d],
 } as const;
 
-const LENGTH_PREFIX_BYTES = 4;
+const encoder = new TextEncoder();
 
 export type TunnelCodecProblem =
   | "encode_missing"
@@ -328,10 +328,11 @@ export function createTunnelBridgeSocket(options: TunnelBridgeSocketOptions): Tu
         fail("encode_failed", error);
         return;
       }
-      // The channel's own rule (bridge-channel.ts transmit): buffered bytes plus the payload's
-      // UTF-8 bytes. Same arithmetic here so the two never disagree; the queue therefore holds
-      // at most maxBufferedBytes plus one length prefix.
-      const payloadBytes = encoded.length - LENGTH_PREFIX_BYTES;
+      // The channel's own rule (bridge-channel.ts transmit), in the channel's own unit: buffered
+      // bytes plus the payload's UTF-8 bytes, whatever the codec adds around them. The two never
+      // disagree, and the queue holds at most maxBufferedBytes plus one frame's codec overhead
+      // (4 bytes with the length-prefixed codec).
+      const payloadBytes = encoder.encode(data).byteLength;
       if (buffered + payloadBytes > BRIDGE_CHANNEL_LIMITS.maxBufferedBytes) {
         fail("overflow");
         return;

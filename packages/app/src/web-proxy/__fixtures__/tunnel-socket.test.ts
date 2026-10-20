@@ -30,37 +30,36 @@ const SMALL_WINDOW: NetworkTunnelLimits = {
   connectTimeoutMs: 10_000,
 };
 const TARGET: NetworkTunnelTarget = { host: "127.0.0.1", port: 4300 };
-const PREFIX = 4;
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
+const decoder = new TextDecoder();
 
-// Minimal u32 big-endian length prefix codec. The app cannot import the server's; parity with the
-// real one is proved by adoptLengthPrefixedCodec's vector here and by the R2 browser proof.
-class TestReader implements TunnelFrameReader {
-  private pending = new Uint8Array(0);
+// A deliberately different wire format from the server's: one UTF-8 line per frame, ended by
+// "\n" (serialized JSON never contains a raw newline). The socket's credit, queue and lifecycle
+// logic is what these tests exercise; the real length-prefixed codec is not reimplemented here,
+// and parity with it is proved where it is loaded for real (the R2 probe and browser proof).
+const LINE_END = 0x0a;
+const OVERHEAD = 1;
+
+class LineReader implements TunnelFrameReader {
+  private pending: number[] = [];
   poisoned = false;
 
-  constructor(
-    private readonly onFrame: (text: string) => void,
-    private readonly maxFrameBytes: number,
-  ) {}
+  constructor(private readonly onFrame: (text: string) => void) {}
 
   push(chunk: Uint8Array): number {
     if (this.poisoned) throw new Error("poisoned");
-    const merged = new Uint8Array(this.pending.length + chunk.length);
-    merged.set(this.pending);
-    merged.set(chunk, this.pending.length);
-    let position = 0;
-    while (merged.length - position >= PREFIX) {
-      const length = new DataView(merged.buffer).getUint32(position, false);
-      if (length === 0 || length > this.maxFrameBytes) {
-        this.poisoned = true;
-        throw new Error(length === 0 ? "zero_length" : "frame_too_large");
+    for (const byte of chunk) {
+      if (byte !== LINE_END) {
+        this.pending.push(byte);
+        continue;
       }
-      if (merged.length - position < PREFIX + length) break;
-      const text = decoder.decode(merged.subarray(position + PREFIX, position + PREFIX + length));
-      position += PREFIX + length;
+      if (this.pending.length === 0) {
+        this.poisoned = true;
+        throw new Error("empty_line");
+      }
+      const text = decoder.decode(Uint8Array.from(this.pending));
+      this.pending = [];
       try {
         this.onFrame(text);
       } catch (error) {
@@ -68,23 +67,18 @@ class TestReader implements TunnelFrameReader {
         throw error;
       }
     }
-    this.pending = merged.slice(position);
     return chunk.length;
   }
 }
 
-function encodeFrame(text: string): Uint8Array {
-  if (text.length === 0) throw new Error("zero_length");
-  const payload = encoder.encode(text);
-  const frame = new Uint8Array(PREFIX + payload.length);
-  new DataView(frame.buffer).setUint32(0, payload.length, false);
-  frame.set(payload, PREFIX);
-  return frame;
+function encodeLine(text: string): Uint8Array {
+  if (text.length === 0 || text.includes("\n")) throw new Error("invalid_line");
+  return encoder.encode(`${text}\n`);
 }
 
-const testCodec: TunnelFrameCodec = {
-  encode: encodeFrame,
-  createReader: (onFrame) => new TestReader(onFrame, BRIDGE_CHANNEL_LIMITS.maxFrameBytes),
+const lineCodec: TunnelFrameCodec = {
+  encode: encodeLine,
+  createReader: (onFrame) => new LineReader(onFrame),
 };
 
 // What the real NetworkTunnelStreamImpl does (packages/client/src/network-tunnel.ts:255-375),
@@ -222,7 +216,7 @@ function createHandlers(overrides: Partial<BridgeSocketHandlers> = {}) {
 
 function openSocket(limits = SMALL_WINDOW, overrides: Partial<BridgeSocketHandlers> = {}) {
   const { tunnel, stream } = createFakeTunnel(limits);
-  const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: testCodec });
+  const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: lineCodec });
   const { handlers, calls } = createHandlers(overrides);
   socket.observe(handlers);
   stream().connect();
@@ -242,7 +236,7 @@ function concat(chunks: Uint8Array[]): Uint8Array {
 
 function decodeFrames(bytes: Uint8Array): string[] {
   const frames: string[] = [];
-  new TestReader((text) => frames.push(text), BRIDGE_CHANNEL_LIMITS.maxFrameBytes).push(bytes);
+  new LineReader((text) => frames.push(text)).push(bytes);
   return frames;
 }
 
@@ -253,10 +247,19 @@ function textOfBytes(bytes: number): string {
   return text;
 }
 
+// A JSON text of exactly `bytes` UTF-8 bytes with about half as many characters, so a count by
+// characters would pass where a count by bytes must refuse.
+function multibyteTextOfBytes(bytes: number): string {
+  const text = JSON.stringify({ pad: "é".repeat((bytes - 10) / 2) });
+  expect(encoder.encode(text).byteLength).toBe(bytes);
+  expect(text.length).toBeLessThan(bytes / 2 + 10);
+  return text;
+}
+
 describe("tunnel bridge socket lifecycle", () => {
   it("opens the stream at creation and reports open once the stream connects", () => {
     const { tunnel, stream } = createFakeTunnel(SMALL_WINDOW);
-    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: testCodec });
+    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: lineCodec });
     expect(stream()).toBeDefined();
     expect(socket.streamId).toBe("stream-1");
     expect(socket.state()).toBe("connecting");
@@ -273,9 +276,26 @@ describe("tunnel bridge socket lifecycle", () => {
     expect(stream().handlerErrors).toEqual([]);
   });
 
+  it("writes a hello sent from open() in the same turn as the connect, with initial credit", () => {
+    const { tunnel, stream } = createFakeTunnel(SMALL_WINDOW);
+    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: lineCodec });
+    const hello = '{"type":"harness.hello","token":"SyntheticTokenForUnitTestsOnly"}';
+    const { handlers } = createHandlers({ open: () => socket.send(hello) });
+    socket.observe(handlers);
+    expect(stream().writes).toEqual([]);
+    stream().connect();
+    // Written inside onConnected: the mirrored credit was already the initial window.
+    expect(stream().trace).toEqual([`write:${hello.length + OVERHEAD}`]);
+    expect(stream().writes).toEqual([encodeLine(hello)]);
+    expect(socket.outgoingCredit()).toBe(SMALL_WINDOW.initialWindowBytes - hello.length - OVERHEAD);
+    expect(socket.outgoingCredit()).toBe(stream().outgoingCredit);
+    expect(socket.bufferedAmount()).toBe(0);
+    expect(stream().handlerErrors).toEqual([]);
+  });
+
   it("replays open in a microtask when observed after the stream connected", async () => {
     const { tunnel, stream } = createFakeTunnel(SMALL_WINDOW);
-    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: testCodec });
+    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: lineCodec });
     stream().connect();
     const { handlers, calls } = createHandlers();
     socket.observe(handlers);
@@ -286,7 +306,7 @@ describe("tunnel bridge socket lifecycle", () => {
 
   it("replays the close in a microtask when observed after the stream closed", async () => {
     const { tunnel, stream } = createFakeTunnel(SMALL_WINDOW);
-    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: testCodec });
+    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: lineCodec });
     stream().connect();
     stream().remoteClose(TunnelCloseReason.ProtocolError);
     const { handlers, calls } = createHandlers();
@@ -342,8 +362,8 @@ describe("tunnel bridge socket credit and fragmentation", () => {
     const { socket, stream } = openSocket();
     const text = '{"type":"harness.hello"}';
     socket.send(text);
-    expect(stream.writes).toEqual([encodeFrame(text)]);
-    expect(socket.outgoingCredit()).toBe(SMALL_WINDOW.initialWindowBytes - PREFIX - text.length);
+    expect(stream.writes).toEqual([encodeLine(text)]);
+    expect(socket.outgoingCredit()).toBe(SMALL_WINDOW.initialWindowBytes - text.length - OVERHEAD);
     expect(socket.outgoingCredit()).toBe(stream.outgoingCredit);
     expect(socket.bufferedAmount()).toBe(0);
   });
@@ -351,7 +371,7 @@ describe("tunnel bridge socket credit and fragmentation", () => {
   it("sends a frame larger than the window in credit-sized slices, waiting for credit", () => {
     const { socket, stream } = openSocket();
     const text = textOfBytes(41_000);
-    const frame = encodeFrame(text);
+    const frame = encodeLine(text);
     socket.send(text);
 
     expect(stream.writes.map((chunk) => chunk.length)).toEqual([32_768]);
@@ -360,9 +380,9 @@ describe("tunnel bridge socket credit and fragmentation", () => {
     expect(socket.state()).toBe("open");
 
     stream.grant(10_000);
-    expect(stream.writes.map((chunk) => chunk.length)).toEqual([32_768, 8_236]);
+    expect(stream.writes.map((chunk) => chunk.length)).toEqual([32_768, 8_233]);
     expect(socket.bufferedAmount()).toBe(0);
-    expect(socket.outgoingCredit()).toBe(10_000 - 8_236);
+    expect(socket.outgoingCredit()).toBe(10_000 - 8_233);
     expect(concat(stream.writes)).toEqual(frame);
     expect(stream.handlerErrors).toEqual([]);
   });
@@ -370,11 +390,11 @@ describe("tunnel bridge socket credit and fragmentation", () => {
   it("bounds each slice by maxDataBytes when credit exceeds it", () => {
     const limits = { ...SMALL_WINDOW, initialWindowBytes: 4_096, maxDataBytes: 1_024 };
     const { socket, stream } = openSocket(limits);
-    const text = textOfBytes(3_000 - PREFIX);
+    const text = textOfBytes(3_000 - OVERHEAD);
     socket.send(text);
     expect(stream.writes.map((chunk) => chunk.length)).toEqual([1_024, 1_024, 952]);
     expect(socket.outgoingCredit()).toBe(4_096 - 3_000);
-    expect(concat(stream.writes)).toEqual(encodeFrame(text));
+    expect(concat(stream.writes)).toEqual(encodeLine(text));
   });
 
   it("keeps frames in order across partial credit", () => {
@@ -384,24 +404,24 @@ describe("tunnel bridge socket credit and fragmentation", () => {
     const second = textOfBytes(70);
     socket.send(first);
     socket.send(second);
-    expect(socket.bufferedAmount()).toBe(84 + 74 - 100);
+    expect(socket.bufferedAmount()).toBe(81 + 71 - 100);
     stream.grant(100);
     expect(socket.bufferedAmount()).toBe(0);
     expect(decodeFrames(concat(stream.writes))).toEqual([first, second]);
-    expect(stream.writes.map((chunk) => chunk.length)).toEqual([60, 24, 16, 58]);
+    expect(stream.writes.map((chunk) => chunk.length)).toEqual([60, 21, 19, 52]);
   });
 
   it("queues a frame sent before the stream connects and writes it on connect", () => {
     const { tunnel, stream } = createFakeTunnel(SMALL_WINDOW);
-    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: testCodec });
+    const socket = createTunnelBridgeSocket({ tunnel, target: TARGET, codec: lineCodec });
     const { handlers, calls } = createHandlers();
     socket.observe(handlers);
     socket.send("{}");
-    expect(socket.bufferedAmount()).toBe(6);
+    expect(socket.bufferedAmount()).toBe(2 + OVERHEAD);
     expect(stream().writes).toEqual([]);
     stream().connect();
     expect(calls).toEqual(["open"]);
-    expect(stream().writes).toEqual([Uint8Array.from(TUNNEL_CODEC_VECTOR.bytes)]);
+    expect(stream().writes).toEqual([encodeLine("{}")]);
     expect(socket.bufferedAmount()).toBe(0);
   });
 
@@ -410,10 +430,10 @@ describe("tunnel bridge socket credit and fragmentation", () => {
     const { socket, stream } = openSocket(limits);
     // A loopback peer that returns every byte it reads as credit, from inside write.
     stream.onWrite = (chunk) => stream.grant(chunk.length);
-    const text = textOfBytes(2_500 - PREFIX);
+    const text = textOfBytes(2_500 - OVERHEAD);
     socket.send(text);
     expect(stream.writes.map((chunk) => chunk.length)).toEqual([400, 400, 400, 400, 400, 400, 100]);
-    expect(concat(stream.writes)).toEqual(encodeFrame(text));
+    expect(concat(stream.writes)).toEqual(encodeLine(text));
     expect(socket.bufferedAmount()).toBe(0);
     expect(socket.outgoingCredit()).toBe(1_000);
     expect(stream.handlerErrors).toEqual([]);
@@ -424,8 +444,8 @@ describe("tunnel bridge socket credit and fragmentation", () => {
     const { socket, stream, calls } = openSocket(limits);
     const half = textOfBytes(BRIDGE_CHANNEL_LIMITS.maxBufferedBytes / 2);
     socket.send(half);
-    // One byte of the first prefix went out with the initial credit.
-    expect(socket.bufferedAmount()).toBe(half.length + PREFIX - 1);
+    // One byte of the first frame went out with the initial credit.
+    expect(socket.bufferedAmount()).toBe(half.length + OVERHEAD - 1);
     // Exactly what the channel would accept: bufferedAmount + payload bytes equals the ceiling.
     const fill = textOfBytes(BRIDGE_CHANNEL_LIMITS.maxBufferedBytes - socket.bufferedAmount());
     socket.send(fill);
@@ -436,6 +456,17 @@ describe("tunnel bridge socket credit and fragmentation", () => {
     expect(socket.bufferedAmount()).toBe(0);
     expect(stream.closeReasons).toEqual([TunnelCloseReason.ProtocolError]);
     expect(calls).toEqual(["open", "error", "close"]);
+  });
+
+  it("counts the payload in UTF-8 bytes, not characters, when checking overflow", () => {
+    const limits = { ...SMALL_WINDOW, initialWindowBytes: 1, maxDataBytes: 1 };
+    const { socket } = openSocket(limits);
+    const room = BRIDGE_CHANNEL_LIMITS.maxBufferedBytes / 2;
+    socket.send(textOfBytes(room));
+    expect(socket.bufferedAmount()).toBe(room + OVERHEAD - 1);
+    // Fewer characters than the room left, but more bytes.
+    socket.send(multibyteTextOfBytes(room + 2));
+    expect(socket.failure()?.reason).toBe("overflow");
   });
 
   it("fails closed when the codec refuses a frame, without throwing into the channel", () => {
@@ -461,7 +492,7 @@ describe("tunnel bridge socket credit and fragmentation", () => {
     const limits = { ...SMALL_WINDOW, initialWindowBytes: 2, maxDataBytes: 2 };
     const { socket, stream } = openSocket(limits);
     socket.send("{}");
-    expect(socket.bufferedAmount()).toBe(4);
+    expect(socket.bufferedAmount()).toBe(2 + OVERHEAD - 2);
     stream.writeFailure = new Error("transport gone");
     stream.grant(2);
     expect(socket.failure()?.reason).toBe("stream_failed");
@@ -488,7 +519,7 @@ describe("tunnel bridge socket credit and fragmentation", () => {
     socket.send("{}");
     // Straight to the handlers, bypassing the fake's own validation, as a daemon bug or a
     // hostile peer would.
-    stream.handlers.onCredit(6);
+    stream.handlers.onCredit(2 + OVERHEAD);
     expect(socket.outgoingCredit()).toBe(SMALL_WINDOW.initialWindowBytes);
     expect(() => stream.handlers.onCredit(1)).toThrow(TunnelSocketError);
     expect(socket.failure()?.reason).toBe("credit_violation");
@@ -501,7 +532,7 @@ describe("tunnel bridge socket receive path", () => {
   it("delivers a frame split across chunks and credits each chunk after the parse", () => {
     const { socket, stream, handlers } = openSocket();
     const text = textOfBytes(5_000);
-    const frame = encodeFrame(text);
+    const frame = encodeLine(text);
     stream.deliver(frame.subarray(0, 3));
     expect(handlers.message).not.toHaveBeenCalled();
     expect(stream.consumed).toEqual([3]);
@@ -517,7 +548,7 @@ describe("tunnel bridge socket receive path", () => {
 
   it("delivers two frames from one chunk in order with one consume", () => {
     const { stream, handlers, calls } = openSocket();
-    const chunk = concat([encodeFrame('{"a":1}'), encodeFrame('{"b":22}')]);
+    const chunk = concat([encodeLine('{"a":1}'), encodeLine('{"b":22}')]);
     stream.deliver(chunk);
     expect(handlers.message).toHaveBeenNthCalledWith(1, '{"a":1}');
     expect(handlers.message).toHaveBeenNthCalledWith(2, '{"b":22}');
@@ -527,10 +558,10 @@ describe("tunnel bridge socket receive path", () => {
 
   it("fails closed on a reader violation and rethrows it to the client log", () => {
     const { socket, stream, handlers, calls } = openSocket();
-    stream.deliver(Uint8Array.from([0, 0, 0, 0, 0x7b]));
+    stream.deliver(Uint8Array.from([LINE_END, 0x7b]));
     expect(handlers.message).not.toHaveBeenCalled();
     expect(socket.failure()?.reason).toBe("frame_violation");
-    expect(socket.failure()?.cause).toMatchObject({ message: "zero_length" });
+    expect(socket.failure()?.cause).toMatchObject({ message: "empty_line" });
     expect(stream.consumed).toEqual([]);
     expect(stream.closeReasons).toEqual([TunnelCloseReason.ProtocolError]);
     expect(calls).toEqual(["open", "error", "close"]);
@@ -545,7 +576,7 @@ describe("tunnel bridge socket receive path", () => {
         throw boom;
       },
     });
-    stream.deliver(encodeFrame("{}"));
+    stream.deliver(encodeLine("{}"));
     expect(socket.failure()?.reason).toBe("handler_failed");
     expect(socket.failure()?.cause).toBe(boom);
     expect(stream.consumed).toEqual([]);
@@ -563,7 +594,7 @@ describe("tunnel bridge socket receive path", () => {
       },
     });
     socketRef = socket;
-    stream.deliver(concat([encodeFrame('{"a":1}'), encodeFrame('{"b":2}')]));
+    stream.deliver(concat([encodeLine('{"a":1}'), encodeLine('{"b":2}')]));
     expect(delivered).toEqual(['{"a":1}']);
     expect(stream.consumed).toEqual([]);
     expect(stream.closeReasons).toEqual([TunnelCloseReason.Ok]);
@@ -577,16 +608,16 @@ describe("tunnel bridge socket receive path", () => {
       message: () => socketRef?.send('{"type":"grantCredit"}'),
     });
     socketRef = socket;
-    const inbound = encodeFrame('{"type":"head"}');
+    const inbound = encodeLine('{"type":"head"}');
     stream.deliver(inbound);
-    expect(stream.writes).toEqual([encodeFrame('{"type":"grantCredit"}')]);
-    expect(stream.trace).toEqual([`write:${PREFIX + 22}`, `consume:${inbound.length}`]);
+    expect(stream.writes).toEqual([encodeLine('{"type":"grantCredit"}')]);
+    expect(stream.trace).toEqual([`write:${22 + OVERHEAD}`, `consume:${inbound.length}`]);
   });
 
   it("fails closed when the stream rejects the consume", () => {
     const { socket, stream, handlers, calls } = openSocket();
     stream.consumeFailure = new NetworkTunnelError("invalid_consumption", "accounting drift");
-    stream.deliver(encodeFrame("{}"));
+    stream.deliver(encodeLine("{}"));
     expect(handlers.message).toHaveBeenCalledWith("{}");
     expect(socket.failure()?.reason).toBe("stream_failed");
     expect(socket.failure()?.cause).toBe(stream.consumeFailure);
@@ -598,23 +629,37 @@ describe("tunnel bridge socket receive path", () => {
     const { socket, stream, handlers } = openSocket();
     socket.close(1000);
     stream.state = "connected";
-    stream.deliver(encodeFrame("{}"));
+    stream.deliver(encodeLine("{}"));
     expect(handlers.message).not.toHaveBeenCalled();
     expect(stream.consumed).toEqual([]);
   });
 });
 
 describe("adoptLengthPrefixedCodec", () => {
-  class ValidReader {
-    private readonly inner: TestReader;
-    constructor(options: { onFrame(text: string): void }) {
-      this.inner = new TestReader(options.onFrame, BRIDGE_CHANNEL_LIMITS.maxFrameBytes);
-    }
+  const vector = Uint8Array.from(TUNNEL_CODEC_VECTOR.bytes);
+
+  // A stub that knows only the fixed vector: it is not a parser and proves nothing about the
+  // real module. Parity with the real codec is checked where that module is actually loaded.
+  function encodeVectorOnly(text: string): Uint8Array {
+    if (text !== TUNNEL_CODEC_VECTOR.text) throw new Error("stub knows only the vector");
+    return vector.slice();
+  }
+
+  class VectorOnlyReader {
+    constructor(private readonly options: { onFrame(text: string): void }) {}
     push(chunk: Uint8Array): number {
-      return this.inner.push(chunk);
+      if (chunk.length !== vector.length || chunk.some((byte, index) => byte !== vector[index])) {
+        throw new Error("stub knows only the vector");
+      }
+      this.options.onFrame(TUNNEL_CODEC_VECTOR.text);
+      return chunk.length;
     }
   }
-  const validModule = { encodeLengthPrefixed: encodeFrame, LengthPrefixedReader: ValidReader };
+
+  const stubModule = {
+    encodeLengthPrefixed: encodeVectorOnly,
+    LengthPrefixedReader: VectorOnlyReader,
+  };
 
   function problemOf(module: unknown): string {
     try {
@@ -626,26 +671,26 @@ describe("adoptLengthPrefixedCodec", () => {
     throw new Error("codec was adopted");
   }
 
-  it("accepts a module with the real shape and vector", () => {
-    const codec = adoptLengthPrefixedCodec(validModule);
-    expect(codec.encode("{}")).toEqual(Uint8Array.from(TUNNEL_CODEC_VECTOR.bytes));
+  it("adopts a module whose shape, vector and round trip match", () => {
+    const codec = adoptLengthPrefixedCodec(stubModule);
+    expect(codec.encode(TUNNEL_CODEC_VECTOR.text)).toEqual(vector);
     const frames: string[] = [];
-    codec.createReader((text) => frames.push(text)).push(encodeFrame('{"ok":true}'));
-    expect(frames).toEqual(['{"ok":true}']);
+    expect(codec.createReader((text) => frames.push(text)).push(vector)).toBe(vector.length);
+    expect(frames).toEqual([TUNNEL_CODEC_VECTOR.text]);
   });
 
   it.each([
-    ["encode_missing", { LengthPrefixedReader: ValidReader }],
+    ["encode_missing", { LengthPrefixedReader: VectorOnlyReader }],
     ["encode_missing", null],
-    ["reader_missing", { encodeLengthPrefixed: encodeFrame }],
+    ["reader_missing", { encodeLengthPrefixed: encodeVectorOnly }],
     [
       "vector_mismatch",
-      { ...validModule, encodeLengthPrefixed: (text: string) => encoder.encode(text) },
+      { ...stubModule, encodeLengthPrefixed: (text: string) => encoder.encode(text) },
     ],
     [
       "roundtrip_mismatch",
       {
-        ...validModule,
+        ...stubModule,
         LengthPrefixedReader: class {
           push(chunk: Uint8Array): number {
             return chunk.length;
