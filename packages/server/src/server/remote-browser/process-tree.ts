@@ -14,6 +14,8 @@ export interface ProcessIdentity {
 export interface ProcessEntry extends ProcessIdentity {
   ppid: number;
   pgid: number;
+  /** Exited but not yet reaped: holds no memory and runs nothing. */
+  zombie?: boolean;
   rssBytes: number;
   cpuMs: number;
 }
@@ -134,6 +136,24 @@ export class ProcessTreeTracker {
     return false;
   }
 
+  /**
+   * Waits until no verified process is running (a zombie counts as exited); returns the
+   * identities still running at the deadline. Only exact identities are checked.
+   */
+  async waitUntilGone(timeoutMs: number, pollMs = 50): Promise<ProcessIdentity[]> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const running: ProcessIdentity[] = [];
+      for (const [pid, startTime] of this.verified) {
+        const current = await this.table.read(pid);
+        if (current?.startTime === startTime && !current.zombie) running.push({ pid, startTime });
+        else this.verified.delete(pid);
+      }
+      if (running.length === 0 || Date.now() >= deadline) return running;
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+  }
+
   /** Signals each verified process whose start time still matches; returns how many were signalled. */
   async signal(
     signal: NodeJS.Signals,
@@ -207,6 +227,7 @@ export function parseLinuxProcess(input: {
     .trim()
     .split(/\s+/);
   // fields[0] is field 3 (state); field N is fields[N - 3].
+  const zombie = fields[0] === "Z" || fields[0] === "X";
   const ppid = Number(fields[1]);
   const pgid = Number(fields[2]);
   const utime = Number(fields[11]);
@@ -221,6 +242,7 @@ export function parseLinuxProcess(input: {
     startTime,
     rssBytes: rssKb ? Number(rssKb) * 1024 : 0,
     cpuMs: ((utime + stime) * 1000) / input.ticks,
+    ...(zombie ? { zombie } : {}),
   };
 }
 

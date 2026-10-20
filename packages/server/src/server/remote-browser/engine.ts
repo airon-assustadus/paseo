@@ -117,6 +117,14 @@ export class RemoteBrowserUnavailableError extends Error {
   }
 }
 
+/** Processes of a closed browser are still running; their slot and memory stay accounted. */
+export class RemoteBrowserCleanupError extends Error {
+  constructor(readonly survivors: number) {
+    super(`${survivors} remote browser processes did not exit`);
+    this.name = "RemoteBrowserCleanupError";
+  }
+}
+
 export class RemoteBrowserLimitError extends Error {
   constructor(message: string) {
     super(message);

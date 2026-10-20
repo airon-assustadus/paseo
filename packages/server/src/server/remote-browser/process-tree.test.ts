@@ -96,6 +96,24 @@ describe("ProcessTreeTracker", () => {
   });
 });
 
+describe("ProcessTreeTracker exit confirmation", () => {
+  it("treats zombies and vanished processes as gone", async () => {
+    const processes = table([entry(100, 1, 100, "1000"), entry(101, 100, 100, "1001")]);
+    const tracker = new ProcessTreeTracker({ pid: 100, startTime: "1000" }, processes);
+    await tracker.sample();
+    processes.set([{ ...entry(101, 1, 100, "1001"), zombie: true }]);
+    expect(await tracker.waitUntilGone(100, 10)).toEqual([]);
+  });
+
+  it("reports exact survivors at the deadline", async () => {
+    const processes = table([entry(100, 1, 100, "1000"), entry(101, 100, 100, "1001")]);
+    const tracker = new ProcessTreeTracker({ pid: 100, startTime: "1000" }, processes);
+    await tracker.sample();
+    processes.set([entry(101, 1, 100, "1001"), entry(100, 1, 100, "5000")]);
+    expect(await tracker.waitUntilGone(50, 10)).toEqual([{ pid: 101, startTime: "1001" }]);
+  });
+});
+
 describe("ProcessTreeTracker during a non-atomic sample", () => {
   /** list() shows a stale snapshot; read() answers from a scripted sequence per PID. */
   function racyTable(

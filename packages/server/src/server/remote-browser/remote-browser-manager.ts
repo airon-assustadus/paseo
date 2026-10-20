@@ -227,14 +227,21 @@ export class RemoteBrowserManager {
   }
 
   private finish(entry: Tracked): Promise<void> {
-    entry.closing ??= entry.engine
-      .close()
-      .catch((error) => this.logger.warn({ err: error }, "Remote browser close failed"))
-      .finally(() => {
-        this.tracked.delete(entry);
-        if (this.tracked.size === 0) this.stopWatchdog();
-      });
+    entry.closing ??= this.closeTracked(entry);
     return entry.closing;
+  }
+
+  private async closeTracked(entry: Tracked): Promise<void> {
+    try {
+      await entry.engine.close();
+    } catch (error) {
+      // Processes that did not exit keep their slot and memory accounted, so the limits stay
+      // honest; nothing else is signalled.
+      this.logger.error({ err: error }, "Remote browser processes outlived their close");
+      return;
+    }
+    this.tracked.delete(entry);
+    if (this.tracked.size === 0) this.stopWatchdog();
   }
 
   private ensureWatchdog(): void {

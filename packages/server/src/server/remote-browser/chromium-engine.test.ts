@@ -1,4 +1,5 @@
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import pino from "pino";
@@ -12,6 +13,17 @@ const dirs: string[] = [];
 afterEach(async () => {
   for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
 });
+
+/** Running means present and not a zombie (an exited child awaiting its reaper). */
+function running(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    return state !== "Z" && state !== "X";
+  } catch {
+    return false;
+  }
+}
 
 function alive(pid: number): boolean {
   try {
@@ -68,6 +80,44 @@ describe.skipIf(process.platform !== "linux")("launchChromiumEngine containment"
       .sort();
     expect(opened).toHaveLength(2);
     expect(released).toEqual(opened);
+  });
+
+  it("confirms every process is gone before close resolves, even when SIGTERM is ignored", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-rb-engine-test-"));
+    dirs.push(root);
+    const pidFile = path.join(root, "child.pid");
+    const executable = path.join(root, "stubborn-browser.sh");
+    // Root and child ignore SIGTERM; only the verified SIGKILL ends them.
+    await writeFile(
+      executable,
+      `#!/bin/sh\ntrap '' TERM\n(trap '' TERM; exec sleep 300) &\necho $! > '${pidFile}'\nexec sleep 300\n`,
+    );
+    await chmod(executable, 0o755);
+    const tempRoot = path.join(root, "tmp");
+    await mkdir(tempRoot);
+    const launching = launchChromiumEngine(
+      {
+        executable,
+        logger: pino({ level: "silent" }),
+        processTable: createLinuxProcessTable(),
+        deniedProxyPorts: () => new Set(),
+        onProxyPort: () => {},
+        tempRoot,
+        launchTimeoutMs: 300,
+        closeGraceMs: 100,
+        terminateGraceMs: 500,
+      },
+      {
+        viewport: { width: 390, height: 844, deviceScaleFactor: 2, mobile: true, touch: true },
+        renderScale: 2,
+        initialUrl: null,
+      },
+    );
+    await expect(launching).rejects.toBeInstanceOf(RemoteBrowserUnavailableError);
+    // No waiting here: close only resolved after the exit was confirmed.
+    const childPid = Number((await readFile(pidFile, "utf8")).trim());
+    expect(running(childPid)).toBe(false);
+    expect(await readdir(tempRoot)).toEqual([]);
   });
 
   it("reports a missing executable as unavailable and leaves nothing behind", async () => {

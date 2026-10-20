@@ -13,6 +13,7 @@ import { CdpConnection, CdpError, type CdpEvent } from "./cdp-connection.js";
 import { assertSafeChromiumArgs, buildChromiumArgs, buildChromiumEnv } from "./chromium-launch.js";
 import { RemoteBrowserEgressProxy } from "./egress-proxy.js";
 import {
+  RemoteBrowserCleanupError,
   RemoteBrowserUnavailableError,
   parseNavigableUrl,
   type EngineExitReason,
@@ -222,16 +223,23 @@ export async function launchChromiumEngine(
   const tempDir = await mkdtemp(path.join(config.tempRoot ?? os.tmpdir(), "paseo-remote-browser-"));
   const profileDir = path.join(tempDir, "profile");
   const homeDir = path.join(tempDir, "home");
-  await mkdir(profileDir, { mode: 0o700 });
-  await mkdir(homeDir, { mode: 0o700 });
-  // No network prediction: Chromium would otherwise preconnect to its default search engine
-  // from the page's context as soon as it exists.
-  await mkdir(path.join(profileDir, "Default"), { mode: 0o700 });
-  await writeFile(
-    path.join(profileDir, "Default", "Preferences"),
-    JSON.stringify(CHROMIUM_PREFERENCES),
-    { mode: 0o600 },
-  );
+  try {
+    await mkdir(profileDir, { mode: 0o700 });
+    await mkdir(homeDir, { mode: 0o700 });
+    // No network prediction: Chromium would otherwise preconnect to its default search engine
+    // from the page's context as soon as it exists.
+    await mkdir(path.join(profileDir, "Default"), { mode: 0o700 });
+    await writeFile(
+      path.join(profileDir, "Default", "Preferences"),
+      JSON.stringify(CHROMIUM_PREFERENCES),
+      { mode: 0o600 },
+    );
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true });
+    throw new RemoteBrowserUnavailableError(
+      `Could not prepare the browser profile: ${String(error)}`,
+    );
+  }
   // The page's browser context uses the policy proxy. The process-wide proxy refuses everything,
   // so browser-internal services (component updates, push, sync) cannot reach any network.
   const proxy = new RemoteBrowserEgressProxy({
@@ -661,6 +669,7 @@ class ChromiumEngine implements ManagedRemoteBrowserEngine {
     for (const timer of this.pendingPopups.values()) clearTimeout(timer);
     this.pendingPopups.clear();
     let exited = false;
+    let survivors: ProcessIdentity[] = [];
     try {
       if (!this.cdp.closed) {
         await this.cdp
@@ -674,9 +683,13 @@ class ChromiumEngine implements ManagedRemoteBrowserEngine {
         exited = await waitForExit(child, settings.terminateGraceMs);
       }
       // Helpers can outlive the root briefly; the verified set still identifies them exactly.
+      // The slot is released only once every verified process is confirmed gone.
       if (this.tracker) {
         await this.tracker.sample().catch(() => undefined);
-        await this.tracker.signal("SIGKILL").catch(() => 0);
+        for (let attempt = 0; attempt < 2 && this.tracker.identities.length > 0; attempt += 1) {
+          await this.tracker.signal("SIGKILL").catch(() => 0);
+          survivors = await this.tracker.waitUntilGone(settings.terminateGraceMs);
+        }
       }
     } finally {
       this.cdp.close("Remote browser closed");
@@ -687,8 +700,9 @@ class ChromiumEngine implements ManagedRemoteBrowserEngine {
       await rm(tempDir, { recursive: true, force: true, maxRetries: 3 }).catch((error) =>
         this.logger.warn({ err: error }, "Remote browser temp dir removal failed"),
       );
-      this.logger.debug({ exited }, "Remote browser engine closed");
+      this.logger.debug({ exited, survivors: survivors.length }, "Remote browser engine closed");
     }
+    if (survivors.length > 0) throw new RemoteBrowserCleanupError(survivors.length);
   }
 
   private exit(reason: EngineExitReason): void {

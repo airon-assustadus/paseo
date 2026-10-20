@@ -231,4 +231,18 @@ describe("RemoteBrowserManager", () => {
     await manager.launch({ ...input, initialUrl: "http://localhost:3000/" });
     expect(trackedDuringNavigation).toBe(1);
   });
+
+  it("keeps the slot and memory of a browser whose processes outlived close", async () => {
+    const engine = fakeEngine();
+    engine.close = () => Promise.reject(new Error("2 remote browser processes did not exit"));
+    const manager = new RemoteBrowserManager({
+      logger: pino({ level: "silent" }),
+      limits: { sampleIntervalMs: 60_000, maxBrowsers: 1 },
+      launch: async () => engine,
+    });
+    const launched = await manager.launch(input);
+    await manager.closeBrowser(launched);
+    expect(manager.activeCount).toBe(1);
+    await expect(manager.launch(input)).rejects.toThrow(/Too many/);
+  });
 });
