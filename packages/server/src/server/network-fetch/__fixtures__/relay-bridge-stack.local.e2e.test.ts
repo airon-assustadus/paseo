@@ -1,5 +1,13 @@
+import { readFile } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
+import { basename } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  createProcessTable,
+  type ProcessEntry,
+  type ProcessIdentity,
+  type ProcessTable,
+} from "../../remote-browser/process-tree.js";
 import { encodeLengthPrefixed, LengthPrefixedReader } from "./length-prefixed.js";
 import {
   RelayBridgeStackError,
@@ -124,7 +132,11 @@ describe("relay bridge stack", () => {
       expect(stack.relay.instance).not.toEqual(instanceBefore);
       expect(stack.relay.exited).toBe(false);
       expect(stack.relayRegistrations()).toBeGreaterThan(before);
-      expect(steps.slice(-2)).toEqual(["relay restarting", "daemon re-registered"]);
+      expect(steps.slice(-3)).toEqual([
+        "relay restarting",
+        "relay restarted",
+        "daemon re-registered",
+      ]);
     },
     TEST_TIMEOUT_MS,
   );
@@ -155,6 +167,100 @@ describe("relay bridge stack", () => {
     TEST_TIMEOUT_MS,
   );
 });
+
+describe("relay bridge stack close during restart", () => {
+  // Each case owns its stack: closing is the subject, so the stack is gone at the end of the case.
+  // The helper's `restart` clears its current instance while the old process stops (B-1): a close
+  // in that window must still end up with no relay process of ours and the port refusing.
+
+  it(
+    "closes while the old relay process is still stopping, and no relay process of ours survives",
+    async () => {
+      const table = createProcessTable(process.platform);
+      const before = await descendantsOf(table, process.pid);
+      const steps: string[] = [];
+      const stack = await startRelayBridgeStack({
+        shell: SHELL,
+        allowedOrigin: ALLOWED_ORIGIN,
+        onStep: (step) => steps.push(step),
+      });
+      const relayPort = stack.relay.port;
+
+      const pending = stack.restartRelay();
+      // Synchronous barrier: the helper has already dropped its current instance and begun stopping.
+      expect(steps.at(-1)).toBe("relay restarting");
+      expect(stack.relay.exited).toBe(true);
+
+      // The restart rejects while the close is in progress; its handler is attached first.
+      const rejected = expect(pending).rejects.toMatchObject({
+        name: "RelayBridgeStackError",
+        message: "Relay bridge stack closed during restart",
+      });
+      const closing = stack.close();
+      expect(stack.close()).toBe(closing);
+      await expect(stack.restartRelay()).rejects.toBeInstanceOf(RelayBridgeStackError);
+      await closing;
+      await rejected;
+
+      expect(steps).toContain("relay restarted");
+      expect(stack.relay.exited).toBe(true);
+      expect(await connectionOutcome(relayPort)).toBe("ECONNREFUSED");
+      const processes = await newDescendants(table, process.pid, before);
+      logProcesses("close while stopping", processes);
+      expect(processes.leftovers).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "closes while waiting for the daemon to register again, without waiting out the deadline",
+    async () => {
+      const table = createProcessTable(process.platform);
+      const before = await descendantsOf(table, process.pid);
+      let relayRestarted: () => void = () => undefined;
+      const restarted = new Promise<void>((resolve) => {
+        relayRestarted = resolve;
+      });
+      const stack = await startRelayBridgeStack({
+        shell: SHELL,
+        allowedOrigin: ALLOWED_ORIGIN,
+        registrationTimeoutMs: 30_000,
+        onStep: (step) => {
+          if (step === "relay restarted") relayRestarted();
+        },
+      });
+      const relayPort = stack.relay.port;
+
+      const pending = stack.restartRelay();
+      // Rejected by the close, not by the registration deadline: the daemon is gone and nothing
+      // could register anyway. The handler is attached before the close that triggers it.
+      const rejected = expect(pending).rejects.toMatchObject({
+        name: "RelayBridgeStackError",
+        message: "Relay bridge stack closed during restart",
+      });
+      await restarted;
+      const closeStartedAt = Date.now();
+      await stack.close();
+      await rejected;
+      expect(Date.now() - closeStartedAt).toBeLessThan(30_000);
+
+      expect(stack.relay.exited).toBe(true);
+      expect(await connectionOutcome(relayPort)).toBe("ECONNREFUSED");
+      const processes = await newDescendants(table, process.pid, before);
+      logProcesses("close while registering", processes);
+      expect(processes.leftovers).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+function logProcesses(label: string, processes: Leftovers): void {
+  // Command basenames and counts only; no paths, ports or identifiers.
+  // eslint-disable-next-line no-console
+  console.info(
+    `[relay-stack] ${label} ${JSON.stringify({ transient: processes.transient, unrelated: processes.unrelated, waitedMs: processes.waitedMs, leftovers: processes.leftovers.length })}`,
+  );
+}
 
 describe("relay bridge stack start failure", () => {
   it(
@@ -242,6 +348,95 @@ function connectTcp(port: number): Promise<TcpPeer> {
     socket.once("connect", () => resolve(peer));
     socket.once("error", reject);
   });
+}
+
+/** Live (non-zombie) processes below `root`, by pid and start time, from the repo's process table. */
+async function descendantsOf(table: ProcessTable, root: number): Promise<ProcessIdentity[]> {
+  const byParent = new Map<number, ProcessEntry[]>();
+  for (const entry of await table.list()) {
+    byParent.set(entry.ppid, [...(byParent.get(entry.ppid) ?? []), entry]);
+  }
+  const result: ProcessIdentity[] = [];
+  const queue = [root];
+  for (;;) {
+    const pid = queue.shift();
+    if (pid === undefined) break;
+    for (const child of byParent.get(pid) ?? []) {
+      if (!child.zombie) result.push({ pid: child.pid, startTime: child.startTime });
+      queue.push(child.pid);
+    }
+  }
+  return result;
+}
+
+interface Leftovers {
+  /** New relay descendants still alive at the deadline: wrangler or workerd nobody will stop. */
+  leftovers: Array<ProcessIdentity & { command: string }>;
+  /** New relay descendants seen on the way out, by command basename; exiting is not surviving. */
+  transient: string[];
+  /**
+   * New descendants that are not relay processes, by command basename. The daemon's plugin
+   * compiler keeps an esbuild service alive for the life of this process; it is not the stack's.
+   */
+  unrelated: string[];
+  waitedMs: number;
+}
+
+function isRelayProcess(command: string): boolean {
+  return /wrangler|workerd/i.test(command);
+}
+
+/**
+ * Relay descendants of `root` that did not exist in `before`, re-read until none is left or the
+ * deadline passes. A child still exiting after its parent was stopped is allowed to finish; one
+ * that is still there at the deadline has no owner, which is what B-1 is about.
+ */
+async function newDescendants(
+  table: ProcessTable,
+  root: number,
+  before: readonly ProcessIdentity[],
+  timeoutMs = 5_000,
+): Promise<Leftovers> {
+  const known = new Set(before.map((entry) => `${entry.pid}:${entry.startTime}`));
+  const transient = new Set<string>();
+  const unrelated = new Set<string>();
+  const startedAt = Date.now();
+  for (;;) {
+    const now = await descendantsOf(table, root);
+    const fresh = now.filter((entry) => !known.has(`${entry.pid}:${entry.startTime}`));
+    const described = await Promise.all(
+      fresh.map(async (entry) => ({
+        pid: entry.pid,
+        startTime: entry.startTime,
+        command: await commandOf(entry.pid),
+      })),
+    );
+    const relay = described.filter((entry) => isRelayProcess(entry.command));
+    for (const entry of described) {
+      (isRelayProcess(entry.command) ? transient : unrelated).add(entry.command);
+    }
+    const waitedMs = Date.now() - startedAt;
+    if (relay.length === 0 || waitedMs >= timeoutMs) {
+      return { leftovers: relay, transient: [...transient], unrelated: [...unrelated], waitedMs };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/** Basenames of the first arguments only: enough to tell wrangler, workerd or node apart. */
+async function commandOf(pid: number): Promise<string> {
+  try {
+    const cmdline = await readFile(`/proc/${pid}/cmdline`);
+    return cmdline
+      .toString("utf8")
+      .split("\0")
+      .filter((arg) => arg.length > 0)
+      .slice(0, 3)
+      .map((arg) => basename(arg))
+      .join(" ");
+  } catch {
+    return "?";
+  }
 }
 
 /** Resolves with the connect outcome: "connected" or the error code, never throws. */

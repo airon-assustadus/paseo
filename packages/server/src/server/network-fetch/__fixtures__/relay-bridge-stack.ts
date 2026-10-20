@@ -165,10 +165,22 @@ class DaemonLog {
     return this.lines.filter((line) => line.includes(REGISTRATION_LINE)).length;
   }
 
+  private closedWith: Error | null = null;
+
   /** Resolves once at least `count` registration lines exist; rejects with the recent relay events. */
   waitForRegistrations(count: number, timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (this.closedWith !== null) {
+        reject(this.closedWith);
+        return;
+      }
       const check = () => {
+        if (this.closedWith !== null) {
+          this.waiters.delete(check);
+          clearTimeout(timer);
+          reject(this.closedWith);
+          return;
+        }
         if (this.registrations() < count) return;
         this.waiters.delete(check);
         clearTimeout(timer);
@@ -185,6 +197,12 @@ class DaemonLog {
       this.waiters.add(check);
       check();
     });
+  }
+
+  /** No registration can arrive once the daemon is being closed: pending and future waiters reject. */
+  close(reason: Error): void {
+    this.closedWith = reason;
+    for (const waiter of this.waiters) waiter();
   }
 
   private recentRelayEvents(): string[] {
@@ -313,11 +331,21 @@ export async function startRelayBridgeStack(
     }
   }
 
+  /** The helper's own restart phase, held so `close()` never stops the relay mid-swap (B-1). */
+  let relayRestart: Promise<void> | null = null;
+
+  function closedDuringRestart(): RelayBridgeStackError {
+    return new RelayBridgeStackError("restart", "Relay bridge stack closed during restart");
+  }
+
   async function restart(): Promise<void> {
     const before = log.registrations();
     step("relay restarting", { registrations: before });
     try {
-      await relay.restart();
+      relayRestart = relay.restart();
+      await relayRestart;
+      step("relay restarted");
+      if (closing !== null) throw closedDuringRestart();
       await log.waitForRegistrations(before + 1, registrationTimeoutMs);
     } catch (error) {
       failure = error instanceof Error ? error : new Error(String(error));
@@ -327,13 +355,21 @@ export async function startRelayBridgeStack(
   }
 
   async function closeAll(): Promise<void> {
+    // The daemon goes away below, so a restart waiting for its registration must stop waiting now.
+    log.close(closedDuringRestart());
     const failures: unknown[] = [];
     const steps: Array<() => Promise<void>> = [
       () => host.close(),
       () => daemon.close(),
       () => clientTap.close(),
       () => daemonTap.close(),
-      () => relay.stop(),
+      async () => {
+        // The helper's `restart` clears its current instance while the old process stops; a `stop`
+        // in that window finds nothing to stop and the new process would run on without an owner.
+        // Waiting for the phase (bounded by the relay startup deadline) makes `stop` see it.
+        await relayRestart?.catch(() => undefined);
+        await relay.stop();
+      },
     ];
     for (const run of steps) {
       await run().catch((error: unknown) => failures.push(error));
