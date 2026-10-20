@@ -1,4 +1,8 @@
-import type { BridgeHeaders, BridgeMethod } from "../bridge-messages";
+import type {
+  NetworkFetchChannel,
+  NetworkFetchChannelHandlers,
+  NetworkFetchOutboundFrame,
+} from "../network-fetch-transport";
 
 // Test-only WebSocket channel between the control page and the bridge host
 // (adapter-contract.md §5). It authenticates, encodes and bounds frames; the adapter validates
@@ -21,49 +25,6 @@ export const BRIDGE_CHANNEL_LIMITS = {
 const CLOSE_NORMAL = 1000;
 const CLOSE_VIOLATION = 4008;
 const CLOSE_OVERFLOW = 4013;
-
-// Structural copy of the adapter's channel types (adapter-implementation-plan.md §1), declared
-// here until both modules share a branch.
-export interface NetworkFetchScope {
-  origin: string;
-  pathPrefix: string;
-}
-
-export type NetworkFetchRequestBody = { kind: "none" } | { kind: "stream"; length: number | null };
-
-export type BridgeOutboundFrame =
-  | {
-      type: "session.open";
-      scope: NetworkFetchScope;
-      ttlMs: number;
-      limits: Readonly<Record<string, number>> | null;
-    }
-  | {
-      type: "request";
-      requestId: number;
-      method: BridgeMethod;
-      url: string;
-      headers: BridgeHeaders;
-      redirect: "manual";
-      body: NetworkFetchRequestBody;
-    }
-  | { type: "body"; requestId: number; data: Uint8Array }
-  | { type: "endBody" | "cancel"; requestId: number }
-  | { type: "grantCredit"; requestId: number; bytes: number }
-  | { type: "close" };
-
-export interface NetworkFetchChannelHandlers {
-  frame(data: unknown): void;
-  lost(): void;
-}
-
-export interface NetworkFetchChannel {
-  // Never throws because of the socket: a closed, lost, still-connecting or full socket ends
-  // the channel or makes the call a no-op. A frame that cannot be encoded is a bug and throws.
-  send(frame: BridgeOutboundFrame): void;
-  listen(handlers: NetworkFetchChannelHandlers): void;
-  close(): void;
-}
 
 // bridge-backend-plan.md §1, frozen as D-CH-3. The CA is the run's synthetic test authority;
 // a PEM that is not exactly one certificate (a private key, for one) is refused.
@@ -280,16 +241,10 @@ function readFixture(frame: Record<string, unknown>): BridgeFixtureInfo | null {
   return { http, https, httpsVariants, canary };
 }
 
-function encodeFrame(frame: BridgeOutboundFrame): string {
-  if (frame.type === "body") {
-    const { requestId, data } = frame;
-    return JSON.stringify({ type: "body", requestId, data: encodeBase64(data) });
-  }
-  if (frame.type === "session.open" && frame.limits === null) {
-    const { type, scope, ttlMs } = frame;
-    return JSON.stringify({ type, scope, ttlMs });
-  }
-  return JSON.stringify(frame);
+function encodeFrame(frame: NetworkFetchOutboundFrame): string {
+  if (frame.type !== "body") return JSON.stringify(frame);
+  const { requestId, data } = frame;
+  return JSON.stringify({ type: "body", requestId, data: encodeBase64(data) });
 }
 
 function wrapWebSocket(socket: WebSocket): BridgeSocket {
