@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react-native";
 import { getIsElectron } from "@/constants/platform";
+import { useCanOpenBrowserTab } from "@/remote-browser/capability";
 import { supportsDesktopPaneSplits, useIsCompactFormFactor } from "@/constants/layout";
 import { GIT_ACTION_ICONS } from "@/git/action-icons";
 import { useGitActionRunner, useGitActions } from "@/git/use-actions";
@@ -191,6 +192,7 @@ export function useWorkspaceCommandCenterActions(): void {
     labels: workspace.labels ?? [],
   }));
   const cwd = useWorkspaceDirectory(serverId, workspaceId);
+  const canOpenBrowserTabs = useCanOpenBrowserTab(serverId);
   const currentBranch = fields?.currentBranch ?? null;
   const isPinned = fields?.pinnedAt != null;
   const isCompact = useIsCompactFormFactor();
@@ -285,7 +287,7 @@ export function useWorkspaceCommandCenterActions(): void {
         shortcuts: resolveWorkspaceShortcuts(overrides),
         capabilities: {
           canSplitPanes: supportsDesktopPaneSplits() && !isCompact,
-          canOpenBrowserTabs: getIsElectron(),
+          canOpenBrowserTabs,
           isGit,
           canPin,
           canShowSetup,
@@ -308,6 +310,7 @@ export function useWorkspaceCommandCenterActions(): void {
     [
       activeTabIndex,
       activeTabKind,
+      canOpenBrowserTabs,
       canPin,
       canShowSetup,
       copyBranchName,

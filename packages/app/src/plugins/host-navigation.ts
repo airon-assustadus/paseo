@@ -5,17 +5,18 @@ import { useMemo } from "react";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 
-import { getIsElectron } from "@/constants/platform";
 import { createWorkspaceBrowser } from "@/desktop/browser/store";
+import { useCanOpenBrowserTab } from "@/remote-browser/capability";
 import { createPluginHostNavigation } from "./host-navigation-model";
 
 export function usePluginHostNavigation(
   serverId: string,
 ): NonNullable<PluginSurfaceProps["navigation"]> {
+  const browserAvailable = useCanOpenBrowserTab(serverId);
   return useMemo(
     () =>
       createPluginHostNavigation(serverId, {
-        browserAvailable: getIsElectron(),
+        browserAvailable,
         openAgent: navigateToAgent,
         openWorkspace: navigateToWorkspace,
         createBrowser: createWorkspaceBrowser,
@@ -25,6 +26,6 @@ export function usePluginHostNavigation(
             workspaceId,
           }),
       }),
-    [serverId],
+    [browserAvailable, serverId],
   );
 }
