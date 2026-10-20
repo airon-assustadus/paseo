@@ -2,6 +2,7 @@ import { defineConfig, configDefaults } from "vitest/config";
 import { playwright } from "@vitest/browser-playwright";
 import path from "path";
 import fs from "fs";
+import { webProxyBridgeCommandFor } from "./vitest.web-proxy-bridge";
 
 const appNodeModules = path.resolve(__dirname, "node_modules");
 const rootNodeModules = path.resolve(__dirname, "../../node_modules");
@@ -33,7 +34,11 @@ export default defineConfig({
         test: {
           name: "unit",
           environment: "node",
-          include: ["src/**/*.{test,spec}.{ts,tsx}", "native-release-version.test.ts"],
+          include: [
+            "src/**/*.{test,spec}.{ts,tsx}",
+            "native-release-version.test.ts",
+            "vitest.web-proxy-bridge.test.ts",
+          ],
           setupFiles: [path.resolve(__dirname, "vitest.setup.ts")],
           exclude: [...configDefaults.exclude, "e2e/**", "src/**/*.browser.{test,spec}.{ts,tsx}"],
         },
@@ -52,6 +57,8 @@ export default defineConfig({
             connectTimeout: 180_000,
             instances: [{ browser: "chromium" }],
             screenshotDirectory: ".vitest-screenshots",
+            // Starts the web proxy bridge host only when a test calls it.
+            commands: { webProxyBridge: webProxyBridgeCommandFor(__dirname) },
           },
           globalSetup: path.resolve(__dirname, "src/runtime/websocket-test-global-setup.ts"),
         },
