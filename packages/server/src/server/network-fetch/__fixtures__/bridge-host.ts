@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
-import type { Socket } from "node:net";
+import net, { type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
 import type { TunnelLookup } from "../../network-tunnel/dial-target.js";
@@ -28,6 +28,13 @@ import {
   type NetworkFetchSink,
   type RequestRelease,
 } from "../session.js";
+import {
+  encodeLengthPrefixed,
+  LENGTH_PREFIX_BYTES,
+  LengthPrefixedError,
+  LengthPrefixedReader,
+  MAX_LENGTH_PREFIXED_FRAME_BYTES,
+} from "./length-prefixed.js";
 import type { FixtureEvent, FixtureEventKind, FixtureRecorder } from "./recorder.js";
 import type { FixtureLimits } from "./routes.js";
 import { startWebProxyFixture, type WebProxyFixture } from "./web-proxy-fixture.js";
@@ -38,10 +45,14 @@ import { startWebProxyFixture, type WebProxyFixture } from "./web-proxy-fixture.
  * that serves the bundled shell on the `wp-a`/`wp-b.localhost` origins, and the web proxy fixture as
  * the only reachable destination. It receives the shell as strings and never reads the app. Nothing
  * here is wired into the daemon; the Vitest command that starts it is the only caller outside tests.
+ *
+ * For the relay experiment (L-relay) the same frames travel over a plain TCP listener with a u32
+ * length prefix, which is what the network tunnel delivers at its destination. Both listeners feed
+ * one connection state machine; only the byte framing differs.
  */
 
 export const BRIDGE_SUBPROTOCOL = "paseo-web-proxy-bridge.v1";
-export const BRIDGE_MAX_PAYLOAD_BYTES = 65_536;
+export const BRIDGE_MAX_PAYLOAD_BYTES = MAX_LENGTH_PREFIXED_FRAME_BYTES;
 export const BRIDGE_MAX_CONNECTIONS = 4;
 export const BRIDGE_MAX_UNAUTHENTICATED = 2;
 export const BRIDGE_HELLO_TIMEOUT_MS = 2_000;
@@ -125,7 +136,7 @@ export interface BridgeShell {
   bootstrapHtml?: string;
 }
 
-export type BridgeHostStep = "static" | "fixture" | "ws";
+export type BridgeHostStep = "static" | "fixture" | "ws" | "tcp";
 
 /** Knobs for `bridge-host.test.ts` only; the Vitest command never accepts or forwards them. */
 export interface BridgeHostHarnessOptions {
@@ -146,6 +157,13 @@ export interface StartBridgeHostOptions {
   /** Lowers `BRIDGE_HARNESS_LIMITS`; a value above the harness is a usage error. */
   limits?: Partial<NetworkFetchLimits>;
   harness?: BridgeHostHarnessOptions;
+  /** Also opens the length-prefixed TCP listener the tunnel can reach (L-relay). Default: off. */
+  tcp?: boolean;
+}
+
+export interface BridgeTcpInfo {
+  /** Loopback port; the tunnel's `Open` names it as the destination. */
+  port: number;
 }
 
 export interface BridgeFixtureOrigin {
@@ -184,14 +202,19 @@ export interface BridgeHostInfo {
   allowedOrigin: string;
   fixture: BridgeFixtureInfo;
   shell: BridgeShellInfo;
+  /** Node-side only until the command owner projects it; `null` when `tcp` was not requested. */
+  tcp: BridgeTcpInfo | null;
 }
 
 export interface BridgeHostStats {
+  /** Sockets accepted on either listener. */
   connections: number;
   authenticatedConnections: number;
   sessionsOpened: number;
   fixtureQueries: number;
   activeSockets: number;
+  /** TCP peers that hung up in the middle of a frame; the partial bytes were never a frame. */
+  truncatedFrames: number;
 }
 
 export interface BridgeHost extends BridgeHostInfo {
@@ -281,6 +304,35 @@ interface FrameLimits {
 
 type ConnectionState = "upgraded" | "authenticated" | "open" | "closed";
 
+/** WebSocket close codes the host uses; on TCP they only pick between `end()` and `destroy()`. */
+type BridgeCloseCode = 1000 | 1001 | 1003 | 1008 | 1013;
+
+interface BridgeTransportEvents {
+  text(text: string): void;
+  /** A binary WebSocket frame; TCP never raises it. */
+  binary(): void;
+  /** The length-prefixed reader refused the bytes; TCP only. */
+  malformed(): void;
+  /** The peer hung up with part of a frame buffered; TCP only. */
+  truncated(): void;
+  close(): void;
+}
+
+/** What a connection needs from its socket; the frame logic never sees `ws` or `net` directly. */
+interface BridgeTransport {
+  readonly kind: "ws" | "tcp";
+  start(events: BridgeTransportEvents): void;
+  isOpen(): boolean;
+  isClosed(): boolean;
+  bufferedBytes(): number;
+  /** Bytes one frame adds to the outbound queue, including any framing. */
+  outboundBytes(payload: string): number;
+  send(payload: string): void;
+  close(code: BridgeCloseCode): void;
+  destroy(): void;
+  readonly closed: Promise<void>;
+}
+
 interface BridgeRuntime {
   token: Buffer;
   allowlists: AllowlistStore;
@@ -297,6 +349,7 @@ interface BridgeRuntime {
     authenticated: number;
     sessionsOpened: number;
     fixtureQueries: number;
+    truncatedFrames: number;
   };
   duplicateArmed: boolean;
   releaseUnauthenticated(): void;
@@ -323,18 +376,22 @@ async function openBridgeHost(
   limits: NetworkFetchLimits,
 ): Promise<BridgeHost> {
   const harness = options.harness ?? {};
-  const opened: OpenedResources = { static: null, backend: null, ws: null };
+  const opened: OpenedResources = { static: null, backend: null, ws: null, tcp: null };
   const connections = new Set<BridgeConnection>();
   let closing: Promise<void> | null = null;
 
+  function listeners(): ManagedServer[] {
+    return [opened.ws, opened.tcp, opened.static].filter(
+      (server): server is ManagedServer => server !== null,
+    );
+  }
+
   function closeEverything(): Promise<void> {
     closing ??= (async () => {
-      const serversClosed = [opened.ws, opened.static]
-        .filter((server): server is ManagedServer => server !== null)
-        .map(stopAccepting);
+      const serversClosed = listeners().map(stopAccepting);
       await Promise.all([...connections].map((connection) => connection.shutdown()));
-      for (const server of [opened.ws, opened.static]) {
-        if (server) for (const socket of server.sockets) socket.destroy();
+      for (const server of listeners()) {
+        for (const socket of server.sockets) socket.destroy();
       }
       await opened.backend?.close();
       await Promise.all(serversClosed);
@@ -345,9 +402,10 @@ async function openBridgeHost(
   let step: BridgeHostStep = "static";
   try {
     failIfRequested(harness, "static");
-    opened.static = await listen(http.createServer());
+    const staticServer = http.createServer();
+    opened.static = await listen(staticServer);
     const shellInfo = describeShell(opened.static.port);
-    attachStaticRoutes(opened.static.server, options, shellInfo);
+    attachStaticRoutes(staticServer, options, shellInfo);
 
     step = "fixture";
     failIfRequested(harness, "fixture");
@@ -360,18 +418,38 @@ async function openBridgeHost(
 
     step = "ws";
     failIfRequested(harness, "ws");
-    opened.ws = await listen(http.createServer());
-    opened.ws.server.maxConnections = BRIDGE_MAX_CONNECTIONS;
+    const wsServer = http.createServer();
+    opened.ws = await listen(wsServer);
+
+    if (options.tcp === true) {
+      step = "tcp";
+      failIfRequested(harness, "tcp");
+      opened.tcp = await listen(net.createServer({ allowHalfOpen: false }));
+    }
+    const tcpInfo = opened.tcp === null ? null : { port: opened.tcp.port };
+
     const backend = opened.backend;
     const fixtureInfo = describeFixture(backend);
     const token = randomBytes(TOKEN_BYTES);
-    const counters = { connections: 0, authenticated: 0, sessionsOpened: 0, fixtureQueries: 0 };
+    const counters = {
+      connections: 0,
+      authenticated: 0,
+      sessionsOpened: 0,
+      fixtureQueries: 0,
+      truncatedFrames: 0,
+    };
     let unauthenticated = 0;
+    // One answer for both listeners: the socket caps are shared, not per listener.
+    function canAccept(): boolean {
+      if (closing !== null) return false;
+      if (connections.size >= BRIDGE_MAX_CONNECTIONS) return false;
+      return unauthenticated < BRIDGE_MAX_UNAUTHENTICATED;
+    }
     const runtime: BridgeRuntime = {
       token,
       allowlists: bridgeAllowlists(backend, harness.extraAllowlistTargets ?? []),
       limits,
-      protectedPorts: new Set([opened.ws.port, opened.static.port]),
+      protectedPorts: new Set(listeners().map((server) => server.port)),
       tlsCa: backend.https ? [backend.https.caPem] : null,
       lookup: harness.lookup,
       helloTimeoutMs: harness.helloTimeoutMs ?? BRIDGE_HELLO_TIMEOUT_MS,
@@ -395,22 +473,32 @@ async function openBridgeHost(
     });
     const wsPort = opened.ws.port;
     const wsHosts = new Set([`127.0.0.1:${wsPort}`, `localhost:${wsPort}`]);
-    opened.ws.server.on("request", answerPlainHttp);
-    opened.ws.server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    wsServer.on("request", answerPlainHttp);
+    wsServer.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
       const refusal = upgradeRefusal(req, wsHosts, options.allowedOrigin);
       if (refusal !== null) {
         refuse(socket, refusal);
         return;
       }
-      if (closing !== null || unauthenticated >= BRIDGE_MAX_UNAUTHENTICATED) {
+      if (!canAccept()) {
         refuse(socket, 503);
         return;
       }
       unauthenticated += 1;
       wss.handleUpgrade(req, socket, head, (ws) => {
         counters.connections += 1;
-        connections.add(attachConnection(ws, runtime));
+        connections.add(attachConnection(webSocketTransport(ws), runtime));
       });
+    });
+    opened.tcp?.server.on("connection", (socket: Socket) => {
+      // No handshake to answer on TCP: a socket past the caps is dropped before any byte is read.
+      if (!canAccept()) {
+        socket.destroy();
+        return;
+      }
+      unauthenticated += 1;
+      counters.connections += 1;
+      connections.add(attachConnection(tcpTransport(socket), runtime));
     });
 
     return {
@@ -419,6 +507,7 @@ async function openBridgeHost(
       allowedOrigin: options.allowedOrigin,
       fixture: fixtureInfo,
       shell: shellInfo,
+      tcp: tcpInfo,
       backend,
       get stats(): BridgeHostStats {
         return {
@@ -427,6 +516,7 @@ async function openBridgeHost(
           sessionsOpened: counters.sessionsOpened,
           fixtureQueries: counters.fixtureQueries,
           activeSockets: connections.size,
+          truncatedFrames: counters.truncatedFrames,
         };
       },
       duplicateNextRequest: () => {
@@ -442,7 +532,9 @@ async function openBridgeHost(
 }
 
 function openedPorts(opened: OpenedResources): number[] {
-  const servers = [opened.static, opened.ws].flatMap((server) => (server ? [server.port] : []));
+  const servers = [opened.static, opened.ws, opened.tcp].flatMap((server) =>
+    server ? [server.port] : [],
+  );
   if (opened.backend === null) return servers;
   const { http: plain, https, httpsVariants, canary } = opened.backend;
   const listeners = [
@@ -462,7 +554,7 @@ function failIfRequested(harness: BridgeHostHarnessOptions, step: BridgeHostStep
 }
 
 interface ManagedServer {
-  server: http.Server;
+  server: net.Server;
   port: number;
   sockets: Set<Socket>;
 }
@@ -472,9 +564,10 @@ interface OpenedResources {
   static: ManagedServer | null;
   backend: WebProxyFixture | null;
   ws: ManagedServer | null;
+  tcp: ManagedServer | null;
 }
 
-async function listen(server: http.Server): Promise<ManagedServer> {
+async function listen(server: net.Server): Promise<ManagedServer> {
   const sockets = new Set<Socket>();
   server.on("connection", (socket: Socket) => {
     sockets.add(socket);
@@ -692,14 +785,13 @@ function refuse(socket: Duplex, status: RefusalStatus): void {
   socket.destroy();
 }
 
-function attachConnection(ws: WebSocket, runtime: BridgeRuntime): BridgeConnection {
+function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): BridgeConnection {
   let state: ConnectionState = "upgraded";
   let session: NetworkFetchSession | null = null;
   let hostClosing = false;
   let holdsUnauthenticatedSlot = true;
   const delivered = new Map<number, number>();
   const credited = new Map<number, number>();
-  const socketClosed = new Promise<void>((resolve) => ws.once("close", () => resolve()));
   let helloTimer: ReturnType<typeof setTimeout> | null = setTimeout(
     () => terminate(1008),
     runtime.helloTimeoutMs,
@@ -731,19 +823,26 @@ function attachConnection(ws: WebSocket, runtime: BridgeRuntime): BridgeConnecti
       state = "closed";
       forgetAllRequests();
       write({ type: "closed", reason });
-      ws.close(hostClosing ? 1001 : 1000);
+      transport.close(hostClosing ? 1001 : 1000);
     },
   };
 
-  ws.on("message", (data, isBinary) => onMessage(data, isBinary));
-  ws.on("error", () => undefined);
-  ws.once("close", () => {
-    clearHelloTimer();
-    releaseUnauthenticatedSlot();
-    state = "closed";
-    forgetAllRequests();
-    session?.close();
-    runtime.forget(connection);
+  transport.start({
+    text: onText,
+    binary: () => terminate(1003),
+    malformed: () => terminate(1008),
+    truncated: () => {
+      runtime.counters.truncatedFrames += 1;
+      terminate(1008);
+    },
+    close: () => {
+      clearHelloTimer();
+      releaseUnauthenticatedSlot();
+      state = "closed";
+      forgetAllRequests();
+      session?.close();
+      runtime.forget(connection);
+    },
   });
 
   function clearHelloTimer(): void {
@@ -776,7 +875,7 @@ function attachConnection(ws: WebSocket, runtime: BridgeRuntime): BridgeConnecti
     clearHelloTimer();
     releaseUnauthenticatedSlot();
     forgetAllRequests();
-    ws.close(code);
+    transport.close(code);
     session?.close();
   }
 
@@ -786,23 +885,19 @@ function attachConnection(ws: WebSocket, runtime: BridgeRuntime): BridgeConnecti
   }
 
   function write(frame: BridgeOutboundFrame): boolean {
-    if (ws.readyState !== WebSocket.OPEN) return false;
+    if (!transport.isOpen()) return false;
     const payload = JSON.stringify(frame);
-    if (ws.bufferedAmount + Buffer.byteLength(payload) > runtime.maxOutboundBytes) {
+    if (transport.bufferedBytes() + transport.outboundBytes(payload) > runtime.maxOutboundBytes) {
       terminate(1013);
       return false;
     }
-    ws.send(payload);
+    transport.send(payload);
     return true;
   }
 
-  function onMessage(data: WebSocket.RawData, isBinary: boolean): void {
+  function onText(text: string): void {
     if (state === "closed") return;
-    if (isBinary) {
-      terminate(1003);
-      return;
-    }
-    const frame = parseFrame(rawText(data), session?.limits ?? runtime.limits);
+    const frame = parseFrame(text, session?.limits ?? runtime.limits);
     if (frame === null) {
       terminate(1008);
       return;
@@ -883,7 +978,7 @@ function attachConnection(ws: WebSocket, runtime: BridgeRuntime): BridgeConnecti
         scope,
         ttlMs,
         limits,
-        isAuthorized: () => state !== "closed" && ws.readyState === WebSocket.OPEN,
+        isAuthorized: () => state !== "closed" && transport.isOpen(),
         protectedLocalPorts: () => runtime.protectedPorts,
         lookup: runtime.lookup,
         tlsCa: runtime.tlsCa,
@@ -966,7 +1061,7 @@ function attachConnection(ws: WebSocket, runtime: BridgeRuntime): BridgeConnecti
       return;
     }
     state = "closed";
-    ws.close(1000);
+    transport.close(1000);
   }
 
   function listEvents(kind: FixtureEventKind | null, after: number): void {
@@ -1012,17 +1107,110 @@ function attachConnection(ws: WebSocket, runtime: BridgeRuntime): BridgeConnecti
     if (state !== "closed") {
       state = "closed";
       clearHelloTimer();
-      ws.close(1001);
+      transport.close(1001);
     }
-    await withTimeout(socketClosed, BRIDGE_RELEASE_WAIT_MS);
-    if (ws.readyState !== WebSocket.CLOSED) {
-      ws.terminate();
-      await socketClosed;
+    await withTimeout(transport.closed, BRIDGE_RELEASE_WAIT_MS);
+    if (!transport.isClosed()) {
+      transport.destroy();
+      await transport.closed;
     }
   }
 
   const connection: BridgeConnection = { shutdown };
   return connection;
+}
+
+function webSocketTransport(ws: WebSocket): BridgeTransport {
+  const closed = new Promise<void>((resolve) => ws.once("close", () => resolve()));
+  return {
+    kind: "ws",
+    start: (events) => {
+      ws.on("message", (data, isBinary) => {
+        if (isBinary) events.binary();
+        else events.text(rawText(data));
+      });
+      ws.on("error", () => undefined);
+      ws.once("close", () => events.close());
+    },
+    isOpen: () => ws.readyState === WebSocket.OPEN,
+    isClosed: () => ws.readyState === WebSocket.CLOSED,
+    bufferedBytes: () => ws.bufferedAmount,
+    outboundBytes: (payload) => Buffer.byteLength(payload),
+    send: (payload) => ws.send(payload),
+    close: (code) => ws.close(code),
+    destroy: () => ws.terminate(),
+    closed,
+  };
+}
+
+/**
+ * The tunnel delivers plain TCP at its destination, so frames travel with the u32 prefix of
+ * `length-prefixed.ts`. TCP carries no close code: a graceful end sends FIN after the last frame and
+ * a violation drops the socket, which the peer can only tell apart by the missing `closed` frame.
+ */
+function tcpTransport(socket: Socket): BridgeTransport {
+  let finished = false;
+  const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+  function finish(): void {
+    finished = true;
+  }
+  return {
+    kind: "tcp",
+    start: (events) => {
+      const reader = new LengthPrefixedReader({
+        maxFrameBytes: BRIDGE_MAX_PAYLOAD_BYTES,
+        // A frame that closed the connection must silence the rest of its chunk.
+        onFrame: (text) => {
+          if (!finished) events.text(text);
+        },
+      });
+      socket.on("data", (chunk: Buffer) => {
+        if (finished) return;
+        try {
+          reader.push(chunk);
+        } catch (error) {
+          if (!(error instanceof LengthPrefixedError)) throw error;
+          events.malformed();
+        }
+      });
+      socket.on("end", () => {
+        if (finished || reader.buffered === 0) return;
+        events.truncated();
+      });
+      socket.on("error", () => undefined);
+      socket.once("close", () => {
+        finished = true;
+        events.close();
+      });
+    },
+    isOpen: () => !finished && socket.writable,
+    isClosed: () => socket.closed,
+    bufferedBytes: () => socket.writableLength,
+    outboundBytes: (payload) => LENGTH_PREFIX_BYTES + Buffer.byteLength(payload),
+    // Every outbound frame stays under the frame ceiling by the session limits (§5.4 of the contract).
+    send: (payload) => {
+      socket.write(encodeLengthPrefixed(payload, BRIDGE_MAX_PAYLOAD_BYTES));
+    },
+    close: (code) => {
+      finish();
+      if (code === 1000 || code === 1001) {
+        socket.end();
+        return;
+      }
+      if (code === 1013) {
+        // The queue is what overflowed; there is nothing worth flushing to a peer that stalled.
+        socket.destroy();
+        return;
+      }
+      // Let a `protocol_error` already queued reach the peer, then stop reading from it.
+      socket.end(() => socket.destroy());
+    },
+    destroy: () => {
+      finish();
+      socket.destroy();
+    },
+    closed,
+  };
 }
 
 /** Resolves when `promise` settles either way, or after `ms`; never rejects. */
