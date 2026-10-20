@@ -53,4 +53,4 @@ The proxy hands the tunnel a `{host, port}` and nothing else. A hostname is neve
 - A genuine `503` or `-100` from a site also triggers one reload of the host's tabs per provider registration.
 - Popups inherit the partition of the tab that opened them.
 - WebAuthn and passkeys run on the client, not the host. Only the network is routed; the renderer and its platform authenticator stay on the desktop. A site that demands a passkey or any hardware-bound factor registered on the host's machine cannot complete the challenge in a routed tab, and a risk engine may reject the unfamiliar device. The host's own browser still signs in. Register a roaming authenticator (a security key) or a passkey on the desktop to sign in there.
-- Mobile, plain-browser web, and port forwarding outside the native browser are out of scope.
+- Mobile and plain-browser web cannot set a browser proxy; they use the [remote browser](remote-browser.md). Port forwarding outside the native browser is out of scope.

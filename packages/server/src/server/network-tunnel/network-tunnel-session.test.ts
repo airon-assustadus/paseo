@@ -16,8 +16,8 @@ import {
   NetworkTunnelSession,
   TunnelProtocolError,
   type NetworkTunnelSessionOptions,
-  type TunnelLookup,
 } from "./network-tunnel-session.js";
+import type { TunnelLookup } from "./dial-target.js";
 import { TunnelTargetError } from "./target-policy.js";
 
 const LIMITS = {
