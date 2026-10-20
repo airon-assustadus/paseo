@@ -6,14 +6,15 @@ import type { BridgeHeaders, BridgeMethod } from "../bridge-messages";
 
 export const BRIDGE_SUBPROTOCOL = "paseo-web-proxy-bridge.v1";
 
+// Sizes are UTF-8 bytes, as the host's maxPayload counts them. Inbound limits are checked
+// before any JSON parsing.
 export const BRIDGE_CHANNEL_LIMITS = {
-  // Inbound: checked before any JSON parsing. The host's frames are ASCII JSON.
-  maxFrameChars: 65_536,
-  // Outbound: the host's maxPayload counts bytes.
   maxFrameBytes: 65_536,
-  maxReadyChars: 16_384,
-  maxBufferedBytes: 1_048_576,
+  maxReadyBytes: 16_384,
+  maxEventsResultBytes: 32_768,
   maxEventsPerPage: 128,
+  maxBufferedBytes: 1_048_576,
+  maxServerNames: 16,
 } as const;
 
 // Client close codes: a browser WebSocket only accepts 1000 and 3000–4999.
@@ -57,23 +58,27 @@ export interface NetworkFetchChannelHandlers {
 }
 
 export interface NetworkFetchChannel {
-  // Never throws; a no-op once the channel is closed or lost.
+  // Never throws because of the socket: a closed, lost, still-connecting or full socket ends
+  // the channel or makes the call a no-op. A frame that cannot be encoded is a bug and throws.
   send(frame: BridgeOutboundFrame): void;
   listen(handlers: NetworkFetchChannelHandlers): void;
   close(): void;
 }
 
+// bridge-backend-plan.md §1, frozen as D-CH-3. The CA is the run's synthetic test authority;
+// a PEM that is not exactly one certificate (a private key, for one) is refused.
 export interface BridgeFixtureInfo {
-  httpOrigin: string;
-  // The rest of harness.ready's fixture description, as received.
-  listeners: Readonly<Record<string, unknown>>;
+  http: { origin: string };
+  https: { origin: string; caPem: string; serverNames: string[] } | null;
+  httpsVariants: { wrongHost: string; expired: string; selfSigned: string } | null;
+  canary: { origin: string } | null;
 }
 
 export interface FixtureEventsPage {
   events: unknown[];
   next: number;
   more: boolean;
-  dropped: number | null;
+  dropped: number;
 }
 
 export interface HarnessStats {
@@ -208,13 +213,71 @@ export function decodeBase64(data: string, maxBytes: number): Uint8Array | null 
   return encodeBase64(bytes) === data ? bytes : null;
 }
 
+const CERTIFICATE_PEM =
+  /^-----BEGIN CERTIFICATE-----\n(?:[A-Za-z0-9+/=]{1,64}\n)+-----END CERTIFICATE-----\n?$/;
+const SERVER_NAME = /^[A-Za-z0-9.:-]{1,253}$/;
+
+// An exact origin with the expected scheme: no path, no trailing slash, nothing to normalize.
+function readOrigin(value: unknown, protocol: "http:" | "https:"): string | null {
+  if (typeof value !== "string" || !URL.canParse(value)) return null;
+  const url = new URL(value);
+  return url.protocol === protocol && url.origin === value ? value : null;
+}
+
+function readListener(value: unknown, protocol: "http:" | "https:"): { origin: string } | null {
+  if (!isRecord(value) || !hasKeys(value, ["origin"])) return null;
+  const origin = readOrigin(value.origin, protocol);
+  return origin === null ? null : { origin };
+}
+
+function readServerNames(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  if (value.length > BRIDGE_CHANNEL_LIMITS.maxServerNames) return null;
+  const names: string[] = [];
+  for (const name of value) {
+    if (typeof name !== "string" || !SERVER_NAME.test(name)) return null;
+    names.push(name);
+  }
+  return names;
+}
+
+function readTlsListener(value: unknown): BridgeFixtureInfo["https"] {
+  if (!isRecord(value) || !hasKeys(value, ["origin", "caPem", "serverNames"])) return null;
+  const origin = readOrigin(value.origin, "https:");
+  const serverNames = readServerNames(value.serverNames);
+  const { caPem } = value;
+  if (origin === null || serverNames === null) return null;
+  if (typeof caPem !== "string" || !CERTIFICATE_PEM.test(caPem)) return null;
+  return { origin, caPem, serverNames };
+}
+
+function readVariants(value: unknown): BridgeFixtureInfo["httpsVariants"] {
+  if (!isRecord(value) || !hasKeys(value, ["wrongHost", "expired", "selfSigned"])) return null;
+  const wrongHost = readOrigin(value.wrongHost, "https:");
+  const expired = readOrigin(value.expired, "https:");
+  const selfSigned = readOrigin(value.selfSigned, "https:");
+  if (wrongHost === null || expired === null || selfSigned === null) return null;
+  return { wrongHost, expired, selfSigned };
+}
+
+// null where the fixture said null; undefined where the value was malformed.
+function readNullable<T>(value: unknown, read: (input: unknown) => T | null): T | null | undefined {
+  if (value === null) return null;
+  return read(value) ?? undefined;
+}
+
 function readFixture(frame: Record<string, unknown>): BridgeFixtureInfo | null {
   if (!hasKeys(frame, ["type", "fixture"]) || !isRecord(frame.fixture)) return null;
-  const { http } = frame.fixture;
-  if (!isRecord(http) || typeof http.origin !== "string" || !URL.canParse(http.origin)) {
+  const { fixture } = frame;
+  if (!hasKeys(fixture, ["http", "https", "httpsVariants", "canary"])) return null;
+  const http = readListener(fixture.http, "http:");
+  const https = readNullable(fixture.https, readTlsListener);
+  const httpsVariants = readNullable(fixture.httpsVariants, readVariants);
+  const canary = readNullable(fixture.canary, (value) => readListener(value, "http:"));
+  if (http === null || https === undefined || httpsVariants === undefined || canary === undefined) {
     return null;
   }
-  return { httpOrigin: http.origin, listeners: frame.fixture };
+  return { http, https, httpsVariants, canary };
 }
 
 function encodeFrame(frame: BridgeOutboundFrame): string {
@@ -298,8 +361,10 @@ export function openBridgeChannel(options: OpenBridgeChannelOptions): Promise<Br
     try {
       socket.send(payload);
     } catch (error) {
-      // The socket started closing under us; its close event may not have arrived yet.
-      if (!(error instanceof DOMException)) throw error;
+      // The one failure a socket reports by throwing (InvalidStateError: not open). Anything
+      // else is a bug and must surface.
+      const isSocketState = error instanceof DOMException && error.name === "InvalidStateError";
+      if (!isSocketState) throw error;
       fail("closed", CLOSE_NORMAL);
     }
   }
@@ -365,9 +430,18 @@ export function openBridgeChannel(options: OpenBridgeChannelOptions): Promise<Br
       return;
     }
     const limit =
-      state === "ready" ? BRIDGE_CHANNEL_LIMITS.maxFrameChars : BRIDGE_CHANNEL_LIMITS.maxReadyChars;
-    const frame = data.length > limit ? null : parseFrame(data);
+      state === "ready" ? BRIDGE_CHANNEL_LIMITS.maxFrameBytes : BRIDGE_CHANNEL_LIMITS.maxReadyBytes;
+    // A string never has more characters than UTF-8 bytes: the cheap test goes first.
+    const bytes = data.length > limit ? limit + 1 : encoder.encode(data).byteLength;
+    const frame = bytes > limit ? null : parseFrame(data);
     if (frame === null) {
+      fail("violation");
+      return;
+    }
+    if (
+      frame.type === "fixture.events.result" &&
+      bytes > BRIDGE_CHANNEL_LIMITS.maxEventsResultBytes
+    ) {
       fail("violation");
       return;
     }
@@ -407,15 +481,15 @@ export function openBridgeChannel(options: OpenBridgeChannelOptions): Promise<Br
       async events(input) {
         const frame = await query("fixture.events.result", { type: "fixture.events", ...input });
         const { events, next, more, dropped } = frame;
-        // `dropped` comes from the host plan (D-HOST-7); the contract table does not list it.
-        const keys = ["type", "events", "next", "more"];
-        if (!hasKeys(frame, "dropped" in frame ? [...keys, "dropped"] : keys)) return invalid();
+        if (!hasKeys(frame, ["type", "events", "next", "more", "dropped"])) return invalid();
         if (!Array.isArray(events) || events.length > BRIDGE_CHANNEL_LIMITS.maxEventsPerPage) {
           return invalid();
         }
-        if (!isCount(next) || typeof more !== "boolean") return invalid();
-        if (dropped === undefined) return { events, next, more, dropped: null };
-        if (!isCount(dropped)) return invalid();
+        if (!isCount(next) || !isCount(dropped) || typeof more !== "boolean") return invalid();
+        // Absolute cursor (D-HOST-7): the page starts at max(after, dropped) and next points just
+        // past the last event it returned, so it never moves back.
+        const start = Math.max(input.after ?? 0, dropped);
+        if (next < start + events.length) return invalid();
         return { events, next, more, dropped };
       },
       async stats(requestId) {

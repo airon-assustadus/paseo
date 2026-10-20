@@ -13,10 +13,74 @@ import {
 
 const TOKEN = "SyntheticBridgeTokenForUnitTestsOnly0123456";
 const URL_WITHOUT_TOKEN = "ws://127.0.0.1:4100/bridge";
-const READY = {
-  type: "harness.ready",
-  fixture: { http: { origin: "http://127.0.0.1:4200" }, https: null, canary: null },
+// Synthetic test CA shape only; no real certificate or key.
+const CA_PEM =
+  "-----BEGIN CERTIFICATE-----\nTUlJQnN6Q0NBVm1nQXdJQkFnSVU=\n-----END CERTIFICATE-----\n";
+const FIXTURE = {
+  http: { origin: "http://127.0.0.1:4200" },
+  https: {
+    origin: "https://127.0.0.1:4201",
+    caPem: CA_PEM,
+    serverNames: ["localhost", "127.0.0.1", "::1"],
+  },
+  httpsVariants: {
+    wrongHost: "https://127.0.0.1:4202",
+    expired: "https://127.0.0.1:4203",
+    selfSigned: "https://127.0.0.1:4204",
+  },
+  canary: { origin: "http://127.0.0.1:4205" },
 };
+const READY = { type: "harness.ready", fixture: FIXTURE };
+
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
+}
+
+// A JSON payload of exactly `target` UTF-8 bytes whose padding is mostly two-byte characters,
+// so it has far fewer characters than bytes.
+function multibytePayload(target: number, build: (pad: string) => object): string {
+  const remaining = target - utf8Bytes(JSON.stringify(build("")));
+  const pad = "é".repeat(Math.floor(remaining / 2)) + "a".repeat(remaining % 2);
+  const payload = JSON.stringify(build(pad));
+  expect(utf8Bytes(payload)).toBe(target);
+  expect(payload.length).toBeLessThan(target);
+  return payload;
+}
+
+function pemOfLength(length: number): string {
+  const lines: string[] = [];
+  for (let offset = 0; offset < length; offset += 64) {
+    lines.push("A".repeat(Math.min(64, length - offset)));
+  }
+  return `-----BEGIN CERTIFICATE-----\n${lines.join("\n")}\n-----END CERTIFICATE-----\n`;
+}
+
+// A valid harness.ready of exactly `target` bytes: the PEM body grows by 66 bytes per full line
+// (64 characters and an escaped newline); one extra server name covers the 2-byte gap.
+function readyOfBytes(target: number): string {
+  const build = (pemLength: number, extraName: string | null) =>
+    JSON.stringify({
+      ...READY,
+      fixture: {
+        ...FIXTURE,
+        https: {
+          ...FIXTURE.https,
+          caPem: pemOfLength(pemLength),
+          serverNames:
+            extraName === null
+              ? FIXTURE.https.serverNames
+              : [...FIXTURE.https.serverNames, extraName],
+        },
+      },
+    });
+  const shortfall = target - utf8Bytes(build(1, null));
+  const fullLines = Math.floor(shortfall / 66);
+  const rest = shortfall - fullLines * 66;
+  const payload =
+    rest <= 63 ? build(1 + fullLines * 64 + rest, null) : build(1 + fullLines * 64 + rest - 4, "a");
+  expect(utf8Bytes(payload)).toBe(target);
+  return payload;
+}
 
 interface FakeSocket {
   socket: BridgeSocket;
@@ -25,7 +89,7 @@ interface FakeSocket {
   urls: string[];
   driver(): BridgeSocketHandlers;
   buffered: { bytes: number };
-  failSends: { enabled: boolean };
+  failSends: { error: Error | null };
 }
 
 function createFakeSocket(protocol: string = BRIDGE_SUBPROTOCOL): FakeSocket {
@@ -33,7 +97,7 @@ function createFakeSocket(protocol: string = BRIDGE_SUBPROTOCOL): FakeSocket {
   const closes: number[] = [];
   const urls: string[] = [];
   const buffered = { bytes: 0 };
-  const failSends = { enabled: false };
+  const failSends: { error: Error | null } = { error: null };
   let handlers: BridgeSocketHandlers | null = null;
   return {
     sent,
@@ -49,7 +113,7 @@ function createFakeSocket(protocol: string = BRIDGE_SUBPROTOCOL): FakeSocket {
       protocol: () => protocol,
       bufferedAmount: () => buffered.bytes,
       send(data) {
-        if (failSends.enabled) throw new DOMException("closing", "InvalidStateError");
+        if (failSends.error !== null) throw failSends.error;
         sent.push(data);
       },
       close(code) {
@@ -120,10 +184,7 @@ describe("opening", () => {
     const connection = await pending;
 
     expect(fake.urls).toEqual([URL_WITHOUT_TOKEN]);
-    expect(connection.harness.fixture).toEqual({
-      httpOrigin: "http://127.0.0.1:4200",
-      listeners: READY.fixture,
-    });
+    expect(connection.harness.fixture).toEqual(FIXTURE);
     expect(JSON.stringify(connection)).not.toContain(TOKEN);
   });
 
@@ -136,10 +197,81 @@ describe("opening", () => {
     expect(fake.closes).toEqual([4008]);
   });
 
+  it("accepts listeners the fixture reports as null", async () => {
+    const fake = createFakeSocket();
+    const pending = start(fake);
+    fake.driver().open();
+    const fixture = { ...FIXTURE, https: null, httpsVariants: null, canary: null };
+    fake.driver().message(JSON.stringify({ type: "harness.ready", fixture }));
+    expect((await pending).harness.fixture).toEqual(fixture);
+  });
+
+  const privateKey = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
   it.each([
     ["a domain frame", { type: "session.opened", limits: {} }],
-    ["a ready without an http origin", { type: "harness.ready", fixture: { http: {} } }],
     ["a ready with extra fields", { ...READY, token: TOKEN }],
+    ["a missing listener", { type: "harness.ready", fixture: { ...FIXTURE, canary: undefined } }],
+    ["an extra listener", { type: "harness.ready", fixture: { ...FIXTURE, extra: null } }],
+    ["a null http listener", { type: "harness.ready", fixture: { ...FIXTURE, http: null } }],
+    [
+      "an http listener on https",
+      {
+        type: "harness.ready",
+        fixture: { ...FIXTURE, http: { origin: "https://127.0.0.1:4200" } },
+      },
+    ],
+    [
+      "a non-canonical origin",
+      {
+        type: "harness.ready",
+        fixture: { ...FIXTURE, http: { origin: "http://127.0.0.1:4200/" } },
+      },
+    ],
+    [
+      "an origin with a path",
+      {
+        type: "harness.ready",
+        fixture: { ...FIXTURE, canary: { origin: "http://127.0.0.1:1/x" } },
+      },
+    ],
+    [
+      "a variant on http",
+      {
+        type: "harness.ready",
+        fixture: {
+          ...FIXTURE,
+          httpsVariants: { ...FIXTURE.httpsVariants, expired: "http://127.0.0.1:4203" },
+        },
+      },
+    ],
+    [
+      "a private key instead of the CA",
+      {
+        type: "harness.ready",
+        fixture: { ...FIXTURE, https: { ...FIXTURE.https, caPem: privateKey } },
+      },
+    ],
+    [
+      "a key after the CA certificate",
+      {
+        type: "harness.ready",
+        fixture: { ...FIXTURE, https: { ...FIXTURE.https, caPem: CA_PEM + privateKey } },
+      },
+    ],
+    [
+      "no server names",
+      {
+        type: "harness.ready",
+        fixture: { ...FIXTURE, https: { ...FIXTURE.https, serverNames: [] } },
+      },
+    ],
+    [
+      "a server name with a path",
+      {
+        type: "harness.ready",
+        fixture: { ...FIXTURE, https: { ...FIXTURE.https, serverNames: ["localhost/x"] } },
+      },
+    ],
   ])("fails the open on %s before harness.ready", async (_label, frame) => {
     const fake = createFakeSocket();
     const pending = start(fake);
@@ -149,16 +281,22 @@ describe("opening", () => {
     expect(fake.closes).toEqual([4008]);
   });
 
-  it("fails the open on a ready above its size limit", async () => {
-    const fake = createFakeSocket();
-    const pending = start(fake);
-    fake.driver().open();
-    const padded = {
-      ...READY,
-      fixture: { ...READY.fixture, note: "x".repeat(BRIDGE_CHANNEL_LIMITS.maxReadyChars) },
-    };
-    fake.driver().message(JSON.stringify(padded));
-    await expect(pending).rejects.toEqual(new BridgeChannelError("violation"));
+  it("accepts a ready of exactly its byte limit and refuses one byte more", async () => {
+    const exact = createFakeSocket();
+    const accepted = start(exact);
+    exact.driver().open();
+    exact.driver().message(readyOfBytes(BRIDGE_CHANNEL_LIMITS.maxReadyBytes));
+    expect((await accepted).harness.fixture.http).toEqual(FIXTURE.http);
+
+    const over = createFakeSocket();
+    const refused = start(over);
+    over.driver().open();
+    over
+      .driver()
+      .message(
+        multibytePayload(BRIDGE_CHANNEL_LIMITS.maxReadyBytes + 1, (pad) => ({ ...READY, pad })),
+      );
+    await expect(refused).rejects.toEqual(new BridgeChannelError("violation"));
   });
 
   it("fails the open when the host never answers or the socket closes", async () => {
@@ -230,19 +368,45 @@ describe("outbound frames", () => {
     expect(listening.fake.closes).toEqual([4013]);
   });
 
-  it("never throws from send, before or after the channel ends", async () => {
+  it("turns a socket that is not open into a loss and stays silent afterwards", async () => {
     const listening = await connect();
-    listening.fake.failSends.enabled = true;
+    listening.fake.failSends.error = new DOMException("not open", "InvalidStateError");
     listening.connection.channel.send({ type: "cancel", requestId: 1 });
     expect(listening.lost.count).toBe(1);
     expect(listening.fake.closes).toEqual([1000]);
-    listening.fake.failSends.enabled = false;
+    listening.fake.failSends.error = null;
     listening.connection.channel.send({ type: "cancel", requestId: 2 });
     expect(listening.fake.sent).toHaveLength(1);
+  });
+
+  it.each([
+    ["a TypeError", new TypeError("bug")],
+    ["another DOMException", new DOMException("bad", "SyntaxError")],
+  ])("lets %s from the socket surface instead of hiding it", async (_label, error) => {
+    const listening = await connect();
+    listening.fake.failSends.error = error;
+    expect(() => listening.connection.channel.send({ type: "cancel", requestId: 1 })).toThrow(
+      error,
+    );
+    expect(listening.lost.count).toBe(0);
   });
 });
 
 describe("inbound frames", () => {
+  it("accepts a frame of exactly the byte limit and refuses one byte more", async () => {
+    const build = (pad: string) => ({ type: "end", requestId: 1, pad });
+    const exact = await connect();
+    exact.fake.driver().message(multibytePayload(BRIDGE_CHANNEL_LIMITS.maxFrameBytes, build));
+    expect(exact.frames).toHaveLength(1);
+    expect(exact.lost.count).toBe(0);
+
+    const over = await connect();
+    over.fake.driver().message(multibytePayload(BRIDGE_CHANNEL_LIMITS.maxFrameBytes + 1, build));
+    expect(over.frames).toEqual([]);
+    expect(over.lost.count).toBe(1);
+    expect(over.fake.closes).toEqual([4008]);
+  });
+
   it("hands domain frames to the adapter, with body data decoded", async () => {
     const listening = await connect();
     openSession(listening, 4);
@@ -326,6 +490,74 @@ describe("harness queries", () => {
     });
     expect(await stats).toEqual({ requestId: 3, delivered: 65_536, credited: 0, active: 1 });
     expect(listening.frames).toEqual([]);
+  });
+
+  it("accepts an events page of exactly 32 KiB and refuses one byte more", async () => {
+    const build = (pad: string) => ({
+      type: "fixture.events.result",
+      events: [{ kind: "request", note: pad }],
+      next: 1,
+      more: false,
+      dropped: 0,
+    });
+    const exact = await connect();
+    const accepted = exact.connection.harness.events({});
+    exact.fake
+      .driver()
+      .message(multibytePayload(BRIDGE_CHANNEL_LIMITS.maxEventsResultBytes, build));
+    expect((await accepted).events).toHaveLength(1);
+
+    const over = await connect();
+    const refused = over.connection.harness.events({});
+    over.fake
+      .driver()
+      .message(multibytePayload(BRIDGE_CHANNEL_LIMITS.maxEventsResultBytes + 1, build));
+    await expect(refused).rejects.toEqual(new BridgeChannelError("violation"));
+    expect(over.lost.count).toBe(1);
+  });
+
+  it("follows the absolute cursor and refuses pages that break it", async () => {
+    const listening = await connect();
+    const { harness } = listening.connection;
+    // after 10, but 12 events were already dropped: the page starts at 12.
+    const page = harness.events({ after: 10 });
+    receive(listening, {
+      type: "fixture.events.result",
+      events: [{ kind: "request" }],
+      next: 13,
+      more: true,
+      dropped: 12,
+    });
+    expect(await page).toEqual({
+      events: [{ kind: "request" }],
+      next: 13,
+      more: true,
+      dropped: 12,
+    });
+
+    const backwards = harness.events({ after: 13 });
+    receive(listening, {
+      type: "fixture.events.result",
+      events: [{ kind: "request" }],
+      next: 13,
+      more: false,
+      dropped: 12,
+    });
+    await expect(backwards).rejects.toEqual(new BridgeChannelError("violation"));
+  });
+
+  it.each([
+    ["without dropped", { events: [], next: 0, more: false }],
+    ["with a negative dropped", { events: [], next: 0, more: false, dropped: -1 }],
+    [
+      "with too many events",
+      { events: Array.from({ length: 129 }, () => ({})), next: 129, more: true, dropped: 0 },
+    ],
+  ])("refuses an events page %s", async (_label, result) => {
+    const listening = await connect();
+    const page = listening.connection.harness.events({});
+    receive(listening, { type: "fixture.events.result", ...result });
+    await expect(page).rejects.toEqual(new BridgeChannelError("violation"));
   });
 
   it("allows one pending query of each kind and rejects a malformed answer", async () => {
