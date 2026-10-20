@@ -19,6 +19,7 @@ export interface FixtureLimits {
   rangeBytes: number;
   maxPostTokens: number;
   maxIssuedCookies: number;
+  maxHeldPosts: number;
   maxEvents: number;
 }
 
@@ -32,6 +33,7 @@ export const DEFAULT_FIXTURE_LIMITS: FixtureLimits = {
   rangeBytes: 1024 * 1024,
   maxPostTokens: 1000,
   maxIssuedCookies: 1000,
+  maxHeldPosts: 64,
   maxEvents: 10_000,
 };
 
@@ -42,6 +44,36 @@ export interface FixtureState {
   readonly allowedOrigins: Set<string>;
   readonly issuedCookieValues: Set<string>;
   readonly postCounts: Map<string, number>;
+  /** POST responses retained behind the `hold=1` barrier until `releaseHeldPosts`. */
+  readonly heldPosts: HeldPost[];
+}
+
+export interface HeldPost {
+  token: string;
+  nonce: string;
+  listener: FixtureListenerName;
+  count: number;
+  res: ServerResponse;
+  released: boolean;
+}
+
+/** Answers every held POST for `token`; returns how many were released, delivered or not. */
+export function releaseHeldPosts(state: FixtureState, token: string): number {
+  const matching = state.heldPosts.filter((held) => held.token === token);
+  for (const held of matching) {
+    state.heldPosts.splice(state.heldPosts.indexOf(held), 1);
+    held.released = true;
+    const delivered = !held.res.destroyed && !held.res.writableEnded;
+    if (delivered) sendJson(held.res, 200, { token, count: held.count, held: true });
+    state.recorder.record({
+      kind: "post.released",
+      listener: held.listener,
+      nonce: held.nonce,
+      token,
+      delivered,
+    });
+  }
+  return matching.length;
 }
 
 export interface RouteContext {
@@ -725,6 +757,18 @@ function postCounter(context: RouteContext, match: RegExpExecArray): void {
     // Reserve the slot on arrival: two slow POSTs for different tokens must not both pass the cap.
     state.postCounts.set(token, 0);
   }
+  const hold = context.url.searchParams.get("hold") === "1";
+  if (hold && state.heldPosts.length >= state.limits.maxHeldPosts) {
+    sendJson(res, 429, { error: "too_many_held", limit: state.limits.maxHeldPosts });
+    return;
+  }
+  state.recorder.record({
+    kind: "post.arrived",
+    listener: context.listener,
+    nonce: context.nonce,
+    token,
+    held: hold,
+  });
   req.resume();
   req.on("end", () => {
     const count = (state.postCounts.get(token) ?? 0) + 1;
@@ -736,8 +780,67 @@ function postCounter(context: RouteContext, match: RegExpExecArray): void {
       token,
       count,
     });
-    sendJson(res, 200, { token, count });
+    if (!hold) {
+      sendJson(res, 200, { token, count });
+      return;
+    }
+    holdPost(context, token, count);
   });
+}
+
+function holdPost(context: RouteContext, token: string, count: number): void {
+  const { res, state } = context;
+  const held: HeldPost = {
+    token,
+    nonce: context.nonce,
+    listener: context.listener,
+    count,
+    res,
+    released: false,
+  };
+  state.heldPosts.push(held);
+  res.on("close", () => {
+    if (held.released) return;
+    state.recorder.record({
+      kind: "post.abandoned",
+      listener: context.listener,
+      nonce: context.nonce,
+      token,
+    });
+  });
+}
+
+const REPEATED_HEADERS: ReadonlyArray<[string, string[]]> = [
+  ["vary", ["Accept-Encoding", "Origin"]],
+  ["link", ["</a.css>; rel=preload; as=style", "</b.js>; rel=preload; as=script"]],
+  ["cache-control", ["no-store", "private"]],
+];
+
+function setRepeatedHeaders(res: ServerResponse): void {
+  for (const [name, values] of REPEATED_HEADERS) res.setHeader(name, values);
+}
+
+/** Two `Location` lines: the parser keeps the first, so a proxy must not pick the last. */
+function duplicateLocation(context: RouteContext): void {
+  const landing = withNonce("/redirect/landing", context.nonce);
+  context.res.setHeader("location", [`${landing}&which=first`, `${landing}&which=second`]);
+  setRepeatedHeaders(context.res);
+  const payload = Buffer.from("duplicate location\n");
+  context.res.writeHead(302, {
+    "content-type": "text/plain; charset=utf-8",
+    "content-length": payload.length,
+  });
+  context.res.end(payload);
+}
+
+function repeatedHeaders(context: RouteContext): void {
+  setRepeatedHeaders(context.res);
+  const payload = Buffer.from("repeated headers\n");
+  context.res.writeHead(200, {
+    "content-type": "text/plain; charset=utf-8",
+    "content-length": payload.length,
+  });
+  context.res.end(payload);
 }
 
 const serverSentEvents = guarded((context) => {
@@ -808,5 +911,7 @@ const ROUTES: readonly Route[] = [
   { method: "GET", pattern: /^\/range$/, handle: rangeBody },
   { method: "POST", pattern: /^\/upload$/, handle: upload },
   { method: "ANY", pattern: /^\/post\/([A-Za-z0-9_-]{1,64})$/, handle: postCounter },
+  { method: "GET", pattern: /^\/headers\/duplicate$/, handle: duplicateLocation },
+  { method: "GET", pattern: /^\/headers\/repeated$/, handle: repeatedHeaders },
   { method: "GET", pattern: /^\/sse$/, handle: serverSentEvents },
 ];
