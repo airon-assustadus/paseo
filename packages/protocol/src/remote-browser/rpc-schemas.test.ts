@@ -252,6 +252,44 @@ describe("remote browser RPC schemas", () => {
     expect(SessionOutboundMessageSchema.parse(message)).toEqual(message);
   });
 
+  it("carries the focus identity and composing flag, and focus-guarded input", () => {
+    const message = {
+      type: "browser.remote.state",
+      payload: {
+        subscriptionId,
+        browserId,
+        generation: 1,
+        state: {
+          ...state,
+          focusedEditable: {
+            inputMode: "",
+            inputType: "text",
+            enterKeyHint: "",
+            focusId: 7,
+            composing: true,
+          },
+        },
+      },
+    };
+    expect(SessionOutboundMessageSchema.parse(message)).toEqual(message);
+    const guarded = {
+      type: "browser.remote.dispatch_input.request",
+      requestId: "r",
+      ...triple,
+      events: [
+        { kind: "composition", text: "ab", selectionStart: 2, selectionEnd: 2, focusId: 7 },
+        { kind: "text", text: "ab", focusId: 7 },
+      ],
+    };
+    expect(SessionInboundMessageSchema.parse(guarded)).toEqual(guarded);
+    expect(
+      SessionInboundMessageSchema.safeParse({
+        ...guarded,
+        events: [{ kind: "text", text: "a", focusId: 0 }],
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts codes this version does not know, so newer daemons stay parseable", () => {
     const message = {
       type: "browser.remote.closed",

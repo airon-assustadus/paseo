@@ -91,9 +91,12 @@ export interface RemoteBrowserAttachment {
   dispatchInput(events: RemoteBrowserInputEvent[]): Promise<void>;
   resize(viewport: RemoteBrowserViewport): Promise<RemoteBrowserViewport>;
   setVisibility(visible: boolean): Promise<void>;
-  /** Ends this attachment; the browser keeps running for `limits.detachedTimeoutMs`. */
+  /** Ends this attachment; the browser keeps running for `limits.detachedTimeoutMs`. No-op once ended. */
   detach(): Promise<void>;
-  /** Closes the browser only if no newer attachment took it over. */
+  /**
+   * Closes the browser only if no newer attachment took it over (`expectedGeneration`). Still
+   * allowed after the attachment ended, so a pane can clean up after a disconnect.
+   */
   close(): Promise<void>;
 }
 
@@ -323,7 +326,8 @@ class Attachment implements RemoteBrowserAttachment {
 
 /**
  * Routes daemon frames and events to live attachments by subscription ID. An attachment object
- * never outlives its subscription: after it ends, every method rejects and a re-attach returns a
+ * never outlives its subscription: after it ends, attachment operations reject, `detach()` is a
+ * no-op, and only the generation-guarded `close()` still reaches the daemon. A re-attach returns a
  * new object with a new subscription ID and generation.
  */
 export class RemoteBrowserRegistry {
