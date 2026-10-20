@@ -18,6 +18,7 @@ export interface FixtureLimits {
   sseMaxEvents: number;
   rangeBytes: number;
   maxPostTokens: number;
+  maxIssuedCookies: number;
   maxEvents: number;
 }
 
@@ -30,6 +31,7 @@ export const DEFAULT_FIXTURE_LIMITS: FixtureLimits = {
   sseMaxEvents: 10_000,
   rangeBytes: 1024 * 1024,
   maxPostTokens: 1000,
+  maxIssuedCookies: 1000,
   maxEvents: 10_000,
 };
 
@@ -432,6 +434,12 @@ function cookieSet(context: RouteContext): void {
   const issue = () => {
     const value = randomBytes(16).toString("hex");
     state.issuedCookieValues.add(value);
+    // Oldest first: a long-running fixture forgets stale values instead of growing without bound.
+    while (state.issuedCookieValues.size > state.limits.maxIssuedCookies) {
+      const oldest = state.issuedCookieValues.values().next().value;
+      if (oldest === undefined) break;
+      state.issuedCookieValues.delete(oldest);
+    }
     return value;
   };
   const secureFlag = secure ? "; Secure" : "";
@@ -709,9 +717,13 @@ function postCounter(context: RouteContext, match: RegExpExecArray): void {
     sendJson(res, 405, { error: "method_not_allowed" });
     return;
   }
-  if (!state.postCounts.has(token) && state.postCounts.size >= state.limits.maxPostTokens) {
-    sendJson(res, 429, { error: "too_many_tokens", limit: state.limits.maxPostTokens });
-    return;
+  if (!state.postCounts.has(token)) {
+    if (state.postCounts.size >= state.limits.maxPostTokens) {
+      sendJson(res, 429, { error: "too_many_tokens", limit: state.limits.maxPostTokens });
+      return;
+    }
+    // Reserve the slot on arrival: two slow POSTs for different tokens must not both pass the cap.
+    state.postCounts.set(token, 0);
   }
   req.resume();
   req.on("end", () => {

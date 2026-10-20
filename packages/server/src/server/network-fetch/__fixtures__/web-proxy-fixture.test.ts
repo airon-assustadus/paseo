@@ -152,6 +152,39 @@ function connectRefused(port: number): Promise<string> {
   });
 }
 
+interface SlowPost {
+  req: http.ClientRequest;
+  reply: Promise<Reply>;
+}
+
+/** Sends the first half of a POST body and leaves the request open until the caller ends it. */
+function startSlowPost(target: string): SlowPost {
+  const url = new URL(target);
+  let settle: (reply: Reply) => void = () => undefined;
+  let fail: (error: Error) => void = () => undefined;
+  const reply = new Promise<Reply>((resolve, reject) => {
+    settle = resolve;
+    fail = reject;
+  });
+  const req = http.request(
+    {
+      host: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
+      method: "POST",
+      headers: { "content-length": "8" },
+    },
+    (res) => {
+      void collect(res).then((body) =>
+        settle({ status: res.statusCode ?? 0, headers: res.headers, body }),
+      );
+    },
+  );
+  req.on("error", fail);
+  req.write("head");
+  return { req, reply };
+}
+
 function cookieHeader(setCookie: string[] | undefined): string {
   return (setCookie ?? []).map((cookie) => cookie.slice(0, cookie.indexOf(";"))).join("; ");
 }
@@ -607,7 +640,7 @@ describe("web proxy fixture", () => {
       expect(cancelEvent.bytesReceived).toBeLessThanOrEqual(64 * 1024);
     });
 
-    it("counts idempotent POSTs per token and caps the token table", async () => {
+    it("counts every POST arrival per token and caps the token table", async () => {
       for (const expected of [1, 2, 3]) {
         const reply = await requestJson<{ token: string; count: number }>(
           `${main.http.baseUrl}/post/tok-1?n=post-${expected}`,
@@ -628,6 +661,52 @@ describe("web proxy fixture", () => {
         method: "POST",
       });
       expect(capped).toMatchObject({ status: 429, json: { error: "too_many_tokens", limit: 1 } });
+    });
+
+    it("reserves the token slot on arrival so concurrent slow POSTs cannot exceed the cap", async () => {
+      const fixture = await startWebProxyFixture({ limits: { maxPostTokens: 1 } });
+      try {
+        const pending = ["race-a", "race-b"].map((token) =>
+          startSlowPost(`${fixture.http.baseUrl}/post/${token}?n=${token}`),
+        );
+        await fixture.events.waitFor("request", (e) => e.nonce === "race-a");
+        await fixture.events.waitFor("request", (e) => e.nonce === "race-b");
+        for (const post of pending) post.req.end("tail");
+        const statuses = (await Promise.all(pending.map((post) => post.reply))).map(
+          (r) => r.status,
+        );
+        expect([...statuses].sort()).toEqual([200, 429]);
+        expect(fixture.postCount("race-a") + fixture.postCount("race-b")).toBe(1);
+        expect(fixture.events.ofKind("post.count")).toHaveLength(1);
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    it("forgets the oldest issued cookie values beyond the configured cap", async () => {
+      const fixture = await startWebProxyFixture({ limits: { maxIssuedCookies: 2 } });
+      try {
+        const first = await request(`${fixture.http.baseUrl}/cookie/set`);
+        const second = await request(`${fixture.http.baseUrl}/cookie/set`);
+        const stale = await requestJson<{ recognized: string[]; unknown: string[] }>(
+          `${fixture.http.baseUrl}/cookie/read`,
+          { headers: { cookie: cookieHeader(first.headers["set-cookie"]) } },
+        );
+        expect(stale.json).toMatchObject({
+          recognized: [],
+          unknown: ["fixture_sess", "fixture_plain"],
+        });
+        const fresh = await requestJson<{ recognized: string[]; unknown: string[] }>(
+          `${fixture.http.baseUrl}/cookie/read`,
+          { headers: { cookie: cookieHeader(second.headers["set-cookie"]) } },
+        );
+        expect(fresh.json).toMatchObject({
+          recognized: ["fixture_sess", "fixture_plain"],
+          unknown: [],
+        });
+      } finally {
+        await fixture.close();
+      }
     });
 
     it("emits server-sent events with ids, resumes after Last-Event-ID, and records early close", async () => {
