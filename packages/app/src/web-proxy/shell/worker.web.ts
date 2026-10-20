@@ -7,6 +7,13 @@ import {
   type ControlMessage,
   type ResponseHeadMessage,
 } from "../bridge-messages";
+import {
+  createClientBinding,
+  type BindingRefusal,
+  type BindingRoute,
+  type ShellClients,
+  type ShellMessageInput,
+} from "./client-binding.web";
 import type { ShellFetchMessage, ShellRequestMessage } from "./relay-messages";
 
 export interface ShellWorkerConfig {
@@ -14,23 +21,27 @@ export interface ShellWorkerConfig {
   // Served by the static shell host (bootstrap, worker). Checked before mountPath.
   shellPathPrefix: string;
   bootstrapPath: string;
+  // Where a bootstrap points its app frame with a ticket; must be inside the worker's scope.
+  enterPath: string;
   // Content path prefix that maps 1:1 onto the destination's root. "/" in a deployment.
   mountPath: string;
   headTimeoutMs: number;
   idleChunkTimeoutMs: number;
   maxRequestBodyBytes: number;
+  ticketTtlMs: number;
+  formationTtlMs: number;
+  resyncTimeoutMs: number;
 }
 
-export interface ShellWindowClient {
-  url: string;
-  postMessage(message: unknown, transfer: Transferable[]): void;
+export interface ShellFetchInput {
+  request: Request;
+  clientId: string;
+  resultingClientId: string;
 }
 
-export interface ShellClients {
-  matchAll(options: {
-    type: "window";
-    includeUncontrolled: boolean;
-  }): Promise<ReadonlyArray<ShellWindowClient>>;
+export interface ShellWorker {
+  fetch(input: ShellFetchInput): ShellFetchDecision;
+  message(input: ShellMessageInput): void;
 }
 
 export type ShellFetchDecision =
@@ -39,7 +50,9 @@ export type ShellFetchDecision =
 
 export type ShellFailureCode =
   | "session_unavailable"
-  | "session_ambiguous"
+  | "client_not_admitted"
+  | "client_limit"
+  | "ticket_rejected"
   | "session_revoked"
   | "bridge_timeout"
   | "bridge_error"
@@ -300,24 +313,28 @@ function copyHeaders(headers: Headers): BridgeHeaders {
   return copied;
 }
 
+function refusalResponse(code: BindingRefusal): Response {
+  // A document outside the chain (top-level, other origin, unknown frame type) gets a network
+  // error, like a request to another origin; known-but-refused clients get an explicit page.
+  if (code === "foreign_client") return Response.error();
+  if (code === "session_unavailable") return failureResponse(503, code);
+  return failureResponse(403, code);
+}
+
 async function proxy(input: {
-  request: Request;
+  fetch: ShellFetchInput;
   url: URL;
   config: ShellWorkerConfig;
-  clients: ShellClients;
+  route: (fetch: ShellFetchInput) => Promise<BindingRoute>;
 }): Promise<Response> {
-  const { request, url, config } = input;
+  const { url, config } = input;
+  const { request } = input.fetch;
+  const route = await input.route(input.fetch);
+  if (route.kind === "refused") return refusalResponse(route.code);
   const method = request.method;
   if (!isBridgeMethod(method)) return failureResponse(405, "method_not_allowed");
   const body = await readBody(request, config.maxRequestBodyBytes);
   if (body === "too_large") return failureResponse(413, "body_too_large");
-  const windows = await input.clients.matchAll({ type: "window", includeUncontrolled: true });
-  const bootstraps = windows.filter(
-    (client) => new URL(client.url).pathname === config.bootstrapPath,
-  );
-  const bootstrap = bootstraps[0];
-  if (bootstrap === undefined) return failureResponse(503, "session_unavailable");
-  if (bootstraps.length > 1) return failureResponse(503, "session_ambiguous");
 
   const channel = new MessageChannel();
   const mode = request.mode === "navigate" ? "navigate" : "subresource";
@@ -333,7 +350,7 @@ async function proxy(input: {
   };
   const transfer: Transferable[] = body === null ? [channel.port2] : [channel.port2, body];
   const response = awaitResponse({ port: channel.port1, method, mode, config });
-  bootstrap.postMessage(message, transfer);
+  route.port.postMessage(message, transfer);
   return response;
 }
 
@@ -354,7 +371,14 @@ function isDirectoryPath(value: string): boolean {
 
 // Zero, NaN or fractional values would turn every timer into an instant failure or a hang.
 function validateShellWorkerConfig(config: ShellWorkerConfig): ShellWorkerConfig {
-  const numbers = ["headTimeoutMs", "idleChunkTimeoutMs", "maxRequestBodyBytes"] as const;
+  const numbers = [
+    "headTimeoutMs",
+    "idleChunkTimeoutMs",
+    "maxRequestBodyBytes",
+    "ticketTtlMs",
+    "formationTtlMs",
+    "resyncTimeoutMs",
+  ] as const;
   for (const field of numbers) {
     if (!isPositiveInteger(config[field])) throw new InvalidShellWorkerConfigError(field);
   }
@@ -363,6 +387,12 @@ function validateShellWorkerConfig(config: ShellWorkerConfig): ShellWorkerConfig
   }
   if (!config.bootstrapPath.startsWith(config.shellPathPrefix)) {
     throw new InvalidShellWorkerConfigError("bootstrapPath");
+  }
+  const isEnterInScope =
+    config.enterPath.startsWith(config.shellPathPrefix) ||
+    config.enterPath.startsWith(config.mountPath);
+  if (!isEnterInScope || config.enterPath === config.bootstrapPath) {
+    throw new InvalidShellWorkerConfigError("enterPath");
   }
   if (
     !URL.canParse(config.controlOrigin) ||
@@ -373,31 +403,80 @@ function validateShellWorkerConfig(config: ShellWorkerConfig): ShellWorkerConfig
   return config;
 }
 
-// Holds no state between events, so a worker the browser stopped and restarted serves the
-// next request exactly like the previous instance would.
-export function createShellFetchHandler(input: {
+// The binding registry is the only state, and it is rebuilt from the live bootstraps when the
+// browser restarts the worker; responses themselves carry nothing between events.
+export function createShellWorker(input: {
   config: ShellWorkerConfig;
   clients: ShellClients;
   origin: string;
-}): (request: Request) => ShellFetchDecision {
+  now?: () => number;
+}): ShellWorker {
   const config = validateShellWorkerConfig(input.config);
-  const { clients, origin } = input;
-  return (request) => {
-    const url = new URL(request.url);
-    // Nothing leaves the phone directly: other origins get a network error.
-    if (url.origin !== origin)
-      return { kind: "respond", response: Promise.resolve(Response.error()) };
-    if (url.pathname.startsWith(config.shellPathPrefix)) return { kind: "network" };
-    if (!url.pathname.startsWith(config.mountPath)) {
-      return { kind: "respond", response: Promise.resolve(Response.error()) };
-    }
-    return { kind: "respond", response: proxy({ request, url, config, clients }) };
+  const { origin } = input;
+  const binding = createClientBinding({
+    config: {
+      origin,
+      bootstrapPath: config.bootstrapPath,
+      shellPathPrefix: config.shellPathPrefix,
+      mountPath: config.mountPath,
+      ticketTtlMs: config.ticketTtlMs,
+      formationTtlMs: config.formationTtlMs,
+      resyncTimeoutMs: config.resyncTimeoutMs,
+    },
+    clients: input.clients,
+    now: input.now ?? Date.now,
+  });
+
+  function route(fetch: ShellFetchInput): Promise<BindingRoute> {
+    if (fetch.request.mode === "navigate") return binding.routeNavigation(fetch);
+    return binding.routeSubresource(fetch.clientId);
+  }
+
+  async function enter(fetch: ShellFetchInput, url: URL): Promise<Response> {
+    const isNestedNavigation =
+      fetch.request.mode === "navigate" && fetch.request.destination !== "document";
+    const entered =
+      isNestedNavigation && (await binding.enter({ ...fetch, ticket: url.searchParams.get("t") }));
+    if (!entered) return failureResponse(403, "ticket_rejected");
+    // Same-origin redirect: the next hop keeps resultingClientId and finds its reservation.
+    return Response.redirect(`${origin}${config.mountPath}`, 302);
+  }
+
+  function respond(response: Promise<Response>): ShellFetchDecision {
+    return { kind: "respond", response };
+  }
+
+  return {
+    message: (message) => binding.handleMessage(message),
+    fetch(fetch) {
+      const url = new URL(fetch.request.url);
+      // Nothing leaves the phone directly: other origins get a network error.
+      if (url.origin !== origin) return respond(Promise.resolve(Response.error()));
+      if (url.pathname === config.enterPath) return respond(enter(fetch, url));
+      if (url.pathname.startsWith(config.shellPathPrefix)) return { kind: "network" };
+      if (!url.pathname.startsWith(config.mountPath)) {
+        return respond(Promise.resolve(Response.error()));
+      }
+      // A top-level document under the mount point is never part of a session.
+      if (fetch.request.destination === "document") {
+        return respond(Promise.resolve(Response.error()));
+      }
+      return respond(proxy({ fetch, url, config, route }));
+    },
   };
 }
 
 interface ShellFetchEvent {
   request: Request;
+  clientId: string;
+  resultingClientId: string;
   respondWith(response: Promise<Response>): void;
+}
+
+interface ShellExtendableMessageEvent {
+  data: unknown;
+  source: { id: string } | null;
+  ports: ReadonlyArray<MessagePort>;
 }
 
 interface ShellExtendableEvent {
@@ -410,6 +489,7 @@ interface ShellWorkerScope {
   skipWaiting(): Promise<void>;
   addEventListener(type: "install", listener: (event: ShellExtendableEvent) => void): void;
   addEventListener(type: "fetch", listener: (event: ShellFetchEvent) => void): void;
+  addEventListener(type: "message", listener: (event: ShellExtendableMessageEvent) => void): void;
 }
 
 export class ShellWorkerScopeError extends Error {
@@ -431,14 +511,22 @@ function isShellWorkerScope(value: unknown): value is ShellWorkerScope {
 
 export function installShellWorker(scope: unknown, config: ShellWorkerConfig): void {
   if (!isShellWorkerScope(scope)) throw new ShellWorkerScopeError();
-  const handle = createShellFetchHandler({
+  const worker = createShellWorker({
     config,
     clients: scope.clients,
     origin: scope.location.origin,
   });
   scope.addEventListener("install", (event) => event.waitUntil(scope.skipWaiting()));
+  scope.addEventListener("message", (event) => {
+    const sourceId = event.source === null ? null : event.source.id;
+    worker.message({ data: event.data, sourceId, ports: event.ports });
+  });
   scope.addEventListener("fetch", (event) => {
-    const decision = handle(event.request);
+    const decision = worker.fetch({
+      request: event.request,
+      clientId: event.clientId,
+      resultingClientId: event.resultingClientId,
+    });
     if (decision.kind === "respond") event.respondWith(decision.response);
   });
 }

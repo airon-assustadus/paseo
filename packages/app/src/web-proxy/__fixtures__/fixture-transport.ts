@@ -78,10 +78,11 @@ const APP_JS = `(async () => {
   const button = document.getElementById("increment").getBoundingClientRect();
   report.button = { x: Math.round(button.x + button.width / 2), y: Math.round(button.y + button.height / 2) };
   let count = 0;
-  document.getElementById("increment").addEventListener("click", () => {
+  document.getElementById("increment").addEventListener("click", async () => {
     count += 1;
     document.getElementById("count").textContent = String(count);
-    testPage.postMessage({ type: "fixture.clicked", count }, "*");
+    const clicked = await fetch("api/echo?click=" + count, { method: "POST", body: "click" });
+    testPage.postMessage({ type: "fixture.clicked", count, echo: await clicked.text() }, "*");
   });
   testPage.postMessage(report, "*");
 })();`;
@@ -126,20 +127,20 @@ image.src = "pixel.png";
 document.body.append(image);
 </script></body></html>`;
 
+// A new frame created by the app has no observable initiator, so the worker refuses it; the
+// app then navigates itself (frame continuity) to a page that keeps the destination's CSP.
 const FRAMING_HTML = `<!doctype html>
 <html lang="en"><body><script>
-const own = document.createElement("iframe");
-own.src = "framed?via=self";
-document.body.append(own);
-const refused = document.createElement("iframe");
-refused.src = "refuses-embedding";
-refused.addEventListener("load", () => {
+const child = document.createElement("iframe");
+child.src = "framed?via=child";
+child.addEventListener("load", () => {
   parent.parent.postMessage({
-    type: "fixture.refused",
-    text: refused.contentDocument.body.textContent.trim(),
+    type: "fixture.child",
+    text: child.contentDocument.body.textContent.trim(),
   }, "*");
+  location.assign("framed?via=self");
 });
-document.body.append(refused);
+document.body.append(child);
 </script></body></html>`;
 
 const INDEX_HTML: Record<FixtureIndex, string> = {
@@ -236,8 +237,6 @@ export function createFixtureTransport(options: { index: FixtureIndex }): Fixtur
         return Promise.resolve(
           respond(200, [...html, ["content-security-policy", "img-src 'none'"]], FRAMED_HTML),
         );
-      case "/refuses-embedding":
-        return Promise.resolve(respond(200, [...html, ["x-frame-options", "DENY"]], "framed page"));
       case "/hang":
         hangRequested.resolve();
         return new Promise((_resolve, reject) => {

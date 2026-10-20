@@ -8,8 +8,14 @@ export const HARNESS = {
   shellPathPrefix: "/src/web-proxy/__fixtures__/shell/",
   bootstrapPath: "/src/web-proxy/__fixtures__/shell/bootstrap.html",
   mountPath: "/src/web-proxy/__fixtures__/app/",
+  // Inside the worker's scope, which is the mount point here; a deployment uses /__paseo/enter.
+  enterPath: "/src/web-proxy/__fixtures__/app/__paseo-enter",
   headTimeoutMs: 2000,
   idleChunkTimeoutMs: 2000,
+  ticketTtlMs: 5000,
+  formationTtlMs: 5000,
+  resyncTimeoutMs: 1000,
+  sessionReplyTimeoutMs: 5000,
 } as const;
 
 export type HarnessContentLabel = "wp-a" | "wp-b";
