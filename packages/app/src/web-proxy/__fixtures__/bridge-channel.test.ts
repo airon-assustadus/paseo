@@ -8,8 +8,8 @@ import {
   type BridgeConnection,
   type BridgeSocket,
   type BridgeSocketHandlers,
-  type NetworkFetchChannelHandlers,
 } from "./bridge-channel";
+import type { NetworkFetchChannelHandlers } from "../network-fetch-transport";
 
 const TOKEN = "SyntheticBridgeTokenForUnitTestsOnly0123456";
 const URL_WITHOUT_TOKEN = "ws://127.0.0.1:4100/bridge";
@@ -321,7 +321,7 @@ describe("outbound frames", () => {
       type: "session.open",
       scope: { origin: "http://127.0.0.1:4200", pathPrefix: "/" },
       ttlMs: 60_000,
-      limits: null,
+      limits: { maxConcurrentRequests: 4 },
     });
     channel.send({ type: "body", requestId: 1, data: new Uint8Array([0, 1, 255]) });
     channel.send({ type: "grantCredit", requestId: 1, bytes: 3 });
@@ -330,6 +330,7 @@ describe("outbound frames", () => {
         type: "session.open",
         scope: { origin: "http://127.0.0.1:4200", pathPrefix: "/" },
         ttlMs: 60_000,
+        limits: { maxConcurrentRequests: 4 },
       },
       { type: "body", requestId: 1, data: "AAH/" },
       { type: "grantCredit", requestId: 1, bytes: 3 },
