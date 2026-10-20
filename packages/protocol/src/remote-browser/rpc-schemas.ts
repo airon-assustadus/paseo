@@ -61,6 +61,7 @@ export const REMOTE_BROWSER_ERROR_CODES = [
   "resource_limit",
   "not_found",
   "stale_attachment",
+  "focus_changed",
   "invalid_request",
   "internal_error",
 ] as const;
@@ -153,10 +154,19 @@ export const RemoteBrowserLoadErrorSchema = z.object({
   message: z.string().max(REMOTE_BROWSER_MAX_MESSAGE_LENGTH),
 });
 
+const FocusIdSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+
 export const RemoteBrowserFocusedEditableSchema = z.object({
   inputMode: HintSchema,
   inputType: HintSchema,
   enterKeyHint: HintSchema,
+  /**
+   * Assigned by the daemon, monotonic per browser and never reused: it changes on every focus
+   * move inside the page and on every new document. No element identity leaves the page.
+   */
+  focusId: FocusIdSchema.optional(),
+  /** Between compositionstart and compositionend on the focused element. */
+  composing: z.boolean().optional(),
 });
 
 export const RemoteBrowserNoticeSchema = z.object({
@@ -232,12 +242,16 @@ export const RemoteBrowserInputEventSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("text"),
     text: z.string().min(1).max(REMOTE_BROWSER_MAX_TEXT_LENGTH),
+    /** Dispatch only while this focusedEditable.focusId is still focused; else `focus_changed`. */
+    focusId: FocusIdSchema.optional(),
   }),
   z.object({
     kind: z.literal("composition"),
     text: z.string().max(REMOTE_BROWSER_MAX_COMPOSITION_LENGTH),
     selectionStart: z.number().int().min(0).max(REMOTE_BROWSER_MAX_COMPOSITION_LENGTH),
     selectionEnd: z.number().int().min(0).max(REMOTE_BROWSER_MAX_COMPOSITION_LENGTH),
+    /** Dispatch only while this focusedEditable.focusId is still focused; else `focus_changed`. */
+    focusId: FocusIdSchema.optional(),
   }),
 ]);
 
