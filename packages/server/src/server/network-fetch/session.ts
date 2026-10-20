@@ -25,6 +25,7 @@ import {
   validateRequest,
   type ExchangeEnvironment,
   type ExchangeEvents,
+  type ExchangeRelease,
   type NetworkFetchLimits,
   type NetworkFetchRequest,
   type NetworkFetchResponseHead,
@@ -50,6 +51,9 @@ export const DEFAULT_NETWORK_FETCH_LIMITS: NetworkFetchLimits = {
 };
 
 export type NetworkFetchClosedReason = "closed" | "revoked" | "expired" | "allowlist_changed";
+
+/** See `ExchangeRelease`: `dnsPending` is the only residual a cancelled request can leave behind. */
+export type RequestRelease = ExchangeRelease;
 
 export interface NetworkFetchFailure {
   code: NetworkFetchErrorCode;
@@ -194,6 +198,8 @@ export class NetworkFetchSession {
   private state: "open" | "closed" = "open";
   private lastRequestId = 0;
   private readonly exchanges = new Map<number, FetchExchange>();
+  /** Release promises not yet resolved; entries remove themselves, so this never grows unbounded. */
+  private readonly releases = new Set<Promise<ExchangeRelease>>();
   private readonly expiresAt: number;
   private readonly expiry: ReturnType<typeof setTimeout>;
   private readonly environment: ExchangeEnvironment;
@@ -224,6 +230,11 @@ export class NetworkFetchSession {
     return this.exchanges.size;
   }
 
+  /** Requests of this generation whose sockets have not all closed yet. */
+  get pendingReleases(): number {
+    return this.releases.size;
+  }
+
   request(request: NetworkFetchRequest): void {
     this.assertOpen();
     const { requestId } = request;
@@ -243,6 +254,7 @@ export class NetworkFetchSession {
         this.eventsFor(requestId, () => exchange),
       );
       this.exchanges.set(requestId, exchange);
+      this.trackRelease(exchange);
       exchange.start();
     } catch (error) {
       if (!(error instanceof NetworkFetchError)) throw error;
@@ -262,11 +274,29 @@ export class NetworkFetchSession {
     this.exchangeFor(requestId)?.grantCredit(bytes);
   }
 
-  cancel(requestId: number): void {
+  /**
+   * Stops a request. Validation still throws synchronously; `null` is a late id. The promise resolves
+   * once the request's work stopped and every socket it held emitted `close`.
+   */
+  cancel(requestId: number): Promise<RequestRelease> | null {
     const exchange = this.exchangeFor(requestId);
-    if (!exchange) return;
+    if (!exchange) return null;
     this.exchanges.delete(requestId);
-    exchange.cancel();
+    return exchange.cancel();
+  }
+
+  /** Resolves when every request of this generation released its sockets; idempotent snapshot. */
+  released(): Promise<void> {
+    return Promise.all(this.releases).then(() => undefined);
+  }
+
+  private trackRelease(exchange: FetchExchange): void {
+    const { released } = exchange;
+    this.releases.add(released);
+    void released.then(() => {
+      this.releases.delete(released);
+      return undefined;
+    });
   }
 
   close(): void {
@@ -278,7 +308,11 @@ export class NetworkFetchSession {
     this.shutdown(reason);
   }
 
-  /** `null` for a request that already finished: its late frames are dropped, not punished. */
+  /**
+   * `null` for an id at or below the watermark that is no longer active: a late frame for a
+   * finished, cancelled, or never-opened lower id is dropped, not punished. The session keeps no
+   * record of which ids were opened; the watermark only rejects late effects.
+   */
   private exchangeFor(requestId: number): FetchExchange | null {
     this.assertOpen();
     const exchange = this.exchanges.get(requestId);

@@ -4,16 +4,23 @@ import http from "node:http";
 import net from "node:net";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
-import type { TunnelDial } from "../network-tunnel/dial-target.js";
+import https from "node:https";
+import type { TunnelDial, TunnelDialInput } from "../network-tunnel/dial-target.js";
 import type { ResolvedTunnelAddress } from "../network-tunnel/target-policy.js";
+import { createSyntheticAuthority } from "./__fixtures__/tls/synthetic-authority.js";
 import { parseTrustedTarget, type TrustedAllowlist, type TrustedTargetInput } from "./allowlist.js";
 import { NetworkFetchOpenError, NetworkFetchProtocolError } from "./errors.js";
-import type {
-  NetworkFetchLimits,
-  NetworkFetchRequest,
-  NetworkFetchResponseHead,
+import {
+  FetchExchange,
+  type ExchangeEnvironment,
+  type ExchangeEvents,
+  type NetworkFetchLimits,
+  type NetworkFetchMethod,
+  type NetworkFetchRequest,
+  type NetworkFetchResponseHead,
 } from "./exchange.js";
 import {
+  DEFAULT_NETWORK_FETCH_LIMITS,
   openNetworkFetchSession,
   type NetworkFetchClosedReason,
   type NetworkFetchFailure,
@@ -187,6 +194,7 @@ interface OpenInput {
   localAddresses?: readonly string[];
   ttlMs?: number;
   isAuthorized?: () => boolean;
+  tlsCa?: readonly string[];
 }
 
 function open(input: OpenInput) {
@@ -203,6 +211,7 @@ function open(input: OpenInput) {
     localAddresses: () => input.localAddresses ?? [],
     lookup: input.lookup,
     dial: input.dial,
+    tlsCa: input.tlsCa ?? null,
     sink: recording.sink,
   });
   recording.attach(session);
@@ -1226,5 +1235,635 @@ describe("network fetch session", () => {
     const names = (outcome.head?.headers ?? []).map(([name]) => name.toLowerCase());
     expect(names).not.toContain("content-encoding");
     expect((await recording.outcome(2)).result).toBe("unsupported_encoding");
+  });
+});
+
+/** Lookups that stay pending until the test answers them, with a barrier on how many started. */
+function gatedLookup() {
+  const answers: Array<(addresses: ResolvedTunnelAddress[]) => void> = [];
+  const waiters: Array<{ count: number; resolve: () => void }> = [];
+  let started = 0;
+  const lookup = () =>
+    new Promise<ResolvedTunnelAddress[]>((resolve) => {
+      answers.push(resolve);
+      started += 1;
+      for (const waiter of waiters.splice(0)) {
+        if (started >= waiter.count) waiter.resolve();
+        else waiters.push(waiter);
+      }
+    });
+  return {
+    lookup,
+    /** Lookups ever started, answered or not. */
+    get started(): number {
+      return started;
+    },
+    untilStarted(count: number): Promise<void> {
+      if (started >= count) return Promise.resolve();
+      return new Promise((resolve) => waiters.push({ count, resolve }));
+    },
+    answerAll(address: string): void {
+      for (const answer of answers.splice(0)) answer([{ address, family: 4 }]);
+    },
+  };
+}
+
+/** Dials that stay pending until the test connects them; optionally deaf to the abort signal. */
+function gatedDial(mode: "honours-abort" | "ignores-abort") {
+  interface Pending {
+    input: TunnelDialInput;
+    resolve: (socket: net.Socket) => void;
+    reject: (error: unknown) => void;
+  }
+  const pending: Pending[] = [];
+  const aborted: string[] = [];
+  const sockets: net.Socket[] = [];
+  /** Sockets whose `close` event fired; `socket.closed` turns true earlier than the event. */
+  const closed = new Set<net.Socket>();
+  let calls = 0;
+  const waiters: Array<{ count: number; resolve: () => void }> = [];
+  const dial: TunnelDial = (input) =>
+    new Promise((resolve, reject) => {
+      calls += 1;
+      const entry: Pending = { input, resolve, reject };
+      pending.push(entry);
+      if (mode === "honours-abort") {
+        input.signal.addEventListener(
+          "abort",
+          () => {
+            aborted.push(`${input.address.address}:${input.port}`);
+            pending.splice(pending.indexOf(entry), 1);
+            reject(new Error("dial aborted by the test port"));
+          },
+          { once: true },
+        );
+      }
+      for (const waiter of waiters.splice(0)) {
+        if (calls >= waiter.count) waiter.resolve();
+        else waiters.push(waiter);
+      }
+    });
+  return {
+    dial,
+    aborted,
+    sockets,
+    closed,
+    get calls(): number {
+      return calls;
+    },
+    untilCalled(count: number): Promise<void> {
+      if (calls >= count) return Promise.resolve();
+      return new Promise((resolve) => waiters.push({ count, resolve }));
+    },
+    /** Hands every pending dial a real connected socket, to `port` when given, else to the asked port. */
+    async connectAll(port?: number): Promise<void> {
+      for (const entry of pending.splice(0)) {
+        const socket = net.connect({
+          host: entry.input.address.address,
+          port: port ?? entry.input.port,
+        });
+        sockets.push(socket);
+        socket.once("close", () => closed.add(socket));
+        await new Promise<void>((resolve) => socket.once("connect", () => resolve()));
+        entry.resolve(socket);
+      }
+    },
+  };
+}
+
+async function listenSilent(onData: () => void): Promise<{ port: number; closed: Promise<void> }> {
+  let markClosed: () => void = () => {};
+  const closed = new Promise<void>((resolve) => {
+    markClosed = resolve;
+  });
+  const silent = net.createServer((socket) => {
+    socket.once("data", onData);
+    socket.once("close", () => markClosed());
+  });
+  await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", resolve));
+  closers.push(() => new Promise<void>((resolve) => silent.close(() => resolve())));
+  const address = silent.address();
+  if (typeof address !== "object" || address === null) throw new Error("No port");
+  return { port: address.port, closed };
+}
+
+describe("network fetch session: cancel, credit guards, and late frames", () => {
+  it("refuses credit beyond the bytes delivered and keeps the exchange usable (T-B1)", async () => {
+    const fixture = await serve((_request, response) => response.end(Buffer.alloc(4096, 0x62)));
+    const { session, recording } = open({
+      targets: [fixture.origin],
+      limits: { initialWindowBytes: 1024, maxChunkBytes: 256 },
+    });
+    recording.setAutoCredit(false);
+
+    session.request(get(1, `${fixture.origin}/`));
+    await recording.until(() => recording.deliveredBytes(1) === 1024);
+    const delivered = recording.eventsFor(1).length;
+
+    for (const bytes of [1025, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => session.grantCredit(1, bytes)).toThrow(
+        expect.objectContaining({ violation: "credit_overflow" }),
+      );
+    }
+    await expectSilenceAfter(recording, 1, delivered);
+    expect(session.activeRequests).toBe(1);
+
+    recording.setAutoCredit(true);
+    session.grantCredit(1, 1024);
+    expect(await recording.outcome(1)).toMatchObject({ result: "end", bodyBytes: 4096 });
+  });
+
+  it("cancels a request during DNS resolution without dialing, and the session goes on (T-D1)", async () => {
+    const dns = gatedLookup();
+    const dialer = gatedDial("honours-abort");
+    let hits = 0;
+    const fixture = await serve((_request, response) => {
+      hits += 1;
+      response.end("late");
+    });
+    const origin = `http://cancel-dns.test:${fixture.port}`;
+    const { session, recording } = open({
+      targets: [origin],
+      lookup: dns.lookup,
+      dial: dialer.dial,
+    });
+
+    session.request(get(1, `${origin}/`));
+    await dns.untilStarted(1);
+    session.cancel(1);
+    expect(session.activeRequests).toBe(0);
+    dns.answerAll("127.0.0.1");
+    await expectSilenceAfter(recording, 1, 0);
+    expect(dialer.calls).toBe(0);
+    expect(session.isOpen).toBe(true);
+
+    session.request(get(2, `${origin}/`));
+    await dns.untilStarted(2);
+    dns.answerAll("127.0.0.1");
+    await dialer.untilCalled(1);
+    await dialer.connectAll();
+    expect(await recording.outcome(2)).toMatchObject({ result: "end", body: "late" });
+    expect(hits).toBe(1);
+    expect(recording.eventsFor(1)).toEqual([]);
+  });
+
+  it.each([
+    ["honours-abort", 0],
+    ["ignores-abort", 1],
+  ] as const)(
+    "cancels a request while TCP is connecting when the dial port %s (T-D1)",
+    async (mode, lateConnections) => {
+      const dialer = gatedDial(mode);
+      let hits = 0;
+      const fixture = await serve((_request, response) => {
+        hits += 1;
+        response.end("late");
+      });
+      const { session, recording } = open({ targets: [fixture.origin], dial: dialer.dial });
+
+      session.request(get(1, `${fixture.origin}/`));
+      await dialer.untilCalled(1);
+      session.cancel(1);
+      expect(session.activeRequests).toBe(0);
+      if (mode === "honours-abort") expect(dialer.aborted).toEqual([`127.0.0.1:${fixture.port}`]);
+      // A port deaf to the signal still hands over a socket; the exchange must destroy it unused.
+      await dialer.connectAll();
+      await expectSilenceAfter(recording, 1, 0);
+      for (const socket of dialer.sockets) {
+        if (!socket.closed)
+          await new Promise<void>((resolve) => socket.once("close", () => resolve()));
+        expect(socket.destroyed).toBe(true);
+      }
+      expect(fixture.connections()).toBe(lateConnections);
+      expect(hits).toBe(0);
+      expect(session.isOpen).toBe(true);
+
+      session.request(get(2, `${fixture.origin}/`));
+      await dialer.untilCalled(2);
+      await dialer.connectAll();
+      expect(await recording.outcome(2)).toMatchObject({ result: "end", body: "late" });
+      expect(hits).toBe(1);
+    },
+  );
+
+  it("cancels a request during the TLS handshake and completes the next one (T-D1)", async () => {
+    const authority = createSyntheticAuthority();
+    const leaf = authority.issue({ commonName: "cancel-tls", ipAddresses: ["127.0.0.1"] });
+    const secure = https.createServer(
+      { key: leaf.privateKeyPem, cert: leaf.certificatePem },
+      (_request, response) => response.end("secure"),
+    );
+    await new Promise<void>((resolve) => secure.listen(0, "127.0.0.1", resolve));
+    closers.push(async () => {
+      secure.closeAllConnections();
+      await new Promise<void>((resolve) => secure.close(() => resolve()));
+    });
+    const securePort = (secure.address() as net.AddressInfo).port;
+    let markHello: () => void = () => {};
+    const clientHello = new Promise<void>((resolve) => {
+      markHello = resolve;
+    });
+    const silent = await listenSilent(() => markHello());
+    // First dial lands on a server that never answers the handshake; later dials reach the real one.
+    const dialer = gatedDial("honours-abort");
+    const origin = `https://127.0.0.1:${securePort}`;
+    const { session, recording } = open({
+      targets: [origin],
+      dial: dialer.dial,
+      tlsCa: [authority.certificatePem],
+    });
+
+    session.request(get(1, `${origin}/`));
+    await dialer.untilCalled(1);
+    await dialer.connectAll(silent.port);
+    await clientHello;
+    session.cancel(1);
+    await silent.closed;
+    await expectSilenceAfter(recording, 1, 0);
+    expect(session.activeRequests).toBe(0);
+    expect(session.isOpen).toBe(true);
+
+    session.request(get(2, `${origin}/`));
+    await dialer.untilCalled(2);
+    await dialer.connectAll();
+    expect(await recording.outcome(2)).toMatchObject({ result: "end", body: "secure" });
+  });
+
+  it("bounds what a request/cancel loop leaves pending to the shared DNS slots (reserva de concorrência)", async () => {
+    const dns = gatedLookup();
+    const dialer = gatedDial("honours-abort");
+    const fixture = await serve((_request, response) => response.end("late"));
+    const origin = `http://pending-loop.test:${fixture.port}`;
+    const { session, recording } = open({
+      targets: [origin],
+      lookup: dns.lookup,
+      dial: dialer.dial,
+      limits: { maxConcurrentRequests: 1 },
+    });
+    try {
+      for (let requestId = 1; requestId <= 6; requestId += 1) {
+        session.request(get(requestId, `${origin}/`));
+        if (requestId <= 2) await dns.untilStarted(requestId);
+        else await settleIo();
+        session.cancel(requestId);
+        expect(session.activeRequests).toBe(0);
+      }
+      // Two resolver calls are in flight (dial-target's global slots); the other four waited for a
+      // slot and left the queue when cancelled. Nothing else is pending for the session.
+      expect(dns.started).toBe(2);
+      dns.answerAll("127.0.0.1");
+      await settleIo();
+      await settleIo();
+      expect(dialer.calls).toBe(0);
+      expect(recording.events).toEqual([]);
+      expect(session.isOpen).toBe(true);
+
+      session.request(get(7, `${origin}/`));
+      await dns.untilStarted(3);
+      dns.answerAll("127.0.0.1");
+      await dialer.untilCalled(1);
+      await dialer.connectAll();
+      expect(await recording.outcome(7)).toMatchObject({ result: "end", body: "late" });
+    } finally {
+      dns.answerAll("127.0.0.1");
+    }
+  });
+
+  it("refuses body frames a request cannot take, without touching the request (T-B2)", async () => {
+    const fixture = await serve((request, response) => {
+      request.pipe(response);
+    });
+    const { session, recording } = open({ targets: [fixture.origin] });
+
+    session.request(get(1, `${fixture.origin}/`));
+    expect(() => session.writeBody(1, Buffer.from("x"))).toThrow(
+      expect.objectContaining({ violation: "body_not_expected" }),
+    );
+    expect(() => session.endBody(1)).toThrow(
+      expect.objectContaining({ violation: "body_not_expected" }),
+    );
+    expect(await recording.outcome(1)).toMatchObject({ result: "end" });
+
+    session.request(
+      get(2, `${fixture.origin}/`, { method: "POST", body: { kind: "stream", length: 2 } }),
+    );
+    session.writeBody(2, Buffer.from("ab"));
+    session.endBody(2);
+    expect(() => session.writeBody(2, Buffer.from("c"))).toThrow(
+      expect.objectContaining({ violation: "body_not_expected" }),
+    );
+    expect(() => session.endBody(2)).toThrow(
+      expect.objectContaining({ violation: "body_not_expected" }),
+    );
+    expect(await recording.outcome(2)).toMatchObject({ result: "end", body: "ab" });
+  });
+
+  it("treats an empty body chunk as a no-op instead of crediting zero bytes (T-B3)", async () => {
+    const fixture = await serve((request, response) => {
+      const hash = createHash("sha256");
+      request.on("data", (chunk: Buffer) => hash.update(chunk));
+      request.on("end", () => response.end(hash.digest("hex")));
+    });
+    const { session, recording } = open({ targets: [fixture.origin] });
+
+    session.request(
+      get(1, `${fixture.origin}/`, { method: "POST", body: { kind: "stream", length: null } }),
+    );
+    session.writeBody(1, Buffer.from("ab"));
+    session.writeBody(1, new Uint8Array(0));
+    session.writeBody(1, Buffer.from("cd"));
+    session.endBody(1);
+
+    expect(await recording.outcome(1)).toMatchObject({
+      result: "end",
+      body: createHash("sha256").update("abcd").digest("hex"),
+    });
+    const credits = recording
+      .eventsFor(1)
+      .filter((event) => event.type === "uploadCredit")
+      .map((event) => (event.type === "uploadCredit" ? event.bytes : 0));
+    expect(credits).toEqual([2, 2]);
+  });
+
+  it("emits no upload credit after revocation for bytes the upstream never accepted (T-B4)", async () => {
+    const dialer = gatedDial("honours-abort");
+    const fixture = await serve((request, response) => request.pipe(response));
+    const { session, recording } = open({ targets: [fixture.origin], dial: dialer.dial });
+
+    session.request(
+      get(1, `${fixture.origin}/`, { method: "POST", body: { kind: "stream", length: null } }),
+    );
+    session.writeBody(1, Buffer.alloc(16 * 1024, 1));
+    await dialer.untilCalled(1);
+    session.revoke();
+    await dialer.connectAll();
+    await settleIo();
+    await settleIo();
+
+    expect(recording.events).toEqual([{ type: "closed", reason: "revoked" }]);
+    expect(dialer.aborted).toEqual([`127.0.0.1:${fixture.port}`]);
+  });
+
+  it("refuses an oversized request head before connecting (T-L1)", async () => {
+    const fixture = await serve((_request, response) => response.end());
+    const { session, recording } = open({
+      targets: [fixture.origin],
+      limits: { maxRequestHeadBytes: 64 },
+    });
+
+    session.request(get(1, `${fixture.origin}/`, { headers: [["Accept", "x".repeat(200)]] }));
+
+    expect((await recording.outcome(1)).result).toBe("request_head_too_large");
+    expect(fixture.connections()).toBe(0);
+  });
+
+  it("fails malformed requests synchronously as invalid_request without connecting (T-S2)", async () => {
+    const fixture = await serve((_request, response) => response.end());
+    const { session, recording } = open({ targets: [fixture.origin] });
+    const unsupported = "TRACE" as NetworkFetchMethod;
+
+    session.request(get(1, `${fixture.origin}/`, { method: unsupported }));
+    session.request(
+      get(2, `${fixture.origin}/`, { method: "POST", body: { kind: "stream", length: -1 } }),
+    );
+    session.request(
+      get(3, `${fixture.origin}/`, { method: "POST", body: { kind: "stream", length: 1.5 } }),
+    );
+    session.request(get(4, `${fixture.origin}/`, { body: { kind: "stream", length: 1 } }));
+    session.request(get(5, `${fixture.origin}/`, { url: "/relative" }));
+
+    for (const requestId of [1, 2, 3, 4, 5]) {
+      expect(recording.eventsFor(requestId)).toEqual([
+        { type: "fail", requestId, failure: expect.objectContaining({ code: "invalid_request" }) },
+      ]);
+    }
+    expect(fixture.connections()).toBe(0);
+    expect(session.activeRequests).toBe(0);
+  });
+
+  it("completes HEAD without a body and sends Origin plus Content-Length: 0 on OPTIONS (T-S3)", async () => {
+    const seen: Array<{ method: string; origin: string | undefined; length: string | undefined }> =
+      [];
+    const fixture = await serve((request, response) => {
+      seen.push({
+        method: request.method ?? "",
+        origin: request.headers.origin,
+        length: request.headers["content-length"],
+      });
+      if (request.method === "HEAD") {
+        response.writeHead(200, { "Content-Length": "10" }).end();
+        return;
+      }
+      response.writeHead(204).end();
+    });
+    const { session, recording } = open({ targets: [fixture.origin] });
+
+    session.request(get(1, `${fixture.origin}/`, { method: "HEAD" }));
+    session.request(get(2, `${fixture.origin}/`, { method: "OPTIONS" }));
+
+    const head = await recording.outcome(1);
+    expect(head).toMatchObject({ result: "end", bodyBytes: 0 });
+    expect(head.head?.headers).toContainEqual(["Content-Length", "10"]);
+    expect((await recording.outcome(2)).head?.status).toBe(204);
+    expect(seen).toEqual([
+      { method: "HEAD", origin: undefined, length: undefined },
+      { method: "OPTIONS", origin: fixture.origin, length: "0" },
+    ]);
+  });
+});
+
+describe("network fetch session: release signal (D-CORE-1)", () => {
+  it("resolves a cancel during DNS with dnsPending and dials nothing afterwards", async () => {
+    const dns = gatedLookup();
+    const dialer = gatedDial("honours-abort");
+    const fixture = await serve((_request, response) => response.end());
+    const origin = `http://release-dns.test:${fixture.port}`;
+    const { session, recording } = open({
+      targets: [origin],
+      lookup: dns.lookup,
+      dial: dialer.dial,
+    });
+
+    session.request(get(1, `${origin}/`));
+    await dns.untilStarted(1);
+    const release = session.cancel(1);
+    expect(release).not.toBeNull();
+    expect(await release).toEqual({ dnsPending: true });
+    expect(session.pendingReleases).toBe(0);
+
+    dns.answerAll("127.0.0.1");
+    await expectSilenceAfter(recording, 1, 0);
+    expect(dialer.calls).toBe(0);
+    await session.released();
+  });
+
+  it("resolves a cancel during the body only after the dialed socket closed", async () => {
+    const held = heldResponder();
+    const dialer = gatedDial("honours-abort");
+    const fixture = await serve(held.handler);
+    const { session, recording } = open({ targets: [fixture.origin], dial: dialer.dial });
+
+    session.request(get(1, `${fixture.origin}/events`));
+    await dialer.untilCalled(1);
+    await dialer.connectAll();
+    await recording.until(() => recording.deliveredBytes(1) > 0);
+    const socket = dialer.sockets[0];
+    expect(dialer.closed.has(socket)).toBe(false);
+
+    const release = await session.cancel(1);
+    expect(release).toEqual({ dnsPending: false });
+    expect(dialer.closed.has(socket)).toBe(true);
+    expect(session.pendingReleases).toBe(0);
+    // The remote side sees the close too; its timing relative to the resolution is not asserted.
+    await held.upstreamClosed;
+  });
+
+  it("resolves a cancel during the TLS handshake after the local socket closed", async () => {
+    let markHello: () => void = () => {};
+    const clientHello = new Promise<void>((resolve) => {
+      markHello = resolve;
+    });
+    const silent = await listenSilent(() => markHello());
+    const dialer = gatedDial("honours-abort");
+    const origin = `https://127.0.0.1:${silent.port}`;
+    const { session, recording } = open({ targets: [origin], dial: dialer.dial });
+
+    session.request(get(1, `${origin}/`));
+    await dialer.untilCalled(1);
+    await dialer.connectAll();
+    await clientHello;
+    expect(await session.cancel(1)).toEqual({ dnsPending: false });
+    expect(dialer.closed.has(dialer.sockets[0])).toBe(true);
+    await silent.closed;
+    await expectSilenceAfter(recording, 1, 0);
+  });
+
+  it("releases an exchange cancelled before start without any network work", async () => {
+    const dialer = gatedDial("honours-abort");
+    const published: string[] = [];
+    const events: ExchangeEvents = {
+      head: () => published.push("head"),
+      body: () => published.push("body"),
+      end: () => published.push("end"),
+      fail: () => published.push("fail"),
+      uploadCredit: () => published.push("uploadCredit"),
+    };
+    const environment: ExchangeEnvironment = {
+      scope: parseTrustedTarget({ origin: "http://127.0.0.1:9", pathPrefix: "/" }),
+      assertCurrent: () => undefined,
+      protectedLocalPorts: () => new Set(),
+      localAddresses: () => [],
+      dial: dialer.dial,
+      tlsCa: null,
+      limits: DEFAULT_NETWORK_FETCH_LIMITS,
+    };
+    const request = get(1, "http://127.0.0.1:9/");
+    const exchange = new FetchExchange(request, new URL(request.url), environment, events);
+
+    const release = exchange.cancel();
+    exchange.start();
+    expect(await release).toEqual({ dnsPending: false });
+    expect(await exchange.cancel()).toEqual({ dnsPending: false });
+    await settleIo();
+    expect(dialer.calls).toBe(0);
+    expect(published).toEqual([]);
+  });
+
+  it("answers null for a cancel after a natural end or a failure and keeps throwing for unknown ids", async () => {
+    const fixture = await serve((_request, response) => response.end("done"));
+    const other = await serve((_request, response) => response.end("other"));
+    const { session, recording } = open({ targets: [fixture.origin, other.origin] });
+
+    session.request(get(1, `${fixture.origin}/`));
+    session.request(get(2, `${other.origin}/`));
+    expect(await recording.outcome(1)).toMatchObject({ result: "end", body: "done" });
+    expect((await recording.outcome(2)).result).toBe("not_allowlisted");
+    await session.released();
+
+    expect(session.cancel(1)).toBeNull();
+    expect(session.cancel(2)).toBeNull();
+    expect(() => session.cancel(9)).toThrow(
+      expect.objectContaining({ violation: "unknown_request" }),
+    );
+    expect(session.pendingReleases).toBe(0);
+    expect(other.connections()).toBe(0);
+  });
+
+  it("releases every request of a revoked generation, whatever state it was in", async () => {
+    const dns = gatedLookup();
+    const held = heldResponder();
+    let markWaiting: () => void = () => {};
+    const waiting = new Promise<void>((resolve) => {
+      markWaiting = resolve;
+    });
+    const fixture = await serve((request, response) => {
+      if (request.url === "/body") {
+        held.handler(request, response);
+        return;
+      }
+      markWaiting();
+    });
+    const origin = `http://release-revoke.test:${fixture.port}`;
+    const { session, recording } = open({ targets: [origin], lookup: dns.lookup });
+
+    session.request(get(1, `${origin}/body`));
+    await dns.untilStarted(1);
+    dns.answerAll("127.0.0.1");
+    await recording.until(() => recording.deliveredBytes(1) > 0);
+    session.request(get(2, `${origin}/head`));
+    await dns.untilStarted(2);
+    dns.answerAll("127.0.0.1");
+    await waiting;
+    session.request(get(3, `${origin}/dns`));
+    await dns.untilStarted(3);
+    expect(session.pendingReleases).toBe(3);
+
+    session.revoke();
+    await session.released();
+    expect(session.pendingReleases).toBe(0);
+    expect(recording.closedReasons()).toEqual(["revoked"]);
+    dns.answerAll("127.0.0.1");
+    await settleIo();
+    await settleIo();
+    expect(fixture.connections()).toBe(2);
+  });
+
+  it("waits for a socket handed over after the cancel before releasing", async () => {
+    const dialer = gatedDial("ignores-abort");
+    const fixture = await serve((_request, response) => response.end());
+    const { session } = open({ targets: [fixture.origin], dial: dialer.dial });
+
+    session.request(get(1, `${fixture.origin}/`));
+    await dialer.untilCalled(1);
+    const release = session.cancel(1);
+    if (!release) throw new Error("expected an active request");
+    await dialer.connectAll();
+    expect(await release).toEqual({ dnsPending: false });
+    expect(dialer.closed.has(dialer.sockets[0])).toBe(true);
+  });
+
+  it("keeps the pending set empty across many request/cancel cycles", async () => {
+    const dns = gatedLookup();
+    const dialer = gatedDial("honours-abort");
+    const fixture = await serve((_request, response) => response.end());
+    const origin = `http://release-loop.test:${fixture.port}`;
+    const { session } = open({ targets: [origin], lookup: dns.lookup, dial: dialer.dial });
+    try {
+      const releases: Array<Promise<unknown>> = [];
+      for (let requestId = 1; requestId <= 50; requestId += 1) {
+        session.request(get(requestId, `${origin}/`));
+        await settleIo();
+        const release = session.cancel(requestId);
+        if (release) releases.push(release);
+      }
+      expect(releases).toHaveLength(50);
+      await Promise.all(releases);
+      await session.released();
+      expect(session.pendingReleases).toBe(0);
+      expect(dns.started).toBe(2);
+      expect(dialer.calls).toBe(0);
+    } finally {
+      dns.answerAll("127.0.0.1");
+    }
   });
 });
