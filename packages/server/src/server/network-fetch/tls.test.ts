@@ -1,12 +1,17 @@
 import { execFileSync } from "node:child_process";
+import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import https from "node:https";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { TunnelDial } from "../network-tunnel/dial-target.js";
 import type { ResolvedTunnelAddress } from "../network-tunnel/target-policy.js";
+import { startWebProxyFixture, type WebProxyFixture } from "./__fixtures__/web-proxy-fixture.js";
 import { parseTrustedTarget } from "./allowlist.js";
-import type { NetworkFetchFailure, NetworkFetchSink } from "./session.js";
+import type { NetworkFetchResponseHead } from "./exchange.js";
+import type { NetworkFetchFailure, NetworkFetchSession, NetworkFetchSink } from "./session.js";
 import { openNetworkFetchSession } from "./session.js";
 
 interface TestPki {
@@ -220,5 +225,119 @@ describe("network fetch TLS", () => {
     });
 
     expect(result).toMatchObject({ code: "tls_hostname_mismatch" });
+  });
+});
+
+type FixtureFetchEvent =
+  | { type: "head"; head: NetworkFetchResponseHead }
+  | { type: "body"; bytes: number }
+  | { type: "end" }
+  | { type: "fail"; failure: NetworkFetchFailure };
+
+interface FixtureFetch {
+  events: FixtureFetchEvent[];
+  session: NetworkFetchSession;
+  /** Every client socket the session dialed, to prove none outlives a rejected handshake. */
+  sockets: net.Socket[];
+}
+
+/** One request through a real session to a fixture listener, trusting only the run's CA. */
+function fetchFromFixture(input: { baseUrl: string; caPem: string }): Promise<FixtureFetch> {
+  const origin = new URL(input.baseUrl).origin;
+  const allowlist = {
+    id: "fixture-tls",
+    revision: 1,
+    targets: [parseTrustedTarget({ origin, pathPrefix: "/" })],
+  };
+  const events: FixtureFetchEvent[] = [];
+  const sockets: net.Socket[] = [];
+  const dial: TunnelDial = ({ address, port }) =>
+    new Promise((resolve, reject) => {
+      const socket = net.connect({ host: address.address, port });
+      sockets.push(socket);
+      socket.once("connect", () => resolve(socket));
+      socket.once("error", reject);
+    });
+  return new Promise((resolve) => {
+    const settle = (event: FixtureFetchEvent) => {
+      events.push(event);
+      resolve({ events, session, sockets });
+    };
+    const sink: NetworkFetchSink = {
+      head: (_requestId, head) => events.push({ type: "head", head }),
+      body: (requestId, chunk) => {
+        events.push({ type: "body", bytes: chunk.byteLength });
+        queueMicrotask(() => {
+          if (session.isOpen) session.grantCredit(requestId, chunk.byteLength);
+        });
+      },
+      end: () => settle({ type: "end" }),
+      fail: (_requestId, failure) => settle({ type: "fail", failure }),
+      uploadCredit: () => {},
+      closed: () => {},
+    };
+    const session = openNetworkFetchSession({
+      allowlists: { get: () => allowlist },
+      allowlistRef: { id: "fixture-tls", revision: 1 },
+      scope: { origin, pathPrefix: "/" },
+      ttlMs: 10_000,
+      isAuthorized: () => true,
+      protectedLocalPorts: () => new Set(),
+      localAddresses: () => [],
+      dial,
+      tlsCa: [input.caPem],
+      sink,
+    });
+    session.request({
+      requestId: 1,
+      method: "GET",
+      url: `${input.baseUrl}/api/echo`,
+      headers: [],
+      redirect: "error",
+      body: { kind: "none" },
+    });
+  });
+}
+
+describe("network fetch TLS against the web proxy fixture", () => {
+  let fixture: WebProxyFixture;
+
+  beforeAll(async () => {
+    fixture = await startWebProxyFixture({ tls: true });
+  });
+
+  afterAll(async () => {
+    await fixture.close();
+  });
+
+  it("rejects an expired certificate from the trusted CA before any HTTP exchange (HTTP-02)", async () => {
+    const valid = fixture.https;
+    const expired = fixture.httpsVariants?.expired;
+    if (!valid || !expired) throw new Error("Fixture started without TLS listeners");
+
+    // Same CA, same names: only the validity period differs, so the CA alone cannot explain a refusal.
+    const control = await fetchFromFixture({ baseUrl: valid.baseUrl, caPem: valid.caPem });
+    const rejected = await fetchFromFixture({ baseUrl: expired.baseUrl, caPem: expired.caPem });
+    await Promise.all(
+      rejected.sockets.map((socket) => (socket.closed ? undefined : once(socket, "close"))),
+    );
+    control.session.close();
+
+    expect(expired.caPem).toBe(valid.caPem);
+    expect(control.events.at(-1)).toEqual({ type: "end" });
+    expect(control.events[0]).toMatchObject({ type: "head", head: { status: 200 } });
+    expect(rejected.events).toEqual([
+      {
+        type: "fail",
+        failure: { code: "tls_certificate_invalid", message: "Certificate is not trusted" },
+      },
+    ]);
+    expect(rejected.sockets).toHaveLength(1);
+    expect(rejected.sockets[0].destroyed).toBe(true);
+    expect(rejected.session.activeRequests).toBe(0);
+    expect(rejected.session.isOpen).toBe(true);
+    rejected.session.close();
+    const reached = fixture.events.ofKind("request").map((event) => event.listener);
+    expect(reached).toEqual(["https"]);
   });
 });
