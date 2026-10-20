@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import net from "node:net";
@@ -33,6 +33,7 @@ export type LocalRelayProblem =
   | "unsupported_platform"
   | "wrangler_not_declared"
   | "wrangler_not_installed"
+  | "global_config_not_isolated"
   | "spawn_failed"
   | "exited"
   | "startup_timeout"
@@ -56,6 +57,8 @@ export interface RelayWorkDirs {
   logs: string;
   registry: string;
   cache: string;
+  /** XDG_CONFIG_HOME for the relay: wrangler's global config, OAuth token and caches land here. */
+  config: string;
 }
 
 export interface RelayLaunchContext {
@@ -321,6 +324,7 @@ export async function startOwnedRelay(options: OwnedRelayOptions): Promise<Owned
     logs: path.join(root, "logs"),
     registry: path.join(root, "registry"),
     cache: path.join(root, "cache"),
+    config: path.join(root, "config"),
   };
   const known = [root];
   let current: Instance | null = null;
@@ -458,8 +462,9 @@ export function resolveWrangler(
 
 /**
  * The only variables the relay process receives. Credentials (Cloudflare, providers), NODE_OPTIONS
- * and everything else from the caller stay out; HOME is passed unchanged, and wrangler's logs,
- * dev registry and cache go to the work directory instead of the user's global config.
+ * and everything else from the caller stay out. HOME is passed unchanged; XDG_CONFIG_HOME moves
+ * wrangler's global config (where `wrangler login` keeps its OAuth token) into the work directory,
+ * with the logs, dev registry and cache. Hiding the banner also skips its npm update check.
  */
 export function relayEnvironment(
   dirs: RelayWorkDirs,
@@ -468,6 +473,8 @@ export function relayEnvironment(
   const env: Record<string, string> = {
     WRANGLER_SEND_METRICS: "false",
     WRANGLER_SEND_ERROR_REPORTS: "false",
+    WRANGLER_HIDE_BANNER: "true",
+    XDG_CONFIG_HOME: dirs.config,
     WRANGLER_LOG_PATH: dirs.logs,
     WRANGLER_REGISTRY_PATH: dirs.registry,
     WRANGLER_CACHE_DIR: dirs.cache,
@@ -477,6 +484,22 @@ export function relayEnvironment(
     if (value !== undefined) env[name] = value;
   }
   return env;
+}
+
+/**
+ * Wrangler 4 reads its global config from `~/.wrangler` whenever that legacy directory exists,
+ * ignoring XDG_CONFIG_HOME (`getGlobalConfigPath`, `useLegacyHomeDir`). The relay then could read
+ * the user's token, so the start is refused; the directory itself is never opened or changed.
+ */
+export function assertWranglerConfigIsolated(home: string | undefined): void {
+  if (home === undefined) return;
+  const legacy = statSync(path.join(home, ".wrangler"), { throwIfNoEntry: false });
+  if (legacy?.isDirectory()) {
+    throw new LocalRelayError(
+      "global_config_not_isolated",
+      "~/.wrangler exists, and wrangler would read it instead of the relay's own config directory",
+    );
+  }
 }
 
 export function wranglerLaunch(input: {
@@ -526,6 +549,7 @@ export async function startLocalWranglerRelay(
   options: LocalWranglerRelayOptions = {},
 ): Promise<LocalWranglerRelay> {
   const installation = resolveWrangler();
+  assertWranglerConfigIsolated(process.env.HOME);
   const relay = await startOwnedRelay({
     launch: (context) => wranglerLaunch({ installation, context }),
     startupTimeoutMs: options.startupTimeoutMs ?? 90_000,
