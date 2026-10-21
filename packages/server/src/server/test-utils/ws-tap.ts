@@ -14,6 +14,7 @@ import { WebSocket, WebSocketServer } from "ws";
 export type WsTapDirection = "toTarget" | "fromTarget";
 
 export interface WsTapOptions {
+  captureClosures?: boolean;
   targetPort: number;
   targetHost?: string;
   maxBytesPerDirection?: number;
@@ -48,7 +49,22 @@ export interface WsTap {
   messages(): readonly WsTapMessage[];
   contains(needle: string | Uint8Array): Record<WsTapDirection, boolean>;
   summary(): WsTapSummary;
+  closures(): WsTapClosures;
   close(): Promise<void>;
+}
+
+export interface WsTapClose {
+  connection: number;
+  at: number;
+  source: "downstream" | "upstream" | "tap_limit" | "tap_error" | "tap_stop";
+  originalCode: number | null;
+  forwardedCode: number | null;
+}
+
+export interface WsTapClosures {
+  enabled: boolean;
+  dropped: number;
+  events: WsTapClose[];
 }
 
 export class WsTapOverflowError extends Error {
@@ -64,6 +80,7 @@ const CLOSE_TOO_BIG = 1009;
 const CLOSE_GOING_AWAY = 1001;
 
 interface Pair {
+  id: number;
   downstream: WebSocket;
   upstream: WebSocket;
   /** Messages received before the upstream handshake completed; dropped if the pair closes first. */
@@ -97,6 +114,28 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
   const pairs = new Set<Pair>();
   let connections = 0;
   let overflow: WsTapOverflow | null = null;
+  const closures: WsTapClose[] = [];
+  let closuresDropped = 0;
+
+  function recordClose(
+    pair: Pair,
+    source: WsTapClose["source"],
+    originalCode: number | null,
+    forwardedCode: number | null,
+  ): void {
+    if (!options.captureClosures || pair.closed) return;
+    if (closures.length === 16) {
+      closures.shift();
+      closuresDropped += 1;
+    }
+    closures.push({
+      connection: pair.id,
+      at: Math.floor(performance.now()),
+      source,
+      originalCode,
+      forwardedCode,
+    });
+  }
 
   const server = http.createServer((_request, response) => {
     response.writeHead(426, { connection: "close" }).end();
@@ -116,6 +155,7 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
 
   function markOverflow(direction: WsTapDirection, limit: number, pair: Pair): void {
     overflow ??= { direction, limit };
+    recordClose(pair, "tap_limit", null, CLOSE_TOO_BIG);
     closePair(pair, CLOSE_TOO_BIG, "tap limit");
   }
 
@@ -149,7 +189,7 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
         protocols ? protocols.split(",").map((value) => value.trim()) : [],
         { maxPayload: maxBytes },
       );
-      const pair: Pair = { downstream, upstream, queued: [], closed: false };
+      const pair: Pair = { id: connections, downstream, upstream, queued: [], closed: false };
       pairs.add(pair);
       downstream.on("message", (data, isBinary) => {
         const buffer = toBuffer(data);
@@ -172,13 +212,18 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
         if (!record("fromTarget", buffer, isBinary, pair)) return;
         if (downstream.readyState === WebSocket.OPEN) downstream.send(buffer, { binary: isBinary });
       });
-      const onClose = (code: number, reason: Buffer) =>
+      const onClose = (source: "downstream" | "upstream") => (code: number, reason: Buffer) => {
+        recordClose(pair, source, code, portableCode(code));
         closePair(pair, portableCode(code), reason.toString("utf8"));
-      downstream.on("close", onClose);
-      upstream.on("close", onClose);
+      };
+      downstream.on("close", onClose("downstream"));
+      upstream.on("close", onClose("upstream"));
       const onError = (direction: WsTapDirection) => (error: Error) => {
         if (isPayloadTooLarge(error)) markOverflow(direction, maxBytes, pair);
-        else closePair(pair, CLOSE_GOING_AWAY, "tap peer error");
+        else {
+          recordClose(pair, "tap_error", null, CLOSE_GOING_AWAY);
+          closePair(pair, CLOSE_GOING_AWAY, "tap peer error");
+        }
       };
       downstream.on("error", onError("toTarget"));
       upstream.on("error", onError("fromTarget"));
@@ -196,6 +241,13 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
 
   return {
     port,
+    closures: () => ({
+      enabled: options.captureClosures === true,
+      dropped: closuresDropped,
+      // Do not let an evidence consumer mutate the recorder.
+      // eslint-disable-next-line no-map-spread
+      events: closures.map((event) => ({ ...event })),
+    }),
     messages: () => messages,
     contains(needle) {
       const bytesNeedle =
@@ -218,6 +270,7 @@ export async function startWsTap(options: WsTapOptions): Promise<WsTap> {
     }),
     async close() {
       for (const pair of Array.from(pairs)) {
+        recordClose(pair, "tap_stop", null, null);
         pair.closed = true;
         pair.queued.length = 0;
         pair.downstream.terminate();

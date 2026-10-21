@@ -277,9 +277,15 @@ export async function startRelayBridgeStack(
   let clientTap: WsTap;
   let daemonTap: WsTap;
   try {
-    clientTap = await startWsTap(wsTapOptions(relay.port, options.tapLimits));
+    clientTap = await startWsTap({
+      ...wsTapOptions(relay.port, options.tapLimits),
+      captureClosures: options.bridgeDiagnostics === true,
+    });
     opened.push({ port: clientTap.port, close: () => clientTap.close() });
-    daemonTap = await startWsTap(wsTapOptions(relay.port, options.tapLimits));
+    daemonTap = await startWsTap({
+      ...wsTapOptions(relay.port, options.tapLimits),
+      captureClosures: options.bridgeDiagnostics === true,
+    });
     opened.push({ port: daemonTap.port, close: () => daemonTap.close() });
   } catch (error) {
     return unwind("taps", error);

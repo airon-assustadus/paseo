@@ -1,6 +1,6 @@
 import http from "node:http";
 import net, { type AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import { startWsTap, type WsTap } from "./ws-tap.js";
 
@@ -31,7 +31,7 @@ async function echoServer(): Promise<{ port: number; paths: string[] }> {
 
 async function tapFor(
   port: number,
-  options: { maxBytesPerDirection?: number } = {},
+  options: { maxBytesPerDirection?: number; captureClosures?: boolean } = {},
 ): Promise<WsTap> {
   const tap = await startWsTap({ targetPort: port, ...options });
   closers.push(() => tap.close());
@@ -67,9 +67,57 @@ function closed(socket: WebSocket): Promise<number> {
 }
 
 describe("ws tap", () => {
+  it("records the original peer close before forwarding, without reason or duplicate cleanup", async () => {
+    const target = await echoServer();
+    const tap = await tapFor(target.port, { captureClosures: true });
+    const socket = await connect(`ws://127.0.0.1:${tap.port}/`);
+    const closeResult = closed(socket);
+    socket.close(4001, "sentinel-private-reason");
+    await closeResult;
+    await vi.waitFor(() => expect(tap.closures().events).toHaveLength(1));
+    expect(tap.closures().events[0]).toMatchObject({
+      connection: 1,
+      source: "downstream",
+      originalCode: 4001,
+      forwardedCode: 4001,
+    });
+    const snapshot = tap.closures();
+    expect(JSON.stringify(snapshot)).not.toContain("sentinel");
+    snapshot.events[0]!.originalCode = 999;
+    expect(tap.closures().events[0]!.originalCode).toBe(4001);
+    await tap.close();
+    expect(tap.closures().events).toHaveLength(1);
+  });
+
+  it("keeps abnormal peer closure distinct from a local stop", async () => {
+    const target = await echoServer();
+    const tap = await tapFor(target.port, { captureClosures: true });
+    const socket = await connect(`ws://127.0.0.1:${tap.port}/`);
+    const closeResult = closed(socket);
+    socket.terminate();
+    await closeResult;
+    await vi.waitFor(() => expect(tap.closures().events).toHaveLength(1));
+    expect(tap.closures().events[0]).toMatchObject({
+      source: "downstream",
+      originalCode: 1006,
+      forwardedCode: 1000,
+    });
+    const second = await connect(`ws://127.0.0.1:${tap.port}/`);
+    const secondClosed = closed(second);
+    await tap.close();
+    await secondClosed;
+    expect(tap.closures().events[1]).toMatchObject({
+      connection: 2,
+      source: "tap_stop",
+      originalCode: null,
+      forwardedCode: null,
+    });
+  });
+
   it("forwards both directions with path and opcode, classifies the handshake, and reports only counts", async () => {
     const target = await echoServer();
     const tap = await tapFor(target.port);
+    expect(tap.closures()).toEqual({ enabled: false, dropped: 0, events: [] });
     const socket = await connect(`ws://127.0.0.1:${tap.port}/relay?serverId=abc&role=client`);
     closers.push(async () => socket.terminate());
 
