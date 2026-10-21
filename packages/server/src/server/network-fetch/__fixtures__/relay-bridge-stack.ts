@@ -12,6 +12,7 @@ import {
   type WsTap,
   type WsTapDirection,
   type WsTapMessage,
+  type WsTapOptions,
   type WsTapOverflow,
 } from "../../test-utils/ws-tap.js";
 import {
@@ -42,6 +43,27 @@ export interface StartRelayBridgeStackOptions {
   registrationTimeoutMs?: number;
   /** Timeline callback; receives step labels and counts only. */
   onStep?: (step: string, detail?: Record<string, unknown>) => void;
+  /**
+   * Capture budget of both taps for a lab run. Absent, the taps keep their own defaults (8 MiB per
+   * direction, 10 000 messages), which R1 and R2 rely on; the counters are cumulative for the life
+   * of the tap, so a physical round with 8 MiB cases needs more than the default.
+   */
+  tapLimits?: RelayTapLimits;
+}
+
+export interface RelayTapLimits {
+  maxBytesPerDirection?: number;
+  maxMessages?: number;
+}
+
+/** The options both taps are started with; the tap validates the caps before it listens. */
+export function wsTapOptions(relayPort: number, limits?: RelayTapLimits): WsTapOptions {
+  const options: WsTapOptions = { targetPort: relayPort };
+  if (limits?.maxBytesPerDirection !== undefined) {
+    options.maxBytesPerDirection = limits.maxBytesPerDirection;
+  }
+  if (limits?.maxMessages !== undefined) options.maxMessages = limits.maxMessages;
+  return options;
 }
 
 /**
@@ -253,9 +275,9 @@ export async function startRelayBridgeStack(
   let clientTap: WsTap;
   let daemonTap: WsTap;
   try {
-    clientTap = await startWsTap({ targetPort: relay.port });
+    clientTap = await startWsTap(wsTapOptions(relay.port, options.tapLimits));
     opened.push({ port: clientTap.port, close: () => clientTap.close() });
-    daemonTap = await startWsTap({ targetPort: relay.port });
+    daemonTap = await startWsTap(wsTapOptions(relay.port, options.tapLimits));
     opened.push({ port: daemonTap.port, close: () => daemonTap.close() });
   } catch (error) {
     return unwind("taps", error);
