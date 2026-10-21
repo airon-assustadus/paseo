@@ -1107,6 +1107,12 @@ const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
 const DEFAULT_SESSION_RPC_TIMEOUT_MS = 60_000;
 const PUSH_TOKEN_REVOCATION_TIMEOUT_MS = 2_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+// Close codes this client sends. A browser WebSocket.close() throws for any code other than 1000 or
+// 3000-4999, and this client runs in browsers, so the RFC 6455 1001/1002 are not usable here. Peers
+// only log the code (the relay replaces it with its own 1001 toward the daemon); 4000 + RFC code is
+// the app's convention for faults, and 4001 is already the E2EE handshake failure of the transport.
+const CLIENT_CLOSE_NORMAL = 1000;
+const CLIENT_CLOSE_PROTOCOL_ERROR = 4002;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5000;
 const LIVENESS_HEARTBEAT_INTERVAL_MS = 10_000;
 const LIVENESS_HEARTBEAT_TIMEOUT_MS = 15_000;
@@ -1275,7 +1281,7 @@ export class DaemonClient {
           responseType: "subscription.release.response",
         });
       } catch (error) {
-        this.disposeTransport(1001, "Subscription release failed");
+        this.disposeTransport(CLIENT_CLOSE_NORMAL, "Subscription release failed");
         this.scheduleReconnect({ reason: "Subscription release failed" });
         throw error;
       }
@@ -1531,7 +1537,7 @@ export class DaemonClient {
           return;
         }
         this.lastErrorValue = "Connection timed out";
-        this.disposeTransport(1001, "Connection timed out");
+        this.disposeTransport(CLIENT_CLOSE_NORMAL, "Connection timed out");
         this.scheduleReconnect({
           reason: "Connection timed out",
           event: "CONNECT_TIMEOUT",
@@ -1660,7 +1666,7 @@ export class DaemonClient {
       this.reconnectTimeout = null;
     }
     this.resetConnectTimeout();
-    this.disposeTransport(1000, "Client closed");
+    this.disposeTransport(CLIENT_CLOSE_NORMAL, "Client closed");
     this.providerSnapshotUpdates.clear();
     this.clearWaiters(new Error("Daemon client closed"));
     await this.owned.close();
@@ -1709,7 +1715,7 @@ export class DaemonClient {
     void this.ping({ timeoutMs: 3_000 })
       .catch((error: unknown) => {
         if (this.transport !== transport || this.connectionState.status !== "connected") return;
-        this.disposeTransport(1001, "Connection verification failed");
+        this.disposeTransport(CLIENT_CLOSE_NORMAL, "Connection verification failed");
         this.scheduleReconnect({
           reason: error instanceof Error ? error.message : String(error),
           event: "CONNECTION_VERIFICATION_FAILED",
@@ -2426,7 +2432,7 @@ export class DaemonClient {
         // Reject and release this handle before closing a source with an unknown bootstrap outcome.
         // Closing first would classify the failure as a reconnect and replay the failed request.
         if (resetSource) {
-          this.disposeTransport(1001, "Subscription request failed");
+          this.disposeTransport(CLIENT_CLOSE_NORMAL, "Subscription request failed");
           this.scheduleReconnect({ reason: "Subscription request failed" });
         }
       },
@@ -6583,7 +6589,7 @@ export class DaemonClient {
     }
   }
 
-  private disposeTransport(code = 1001, reason = "Reconnecting"): void {
+  private disposeTransport(code = CLIENT_CLOSE_NORMAL, reason = "Reconnecting"): void {
     this.owned.disconnected();
     this.networkTunnels.disconnected();
     this.remoteBrowsers.disconnected();
@@ -6815,7 +6821,7 @@ export class DaemonClient {
   private handleNetworkTunnelProtocolError(reason: string): void {
     this.networkTunnels.disconnected();
     this.remoteBrowsers.disconnected();
-    this.disposeTransport(1002, reason);
+    this.disposeTransport(CLIENT_CLOSE_PROTOCOL_ERROR, reason);
     this.scheduleReconnect({
       reason,
       event: "NETWORK_TUNNEL_PROTOCOL_ERROR",
@@ -7056,7 +7062,7 @@ export class DaemonClient {
     }
     this.consecutiveLivenessFailures = 0;
     this.lastErrorValue = error.message;
-    this.disposeTransport(1001, "Liveness check timed out");
+    this.disposeTransport(CLIENT_CLOSE_NORMAL, "Liveness check timed out");
     this.scheduleReconnect({
       reason: error.message,
       event: "LIVENESS_TIMEOUT",
