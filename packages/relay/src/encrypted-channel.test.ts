@@ -303,7 +303,7 @@ describe("EncryptedChannel", () => {
 
     expect(onerror).toHaveBeenCalledTimes(1);
     expect((onerror.mock.calls[0][0] as Error).message).toBe("backlog send failed");
-    expect(transport.close).toHaveBeenCalledWith(1011, "backlog send failed");
+    expect(transport.close).toHaveBeenCalledWith(4011, "backlog send failed");
   });
 
   it("fails handshake on invalid hello", async () => {
@@ -530,5 +530,229 @@ describe("EncryptedChannel", () => {
     expect(typeof (daemonTransport.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toBe(
       "string",
     );
+  });
+});
+
+// A browser never puts a bad close on the wire: WebSocket.close() throws before it. The fakes
+// below reproduce that algorithm and ws's, so a code or reason the runtime refuses fails here.
+interface RecordedClose {
+  code: number | undefined;
+  reason: string | undefined;
+}
+
+interface RecordingTransport extends Transport {
+  closes: RecordedClose[];
+}
+
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
+}
+
+// WHATWG WebSocket "close": InvalidAccessError unless code is 1000 or 3000..4999, SyntaxError when
+// the reason exceeds 123 UTF-8 bytes. A second close() on a closing socket is a no-op.
+function browserLikeTransport(): RecordingTransport {
+  const closes: RecordedClose[] = [];
+  return {
+    closes,
+    send: vi.fn(),
+    close(code, reason) {
+      if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
+        throw new DOMException(
+          `The code must be either 1000, or between 3000 and 4999. ${code} is neither.`,
+          "InvalidAccessError",
+        );
+      }
+      if (reason !== undefined && utf8Bytes(reason) > 123) {
+        throw new DOMException(
+          "The close reason must not be greater than 123 UTF-8 bytes.",
+          "SyntaxError",
+        );
+      }
+      if (closes.length === 0) closes.push({ code, reason });
+    },
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+  };
+}
+
+// Node's ws (lib/validation.js isValidStatusCode, lib/sender.js): 1000..1014 except 1004..1006,
+// plus 3000..4999; RangeError when the reason exceeds 123 bytes.
+function wsLikeTransport(): RecordingTransport {
+  const closes: RecordedClose[] = [];
+  return {
+    closes,
+    send: vi.fn(),
+    close(code, reason) {
+      const valid =
+        code === undefined ||
+        (code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) ||
+        (code >= 3000 && code <= 4999);
+      if (!valid) throw new TypeError(`Invalid WebSocket frame: invalid status code ${code}`);
+      if (reason !== undefined && utf8Bytes(reason) > 123) {
+        throw new RangeError("The message must not be greater than 123 bytes");
+      }
+      if (closes.length === 0) closes.push({ code, reason });
+    },
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+  };
+}
+
+// Negotiated binary frames decrypt to bytes; compare deliveries as text either way.
+function asText(entry: string | ArrayBuffer): string {
+  return typeof entry === "string" ? entry : new TextDecoder().decode(entry);
+}
+
+// Resolves with the handleMessage promise, so a close that throws inside it is seen here.
+function deliver(transport: Transport, data: string | ArrayBuffer): Promise<void> {
+  return Promise.resolve(transport.onmessage?.({ data, isBinary: data instanceof ArrayBuffer }));
+}
+
+const READY_WITH_BINARY = JSON.stringify({
+  type: "e2ee_ready",
+  capabilities: { binaryCiphertext: true },
+});
+
+// Opens a client channel over `transport` and returns the key the daemon side would hold.
+async function openClient(
+  transport: RecordingTransport,
+  onerror?: (error: Error) => void,
+): Promise<{ channel: EncryptedChannel; sharedKey: Uint8Array }> {
+  const daemonKeyPair = generateKeyPair();
+  let resolveOpen: (() => void) | null = null;
+  const opened = new Promise<void>((resolve) => {
+    resolveOpen = resolve;
+  });
+  const channel = await createClientChannel(transport, exportPublicKey(daemonKeyPair.publicKey), {
+    onopen: () => resolveOpen?.(),
+    ...(onerror ? { onerror } : {}),
+  });
+  const hello = JSON.parse(
+    (transport.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string,
+  ) as { key: string };
+  await deliver(transport, READY_WITH_BINARY);
+  await opened;
+  return {
+    channel,
+    sharedKey: deriveSharedKey(daemonKeyPair.secretKey, importPublicKey(hello.key)),
+  };
+}
+
+describe("EncryptedChannel close codes", () => {
+  it("client closes a browser socket after a decryption failure, with a code the browser sends", async () => {
+    const transport = browserLikeTransport();
+    const { channel } = await openClient(transport);
+
+    await expect(deliver(transport, new Uint8Array(64).buffer)).resolves.toBeUndefined();
+
+    expect(transport.closes).toEqual([{ code: 4011, reason: "Decryption failed" }]);
+    expect(channel.isOpen()).toBe(false);
+    await expect(channel.send("after close")).rejects.toThrow("Channel not open");
+  });
+
+  it("client stops delivering frames once a decryption failure closed it", async () => {
+    const transport = browserLikeTransport();
+    const received: (string | ArrayBuffer)[] = [];
+    const daemonKeyPair = generateKeyPair();
+    let resolveOpen: (() => void) | null = null;
+    const opened = new Promise<void>((resolve) => {
+      resolveOpen = resolve;
+    });
+    const channel = await createClientChannel(transport, exportPublicKey(daemonKeyPair.publicKey), {
+      onopen: () => resolveOpen?.(),
+      onmessage: (data) => received.push(data),
+    });
+    const hello = JSON.parse(
+      (transport.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string,
+    ) as { key: string };
+    const sharedKey = deriveSharedKey(daemonKeyPair.secretKey, importPublicKey(hello.key));
+    await deliver(transport, READY_WITH_BINARY);
+    await opened;
+
+    await deliver(transport, encrypt(sharedKey, "before"));
+    await deliver(transport, new Uint8Array(64).buffer);
+    await deliver(transport, encrypt(sharedKey, "after"));
+
+    expect(received.map(asText)).toEqual(["before"]);
+    expect(channel.isOpen()).toBe(false);
+    expect(transport.closes).toHaveLength(1);
+  });
+
+  it("client closes a browser socket when the handshake backlog fails to send", async () => {
+    const transport = browserLikeTransport();
+    let sendAttempts = 0;
+    (transport.send as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      sendAttempts += 1;
+      return sendAttempts === 1 ? undefined : Promise.reject(new Error("backlog send failed"));
+    });
+    const onerror = vi.fn();
+    const daemonKeyPair = generateKeyPair();
+    const channel = await createClientChannel(transport, exportPublicKey(daemonKeyPair.publicKey), {
+      onerror,
+    });
+    await channel.send(new ArrayBuffer(8));
+
+    await expect(deliver(transport, READY_WITH_BINARY)).resolves.toBeUndefined();
+    await waitForAsyncDelivery();
+
+    expect(onerror).toHaveBeenCalledTimes(1);
+    expect(transport.closes).toEqual([{ code: 4011, reason: "backlog send failed" }]);
+    expect(channel.isOpen()).toBe(false);
+  });
+
+  it("client bounds the close reason to 123 UTF-8 bytes at a character boundary", async () => {
+    const transport = browserLikeTransport();
+    // 60 three-byte characters: 180 bytes, and byte 123 falls inside a character.
+    const message = "ç".repeat(10) + "€".repeat(60);
+    let sendAttempts = 0;
+    (transport.send as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      sendAttempts += 1;
+      return sendAttempts === 1 ? undefined : Promise.reject(new Error(message));
+    });
+    const daemonKeyPair = generateKeyPair();
+    const channel = await createClientChannel(transport, exportPublicKey(daemonKeyPair.publicKey), {
+      onerror: () => undefined,
+    });
+    await channel.send(new ArrayBuffer(8));
+
+    await expect(deliver(transport, READY_WITH_BINARY)).resolves.toBeUndefined();
+    await waitForAsyncDelivery();
+
+    expect(transport.closes).toHaveLength(1);
+    const reason = transport.closes[0].reason ?? "";
+    expect(utf8Bytes(reason)).toBeLessThanOrEqual(123);
+    expect(reason.length).toBeGreaterThan(0);
+    expect(message.startsWith(reason)).toBe(true);
+    expect(reason.endsWith("�")).toBe(false);
+  });
+
+  it("daemon keeps the RFC 6455 codes its ws socket accepts", async () => {
+    const transport = wsLikeTransport();
+    const received: (string | ArrayBuffer)[] = [];
+    const daemonKeyPair = generateKeyPair();
+    const clientKeyPair = generateKeyPair();
+    const channelPromise = createDaemonChannel(transport, daemonKeyPair, {
+      onmessage: (data) => received.push(data),
+    });
+    await deliver(
+      transport,
+      JSON.stringify({
+        type: "e2ee_hello",
+        key: exportPublicKey(clientKeyPair.publicKey),
+        capabilities: { binaryCiphertext: true },
+      }),
+    );
+    const channel = await channelPromise;
+    const sharedKey = deriveSharedKey(clientKeyPair.secretKey, daemonKeyPair.publicKey);
+
+    await deliver(transport, encrypt(sharedKey, "before"));
+    await expect(deliver(transport, new Uint8Array(64).buffer)).resolves.toBeUndefined();
+    await deliver(transport, encrypt(sharedKey, "after"));
+
+    expect(received.map(asText)).toEqual(["before"]);
+    expect(transport.closes).toEqual([{ code: 1011, reason: "Decryption failed" }]);
+    expect(channel.isOpen()).toBe(false);
   });
 });
