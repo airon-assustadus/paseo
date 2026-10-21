@@ -1109,8 +1109,9 @@ const PUSH_TOKEN_REVOCATION_TIMEOUT_MS = 2_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 // Close codes this client sends. A browser WebSocket.close() throws for any code other than 1000 or
 // 3000-4999, and this client runs in browsers, so the RFC 6455 1001/1002 are not usable here. Peers
-// only log the code (the relay replaces it with its own 1001 toward the daemon); 4000 + RFC code is
-// the app's convention for faults, and 4001 is already the E2EE handshake failure of the transport.
+// only log the code (the relay replaces it with its own 1001 toward the daemon). Faults use the RFC
+// code + 3000 (4002 here, 4008/4011 in the E2EE channel); 4001 is the transport's own code for a
+// failed E2EE handshake.
 const CLIENT_CLOSE_NORMAL = 1000;
 const CLIENT_CLOSE_PROTOCOL_ERROR = 4002;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5000;
