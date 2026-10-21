@@ -34,6 +34,8 @@ import {
  */
 
 export interface StartRelayBridgeStackOptions {
+  /** Private host metadata only; default off in R1/R2. */
+  bridgeDiagnostics?: boolean;
   shell: BridgeShell;
   /** Full origin of the page that will talk to the host; the host validates it. */
   allowedOrigin: string;
@@ -323,6 +325,7 @@ export async function startRelayBridgeStack(
       shell: options.shell,
       allowedOrigin: options.allowedOrigin,
       tcp: true,
+      diagnostics: options.bridgeDiagnostics,
     });
   } catch (error) {
     return unwind("host", error);
