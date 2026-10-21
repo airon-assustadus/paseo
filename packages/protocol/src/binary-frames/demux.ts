@@ -1,4 +1,5 @@
 import { decodeTunnelFrame, TunnelOpcode, type TunnelFrame } from "./tunnel.js";
+import { HOST_ROUTE_OPCODE, decodeHostRouteFrame, type HostRouteFrame } from "./host-route.js";
 import {
   decodeFileTransferFrame,
   FileTransferOpcode,
@@ -11,12 +12,17 @@ import {
 } from "./terminal.js";
 
 export type BinaryFrame =
+  | { kind: "host_route"; frame: HostRouteFrame }
   | { kind: "terminal"; frame: TerminalStreamFrame }
   | { kind: "file_transfer"; frame: FileTransferFrame }
   | { kind: "tunnel"; frame: TunnelFrame };
 
 export function decodeBinaryFrame(bytes: Uint8Array): BinaryFrame | null {
   switch (bytes[0]) {
+    case HOST_ROUTE_OPCODE: {
+      const frame = decodeHostRouteFrame(bytes);
+      return frame ? { kind: "host_route", frame } : null;
+    }
     case TerminalStreamOpcode.Output:
     case TerminalStreamOpcode.Input:
     case TerminalStreamOpcode.Resize:

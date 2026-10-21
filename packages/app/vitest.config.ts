@@ -116,6 +116,7 @@ export default defineConfig({
       deps: {
         fallbackCJS: true,
         inline: [
+          "react-native-enriched-markdown",
           "zustand",
           "@tanstack/react-query",
           "react-native-web",
