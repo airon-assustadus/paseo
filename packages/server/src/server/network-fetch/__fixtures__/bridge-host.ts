@@ -36,6 +36,12 @@ import {
   MAX_LENGTH_PREFIXED_FRAME_BYTES,
 } from "./length-prefixed.js";
 import type { FixtureEvent, FixtureEventKind, FixtureRecorder } from "./recorder.js";
+import {
+  createBridgeTrace,
+  type BridgeTrace,
+  type BridgeTraceKind,
+  type BridgeTraceSnapshot,
+} from "./bridge-trace.js";
 import type { FixtureLimits } from "./routes.js";
 import { startWebProxyFixture, type WebProxyFixture } from "./web-proxy-fixture.js";
 
@@ -154,6 +160,8 @@ export interface BridgeHostHarnessOptions {
 }
 
 export interface StartBridgeHostOptions {
+  /** Bounded metadata for the private lab operator; never sent by the bridge protocol. */
+  diagnostics?: boolean;
   shell: BridgeShell;
   /** Full origin of the test page; `new URL(o).origin === o`. */
   allowedOrigin: string;
@@ -223,6 +231,7 @@ export interface BridgeHostStats {
 }
 
 export interface BridgeHost extends BridgeHostInfo {
+  diagnostics(): BridgeTraceSnapshot;
   readonly stats: BridgeHostStats;
   /** Node-side handle for the host's own tests; never serialized to the page. */
   readonly backend: WebProxyFixture;
@@ -339,6 +348,7 @@ interface BridgeTransport {
 }
 
 interface BridgeRuntime {
+  trace: BridgeTrace;
   token: Buffer;
   allowlists: AllowlistStore;
   limits: NetworkFetchLimits;
@@ -384,6 +394,7 @@ async function openBridgeHost(
   const harness = options.harness ?? {};
   const opened: OpenedResources = { static: null, backend: null, ws: null, tcp: null };
   const connections = new Set<BridgeConnection>();
+  const trace = createBridgeTrace(options.diagnostics === true);
   let closing: Promise<void> | null = null;
 
   function listeners(): ManagedServer[] {
@@ -463,6 +474,7 @@ async function openBridgeHost(
       return closing === null && unauthenticated < BRIDGE_MAX_UNAUTHENTICATED;
     }
     const runtime: BridgeRuntime = {
+      trace,
       token,
       allowlists: bridgeAllowlists(backend, harness.extraAllowlistTargets ?? []),
       limits,
@@ -547,6 +559,7 @@ async function openBridgeHost(
           truncatedFrames: counters.truncatedFrames,
         };
       },
+      diagnostics: () => trace.snapshot(),
       duplicateNextRequest: () => {
         runtime.duplicateArmed = true;
       },
@@ -815,6 +828,16 @@ function refuse(socket: Duplex, status: RefusalStatus): void {
 }
 
 function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): BridgeConnection {
+  const connectionId = runtime.counters.connections;
+  function record(
+    phase: "in" | "attempt" | "accepted" | "threw" | "lifecycle",
+    kind: BridgeTraceKind,
+    requestId: number | null = null,
+    bytes: number | null = null,
+  ): void {
+    runtime.trace.record({ connection: connectionId, phase, kind, requestId, bytes });
+  }
+  record("lifecycle", "connection");
   let state: ConnectionState = "upgraded";
   let session: NetworkFetchSession | null = null;
   let hostClosing = false;
@@ -865,6 +888,7 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
       terminate(1008);
     },
     close: () => {
+      record("lifecycle", "transport_close");
       clearHelloTimer();
       releaseUnauthenticatedSlot();
       state = "closed";
@@ -900,6 +924,7 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
   /** Closes the connection and its session; a second call is a no-op. */
   function terminate(code: 1003 | 1008 | 1013): void {
     if (state === "closed") return;
+    record("lifecycle", "terminate");
     state = "closed";
     clearHelloTimer();
     releaseUnauthenticatedSlot();
@@ -920,8 +945,38 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
       terminate(1013);
       return false;
     }
-    transport.send(payload);
+    recordOutbound(frame, "attempt");
+    try {
+      transport.send(payload);
+    } catch (error) {
+      recordOutbound(frame, "threw");
+      throw error;
+    }
+    recordOutbound(frame, "accepted");
     return true;
+  }
+
+  function recordOutbound(
+    frame: BridgeOutboundFrame,
+    phase: "attempt" | "accepted" | "threw",
+  ): void {
+    switch (frame.type) {
+      case "body":
+        record(phase, "body", frame.requestId, Buffer.byteLength(frame.data, "base64"));
+        return;
+      case "uploadCredit":
+        record(phase, "uploadCredit", frame.requestId, frame.bytes);
+        return;
+      case "head":
+      case "end":
+      case "fail":
+      case "cancelled":
+        record(phase, frame.type, frame.requestId);
+        return;
+      case "closed":
+      case "protocol_error":
+        record(phase, frame.type);
+    }
   }
 
   function onText(text: string): void {
@@ -939,18 +994,23 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
         openSession(frame.scope, frame.ttlMs, frame.limits);
         return;
       case "request":
+        record("in", "request", frame.request.requestId);
         dispatchRequest(frame.request);
         return;
       case "body":
+        record("in", "body", frame.requestId, frame.data.byteLength);
         withOpenSession((open) => open.writeBody(frame.requestId, frame.data));
         return;
       case "endBody":
+        record("in", "endBody", frame.requestId);
         withOpenSession((open) => open.endBody(frame.requestId));
         return;
       case "cancel":
+        record("in", "cancel", frame.requestId);
         cancel(frame.requestId);
         return;
       case "grantCredit":
+        record("in", "grantCredit", frame.requestId, frame.bytes);
         withOpenSession((open) => {
           open.grantCredit(frame.requestId, frame.bytes);
           const counted = credited.get(frame.requestId);
@@ -1127,6 +1187,7 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
   }
 
   async function shutdown(): Promise<void> {
+    record("lifecycle", "shutdown");
     hostClosing = true;
     if (session !== null) {
       const open = session;

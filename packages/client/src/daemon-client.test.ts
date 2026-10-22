@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { afterEach, expect, expectTypeOf, test, vi } from "vitest";
 import { z } from "zod";
+import { createWebSocketTransportFactory } from "./daemon-client-websocket-transport";
+import type { WebSocketLike } from "./daemon-client-transport-types";
 import {
   DaemonClient,
   supportsUsageReports,
@@ -8635,4 +8637,136 @@ test("remote browser attachments end when the transport disconnects", async () =
   const { attachment, transport } = await openRemoteBrowserWithFrames([remoteFrame(0)]);
   transport.triggerClose({ code: 1006 });
   expect(attachment.ended).toEqual({ kind: "disconnected", reason: "disconnected" });
+});
+
+// A browser WebSocket.close() throws before anything reaches the wire: InvalidAccessError unless the
+// code is 1000 or 3000..4999, SyntaxError when the reason exceeds 123 UTF-8 bytes. This socket
+// reproduces that algorithm and the browser event model, so the real wrapper takes its
+// addEventListener path and the DaemonClient's close is only recorded when a browser would send it.
+interface BrowserLikeWebSocket extends WebSocketLike {
+  closes: Array<{ code: number | undefined; reason: string | undefined }>;
+  open(): void;
+  receive(data: string | ArrayBuffer): void;
+  listenerCount(): number;
+}
+
+function createBrowserLikeWebSocket(): BrowserLikeWebSocket {
+  const listeners = new Map<string, Set<(event: unknown) => void>>();
+  const dispatch = (event: string, payload: unknown) => {
+    for (const listener of listeners.get(event) ?? []) listener(payload);
+  };
+  const ws: BrowserLikeWebSocket = {
+    readyState: 0,
+    binaryType: "blob",
+    closes: [],
+    send: vi.fn(),
+    close(code?: number, reason?: string) {
+      if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
+        throw new DOMException(
+          `The code must be either 1000, or between 3000 and 4999. ${code} is neither.`,
+          "InvalidAccessError",
+        );
+      }
+      if (reason !== undefined && new TextEncoder().encode(reason).byteLength > 123) {
+        throw new DOMException(
+          "The close reason must not be greater than 123 UTF-8 bytes.",
+          "SyntaxError",
+        );
+      }
+      if (ws.readyState >= 2) return;
+      ws.readyState = 2;
+      ws.closes.push({ code, reason });
+      queueMicrotask(() => {
+        ws.readyState = 3;
+        dispatch("close", { code: code ?? 1005, reason: reason ?? "", wasClean: true });
+      });
+    },
+    addEventListener(event, listener) {
+      let set = listeners.get(event);
+      if (!set) {
+        set = new Set();
+        listeners.set(event, set);
+      }
+      set.add(listener);
+    },
+    removeEventListener(event, listener) {
+      listeners.get(event)?.delete(listener);
+    },
+    open() {
+      ws.readyState = 1;
+      dispatch("open", {});
+    },
+    receive(data) {
+      dispatch("message", { data });
+    },
+    listenerCount() {
+      let count = 0;
+      for (const set of listeners.values()) count += set.size;
+      return count;
+    },
+  };
+  return ws;
+}
+
+const BROWSER_SERVER_INFO = JSON.stringify({
+  type: "session",
+  message: {
+    type: "status",
+    payload: {
+      status: "server_info",
+      serverId: "srv_test_browser_socket",
+      hostname: null,
+      version: null,
+      features: { ownedSubscriptions: true },
+    },
+  },
+});
+
+test("closes a browser socket with a code the browser sends when the connect times out", async () => {
+  const sockets: BrowserLikeWebSocket[] = [];
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_browser_socket_timeout",
+    connectTimeoutMs: 50,
+    reconnect: { enabled: true, baseDelayMs: 1, maxDelayMs: 1 },
+    transportFactory: createWebSocketTransportFactory(() => {
+      const ws = createBrowserLikeWebSocket();
+      sockets.push(ws);
+      return ws;
+    }),
+  });
+  clients.push(client);
+
+  void client.connect().catch(() => undefined);
+  await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+
+  const first = sockets[0];
+  expect(first.closes).toEqual([{ code: 1000, reason: "Connection timed out" }]);
+  await vi.waitFor(() => expect(first.readyState).toBe(3));
+  expect(first.listenerCount()).toBe(0);
+});
+
+test("closes a browser socket with an application code after a tunnel protocol error", async () => {
+  const ws = createBrowserLikeWebSocket();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_browser_socket_protocol",
+    reconnect: { enabled: false },
+    transportFactory: createWebSocketTransportFactory(() => ws),
+  });
+  clients.push(client);
+
+  const connecting = client.connect();
+  ws.open();
+  ws.receive(BROWSER_SERVER_INFO);
+  await connecting;
+  expect(client.getConnectionState().status).toBe("connected");
+
+  ws.receive(new Uint8Array([TunnelOpcode.Data, 0]).buffer);
+
+  await vi.waitFor(() => expect(ws.closes).toHaveLength(1));
+  expect(ws.closes).toEqual([{ code: 4002, reason: "Malformed network tunnel frame" }]);
+  expect(client.getConnectionState().status).not.toBe("connected");
+  await vi.waitFor(() => expect(ws.readyState).toBe(3));
+  expect(ws.listenerCount()).toBe(0);
 });

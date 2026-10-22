@@ -16,6 +16,7 @@ import {
 } from "./bridge-host.js";
 import { encodeLengthPrefixed, LengthPrefixedReader } from "./length-prefixed.js";
 import { FixtureRecorder, type FixtureEvent } from "./recorder.js";
+import { createBridgeTrace } from "./bridge-trace.js";
 
 const closers: Array<() => Promise<void>> = [];
 
@@ -27,6 +28,46 @@ const ALLOWED_ORIGIN = "http://localhost:4173";
 const SHELL = { bootstrapJs: "// bootstrap bundle", workerJs: "// worker bundle" };
 const HELLO_TIMEOUT_MS = 200;
 const WAIT_MS = 10_000;
+
+describe("private bridge trace", () => {
+  it("keeps bounded detached metadata and marks lost history", () => {
+    const trace = createBridgeTrace(true, () => 12.9);
+    const event = {
+      connection: 1,
+      phase: "in" as const,
+      kind: "request" as const,
+      requestId: 2,
+      bytes: null,
+      token: "sentinel-authority",
+    };
+    for (let i = 0; i < 515; i += 1) trace.record(event);
+    const snapshot = trace.snapshot();
+    expect(snapshot.dropped).toBe(3);
+    expect(snapshot.events).toHaveLength(512);
+    expect(snapshot.events[0]).toEqual({
+      sequence: 4,
+      at: 12,
+      connection: 1,
+      phase: "in",
+      kind: "request",
+      requestId: 2,
+      bytes: null,
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("sentinel-authority");
+    snapshot.events[0]!.connection = 99;
+    expect(trace.snapshot().events[0]!.connection).toBe(1);
+    expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeLessThan(128 * 1024);
+  });
+
+  it("defaults to an empty disabled trace and separates lifetimes", async () => {
+    const host = await startHost();
+    await openSession(host);
+    expect(host.diagnostics()).toMatchObject({ enabled: false, dropped: 0, events: [] });
+    expect(createBridgeTrace(true).snapshot().instance).not.toBe(
+      createBridgeTrace(true).snapshot().instance,
+    );
+  });
+});
 
 async function startHost(overrides: Partial<StartBridgeHostOptions> = {}): Promise<BridgeHost> {
   const host = await startBridgeHost({
@@ -679,7 +720,7 @@ describe("authentication", () => {
 
   it("closes with 1008 on a wrong, short, long or malformed token and on frames before hello", async () => {
     const host = await startHost({ harness: { helloTimeoutMs: WAIT_MS } });
-    const wrongToken = `${host.token.slice(0, 42)}${host.token.endsWith("A") ? "B" : "A"}`;
+    const wrongToken = `${host.token.startsWith("A") ? "B" : "A"}${host.token.slice(1)}`;
     const attempts: unknown[] = [
       { type: "harness.hello", token: wrongToken },
       { type: "harness.hello", token: host.token.slice(0, 42) },
@@ -989,7 +1030,7 @@ describe("requests", () => {
   });
 
   it("uploads a body only in base64 chunks within the limits", async () => {
-    const host = await startHost();
+    const host = await startHost({ diagnostics: true });
     const client = await openSession(host);
     const payload = Buffer.from("bridge upload body");
     client.send(
@@ -1018,6 +1059,32 @@ describe("requests", () => {
       violation: "unknown_request",
     });
     expect(await client.closed).toEqual({ code: 1008, reason: "" });
+    const trace = host.diagnostics();
+    const receivedBody = trace.events.find(
+      (event) => event.phase === "in" && event.kind === "body",
+    );
+    const creditAttempt = trace.events.find(
+      (event) => event.phase === "attempt" && event.kind === "uploadCredit",
+    );
+    const creditAccepted = trace.events.find(
+      (event) => event.phase === "accepted" && event.kind === "uploadCredit",
+    );
+    expect(receivedBody).toMatchObject({ connection: 1, requestId: 1, bytes: payload.byteLength });
+    expect(creditAccepted).toMatchObject({
+      connection: 1,
+      requestId: 1,
+      bytes: payload.byteLength,
+    });
+    expect(receivedBody!.sequence).toBeLessThan(creditAttempt!.sequence);
+    expect(creditAttempt!.sequence).toBeLessThan(creditAccepted!.sequence);
+    expect(receivedBody!.at).toBeLessThanOrEqual(creditAccepted!.at);
+    expect(trace.dropped).toBe(0);
+    expect(trace.events.some((event) => event.kind === "end" && event.phase === "accepted")).toBe(
+      true,
+    );
+    expect(JSON.stringify(trace)).not.toContain(payload.toString());
+    expect(JSON.stringify(trace)).not.toContain(host.token);
+    expect(JSON.stringify(trace)).not.toContain(host.fixture.http.origin);
   });
 
   it("closes with 1013 when a frame would exceed the outbound budget", async () => {
@@ -1445,7 +1512,7 @@ describe("tcp", () => {
 
   it("drops the socket without a frame on a bad token, a silent peer or a bad prefix", async () => {
     const host = await startHost({ tcp: true });
-    const wrongToken = `${host.token.slice(0, 42)}${host.token.endsWith("A") ? "B" : "A"}`;
+    const wrongToken = `${host.token.startsWith("A") ? "B" : "A"}${host.token.slice(1)}`;
     const bad = await connectTcp(host);
     bad.send({ type: "harness.hello", token: wrongToken });
     await bad.closed;

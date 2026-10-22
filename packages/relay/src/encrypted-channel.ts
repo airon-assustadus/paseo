@@ -51,6 +51,8 @@ interface EncryptedChannelOptions {
    */
   daemonKeyPair?: KeyPair;
   binaryCiphertext?: boolean;
+  /** Defaults to the daemon's RFC 6455 codes; the client factory passes `CLIENT_CLOSE_CODES`. */
+  closeCodes?: ChannelCloseCodes;
 }
 
 interface E2EEHelloMessage {
@@ -117,8 +119,27 @@ function buildInvalidHelloError(rawText: string, parsed?: unknown): Error {
 
 const HANDSHAKE_RETRY_MS = 1000;
 const MAX_PENDING_SENDS = 200;
-const REHANDSHAKE_REJECTION_CODE = 1008;
+/** RFC 6455 ceiling: a browser throws SyntaxError and ws a RangeError for a longer reason. */
+const MAX_CLOSE_REASON_BYTES = 123;
 const ENCRYPTED_PAYLOAD_OVERHEAD_BYTES = 40;
+
+/** Close codes the channel sends when it ends the connection on its own fault. */
+export interface ChannelCloseCodes {
+  /** Decryption or protocol failure. */
+  internalError: number;
+  /** Re-handshake with a different key. */
+  policyViolation: number;
+}
+
+/** The daemon runs on Node's ws, which accepts the RFC 6455 codes; peers and logs know them. */
+export const DAEMON_CLOSE_CODES: ChannelCloseCodes = { internalError: 1011, policyViolation: 1008 };
+
+/**
+ * A browser WebSocket.close() throws InvalidAccessError for any code other than 1000 or
+ * 3000–4999, so the client channel sends application codes (RFC code + 3000, the app's convention)
+ * that every runtime accepts. The daemon only relays the code to its own close handler.
+ */
+export const CLIENT_CLOSE_CODES: ChannelCloseCodes = { internalError: 4011, policyViolation: 4008 };
 
 export function base64EncryptedWireByteLength(plaintextBytes: number): number {
   return 4 * Math.ceil((plaintextBytes + ENCRYPTED_PAYLOAD_OVERHEAD_BYTES) / 3);
@@ -160,7 +181,9 @@ export async function createClientChannel(
   const daemonPublicKey = importPublicKey(daemonPublicKeyB64);
   const sharedKey = deriveSharedKey(keyPair.secretKey, daemonPublicKey);
 
-  const channel = new EncryptedChannel(transport, sharedKey, events);
+  const channel = new EncryptedChannel(transport, sharedKey, events, {
+    closeCodes: CLIENT_CLOSE_CODES,
+  });
 
   // Send e2ee_hello with our public key
   const ourPublicKeyB64 = exportPublicKey(keyPair.publicKey);
@@ -324,6 +347,7 @@ export class EncryptedChannel {
   private events: EncryptedChannelEvents;
   private options: EncryptedChannelOptions;
   private pendingSends: Array<string | ArrayBuffer> = [];
+  private readonly closeCodes: ChannelCloseCodes;
   private onOpenCallbacks: Array<() => void> = [];
   private onCloseCallbacks: Array<() => void> = [];
 
@@ -337,6 +361,7 @@ export class EncryptedChannel {
     this.sharedKey = sharedKey;
     this.events = events;
     this.options = options;
+    this.closeCodes = options.closeCodes ?? DAEMON_CLOSE_CODES;
 
     Object.assign(transport, {
       onmessage: (message: TransportMessage) => this.handleMessage(message),
@@ -371,8 +396,7 @@ export class EncryptedChannel {
           } catch (error) {
             const err = error instanceof Error ? error : new Error(String(error));
             this.events.onerror?.(err);
-            this.state = "closed";
-            this.transport.close(1011, err.message);
+            this.closeOnFault("internalError", err.message);
           }
         }
       } catch {
@@ -452,9 +476,9 @@ export class EncryptedChannel {
       // re-handshake. Emitting an error event here can cause higher-level code
       // to tear down the session without triggering a clean reconnect.
       try {
-        this.transport.close(1011, err.message);
+        this.closeOnFault("internalError", err.message);
       } catch {
-        // ignore
+        // The channel is already closed above; only the socket's own close can still fail.
       }
     }
   }
@@ -520,13 +544,21 @@ export class EncryptedChannel {
   }
 
   private rejectKeyRotation(): void {
+    this.closeOnFault("policyViolation", REHANDSHAKE_KEY_MISMATCH_CLOSE_REASON);
+  }
+
+  /**
+   * Ends the connection on the channel's own fault. The state turns closed first, so a transport
+   * that still refuses the close leaves no channel delivering or accepting frames behind it.
+   */
+  private closeOnFault(kind: keyof ChannelCloseCodes, reason: string): void {
     this.state = "closed";
-    this.transport.close(REHANDSHAKE_REJECTION_CODE, REHANDSHAKE_KEY_MISMATCH_CLOSE_REASON);
+    this.transport.close(this.closeCodes[kind], boundCloseReason(reason));
   }
 
   close(code = 1000, reason = "Normal closure"): void {
     this.state = "closed";
-    this.transport.close(code, reason);
+    this.transport.close(code, boundCloseReason(reason));
   }
 
   isOpen(): boolean {
@@ -540,6 +572,16 @@ export class EncryptedChannel {
   onClose(cb: () => void): void {
     this.onCloseCallbacks.push(cb);
   }
+}
+
+/** Cuts a reason to the RFC 6455 ceiling at a UTF-8 character boundary. */
+function boundCloseReason(reason: string): string {
+  const bytes = new TextEncoder().encode(reason);
+  if (bytes.byteLength <= MAX_CLOSE_REASON_BYTES) return reason;
+  let end = MAX_CLOSE_REASON_BYTES;
+  // A continuation byte (10xxxxxx) at the cut means the cut would split a character.
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return new TextDecoder().decode(bytes.subarray(0, end));
 }
 
 function decodeTransportText(data: string | ArrayBuffer): string {
