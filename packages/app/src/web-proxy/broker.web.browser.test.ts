@@ -99,8 +99,10 @@ function requestedUrls(transport: FixtureTransport): string[] {
   return transport.requests.map((request) => request.url);
 }
 
-function grants(states: WebProxyBrokerState[]): WebProxyBrokerState[] {
-  return states.filter((state) => state.status === "granted");
+// Lifecycle updates republish a granted state; each generation is granted once.
+function grantedGenerations(states: WebProxyBrokerState[]): number[] {
+  const granted = states.filter((state) => state.status === "granted");
+  return [...new Set(granted.map((state) => state.generation))];
 }
 
 function appendFrame(src: string): HTMLIFrameElement {
@@ -166,8 +168,8 @@ describe("web proxy broker and shell", () => {
     ]);
 
     // The app re-sent hello from the bootstrap's realm and its own: one grant only.
-    expect(grants(states)).toEqual([{ status: "granted", generation: 1 }]);
-    expect(broker.getState()).toEqual({ status: "granted", generation: 1 });
+    expect(grantedGenerations(states)).toEqual([1]);
+    expect(broker.getState()).toMatchObject({ status: "granted", generation: 1 });
 
     // Subresources race each other through the worker; the set is what the app asked for.
     const paths = transport.requests.map((request) => new URL(request.url).pathname);
@@ -294,7 +296,7 @@ describe("web proxy broker and shell", () => {
         }),
       SLOW,
     );
-    expect(grants(states)).toEqual([]);
+    expect(grantedGenerations(states)).toEqual([]);
     expect(broker.getFrame()).toBeNull();
   }, 30_000);
 
@@ -349,7 +351,7 @@ describe("web proxy broker and shell", () => {
     );
     expect(broker.getFrame()).toBeNull();
     expect(container.querySelector("iframe")).toBeNull();
-    expect(grants(states)).toEqual([{ status: "granted", generation: 1 }]);
+    expect(grantedGenerations(states)).toEqual([1]);
     expect(broker.getState().status).toBe("revoked");
     expect(transport.requests.map((request) => new URL(request.url).pathname)).toEqual(["/"]);
   }, 30_000);
@@ -369,7 +371,7 @@ describe("web proxy broker and shell", () => {
     const [result] = await waitForMessages(CONTENT_A, "fixture.hang", 1);
     expect(result).toEqual({ type: "fixture.hang", status: 504, code: "bridge_timeout" });
     await transport.waitForHangAbort();
-    expect(broker.getState()).toEqual({ status: "granted", generation: 1 });
+    expect(broker.getState()).toMatchObject({ status: "granted", generation: 1 });
   }, 30_000);
 
   it("hands out a new generation on reopen and never reuses the previous port", async () => {
@@ -378,10 +380,7 @@ describe("web proxy broker and shell", () => {
     broker.revoke("disposed");
     broker.reopen();
     await waitForMessages(CONTENT_A, "fixture.report", 2);
-    expect(grants(states)).toEqual([
-      { status: "granted", generation: 1 },
-      { status: "granted", generation: 2 },
-    ]);
+    expect(grantedGenerations(states)).toEqual([1, 2]);
     const generations = new Set(transport.requests.map((request) => request.initiator.generation));
     expect(generations).toEqual(new Set([1, 2]));
     const last = transport.requests.at(-1);

@@ -1,21 +1,70 @@
 import {
   DEFAULT_BRIDGE_LIMITS,
+  createLifecycleToken,
   parseHello,
+  parseLifecycleToBroker,
+  parseResumed,
   validateBridgeLimits,
   type BridgeLimits,
   type BridgeRevokeReason,
+  type LifecycleSuspendReason,
+  type LifecycleToBrokerMessage,
+  type LifecycleToShellMessage,
+  type NavigationDroppedMessage,
   type PortGrantMessage,
 } from "./bridge-messages";
 import { startPortSession, type PortSession } from "./port-session.web";
 import { createCapability, type WebProxyCapability } from "./request-policy";
 import type { WebProxyTransport } from "./transport";
 
+export type WebProxyLifecycle = "negotiating" | "ready" | "unavailable";
+
+export interface WebProxyNavigationDrops {
+  head_timeout: number;
+  transport_closed: number;
+  suspended: number;
+}
+
+export type WebProxyResumeFailure =
+  | "not_suspended"
+  | "ack_timeout"
+  | "ack_invalid"
+  | "ack_port_closed"
+  | "transport_lost"
+  | "terminal";
+
+export type WebProxyTerminalCause = "ack_timeout" | "ack_invalid" | "ack_port_closed";
+
+interface LifecycleFields {
+  lifecycle: WebProxyLifecycle;
+  workerArmed: boolean;
+  navigationDrops: WebProxyNavigationDrops;
+}
+
 export type WebProxyBrokerState =
   | { status: "loading"; generation: number }
   | { status: "awaiting_hello"; generation: number }
-  | { status: "granted"; generation: number }
+  | ({ status: "granted"; generation: number } & LifecycleFields)
+  | ({
+      status: "suspended";
+      generation: number;
+      reason: LifecycleSuspendReason;
+      // From the shell's paseo.web.suspended; null until it arrives.
+      documentKept: boolean | null;
+      lastResumeFailure: "transport_lost" | null;
+    } & LifecycleFields)
+  | ({ status: "resuming"; previous: number; generation: number } & LifecycleFields)
   | { status: "failed"; generation: number; reason: "handshake_timeout" }
-  | { status: "revoked"; generation: number; reason: BridgeRevokeReason };
+  | {
+      status: "revoked";
+      generation: number;
+      reason: BridgeRevokeReason;
+      cause?: WebProxyTerminalCause;
+    };
+
+export type WebProxyResumeResult =
+  | { kind: "resumed"; previous: number; generation: number; documentPreserved: boolean }
+  | { kind: "failed"; reason: WebProxyResumeFailure };
 
 export interface WebProxyBrokerOptions {
   capability: WebProxyCapability;
@@ -38,6 +87,12 @@ export interface WebProxyBroker {
   revoke(reason: BridgeRevokeReason): void;
   reopen(): void;
   dispose(): void;
+  // Ends the current generation's authority synchronously and keeps the document, without
+  // input. False when the shell has no lifecycle: the caller then revokes as before.
+  suspend(reason: LifecycleSuspendReason): boolean;
+  // Hands a new generation, served by `transport`, to the suspended shell. Authority starts
+  // only with the shell's acknowledgement on the new port.
+  resume(input: { transport: WebProxyTransport }): Promise<WebProxyResumeResult>;
 }
 
 export class WebProxyBrokerSetupError extends Error {
@@ -61,6 +116,32 @@ function isTerminal(state: WebProxyBrokerState): boolean {
   return state.status === "revoked" || state.status === "failed";
 }
 
+// A refused acknowledgement ends the view with a reason the wire already has.
+const TERMINAL_WIRE_REASON: Record<WebProxyTerminalCause, BridgeRevokeReason> = {
+  ack_invalid: "protocol_error",
+  ack_port_closed: "port_closed",
+  ack_timeout: "protocol_error",
+};
+
+// The side port belongs to the shell instance: it travels inside the first generation's request
+// port and outlives generations.
+interface SidePort {
+  port: MessagePort;
+  offer: string;
+  generation: number;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+interface Resumption {
+  previous: number;
+  generation: number;
+  port: MessagePort;
+  transport: WebProxyTransport;
+  timer: ReturnType<typeof setTimeout>;
+  lost: LifecycleSuspendReason | null;
+  settle(result: WebProxyResumeResult): void;
+}
+
 // Lives on the control origin. It is the only code that holds both the transport and a frame
 // of the content origin, and the content only ever sees one MessagePort per generation.
 export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBroker {
@@ -81,10 +162,30 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
   let frame: HTMLIFrameElement | null = null;
   let session: PortSession | null = null;
   let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  let side: SidePort | null = null;
+  let resumption: Resumption | null = null;
+  let lifecycle: WebProxyLifecycle = "negotiating";
+  let workerArmed = false;
+  const navigationDrops: WebProxyNavigationDrops = {
+    head_timeout: 0,
+    transport_closed: 0,
+    suspended: 0,
+  };
+  const suspendedDropGenerations = new Set<number>();
 
   function setState(next: WebProxyBrokerState): void {
     state = next;
     options.onStateChange?.(next);
+  }
+
+  function lifecycleFields(): LifecycleFields {
+    return { lifecycle, workerArmed, navigationDrops: { ...navigationDrops } };
+  }
+
+  function publishLifecycle(): void {
+    if (state.status === "granted" || state.status === "suspended" || state.status === "resuming") {
+      setState({ ...state, ...lifecycleFields() });
+    }
   }
 
   function clearHandshakeTimer(): void {
@@ -92,20 +193,60 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     handshakeTimer = null;
   }
 
+  function closeSidePort(): void {
+    if (side === null) return;
+    if (side.timer !== null) clearTimeout(side.timer);
+    side.port.removeEventListener("message", onSideMessage);
+    side.port.removeEventListener("messageerror", onSideMessageError);
+    side.port.removeEventListener("close", onSidePortClosed);
+    side.port.close();
+    side = null;
+  }
+
+  function sendToShell(message: LifecycleToShellMessage, transfer: Transferable[] = []): void {
+    side?.port.postMessage(message, transfer);
+  }
+
+  // Takes the pending resumption out of play: its port closes, a late acknowledgement is lost.
+  function abandonResumption(result: WebProxyResumeResult): void {
+    const current = resumption;
+    if (current === null) return;
+    resumption = null;
+    clearTimeout(current.timer);
+    current.port.removeEventListener("message", onAdoptionMessage);
+    current.port.removeEventListener("messageerror", onAdoptionMessageError);
+    current.port.removeEventListener("close", onAdoptionPortClosed);
+    current.port.close();
+    current.settle(result);
+  }
+
   // Ending a generation also unloads whatever the content origin left in the frame.
   function terminate(next: WebProxyBrokerState): void {
     clearHandshakeTimer();
+    abandonResumption({ kind: "failed", reason: "terminal" });
+    closeSidePort();
     setState(next);
     frame?.remove();
     frame = null;
   }
 
-  function revoke(reason: BridgeRevokeReason): void {
+  function revoke(reason: BridgeRevokeReason, cause?: WebProxyTerminalCause): void {
     if (isTerminal(state)) return;
     const current = session;
     session = null;
     current?.revoke(reason);
-    terminate({ status: "revoked", generation: state.generation, reason });
+    const generation = state.generation;
+    terminate(
+      cause === undefined
+        ? { status: "revoked", generation, reason }
+        : { status: "revoked", generation, reason, cause },
+    );
+  }
+
+  // The seam the authoritative revocation reuses: authority ends, the frame stays.
+  function fence(): void {
+    session?.quiesce();
+    if (frame !== null) frame.inert = true;
   }
 
   function createFrame(): HTMLIFrameElement {
@@ -146,29 +287,242 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     options.container.appendChild(frame);
   }
 
-  function grant(target: Window): void {
-    clearHandshakeTimer();
-    const channel = new MessageChannel();
-    const generation = state.generation;
-    const granted = startPortSession({
-      port: channel.port1,
+  function startSession(input: {
+    port: MessagePort;
+    generation: number;
+    transport: WebProxyTransport;
+  }): PortSession {
+    const { generation } = input;
+    const started = startPortSession({
+      port: input.port,
       generation,
       capability,
       limits,
-      transport: options.transport,
+      transport: input.transport,
       onRevoked: (reason) => {
         // Revocations started by the session itself (protocol errors) end the generation too.
-        if (session !== granted) return;
+        if (session !== started) return;
         session = null;
         terminate({ status: "revoked", generation, reason });
       },
       onRedirectBlocked: (requestUrl) => options.onRedirectBlocked?.(requestUrl),
+      // While a new generation is being adopted, the shell drops this port on its own.
+      closePolicy: () =>
+        session === started && state.status !== "resuming" ? "terminal" : "discard",
     });
+    return started;
+  }
+
+  function offerLifecycle(granted: PortSession, generation: number): void {
+    const channel = new MessageChannel();
+    const offered: SidePort = {
+      port: channel.port1,
+      offer: createLifecycleToken(),
+      generation,
+      timer: null,
+    };
+    side = offered;
+    // COMPAT(web-proxy-lifecycle): a shell published before the lifecycle never accepts and
+    // its losses revoke as before; remove after the minimum published shell accepts.
+    offered.timer = setTimeout(() => {
+      offered.timer = null;
+      if (side !== offered || lifecycle !== "negotiating") return;
+      closeSidePort();
+      lifecycle = "unavailable";
+      publishLifecycle();
+    }, options.handshakeTimeoutMs);
+    channel.port1.addEventListener("message", onSideMessage);
+    channel.port1.addEventListener("messageerror", onSideMessageError);
+    channel.port1.addEventListener("close", onSidePortClosed);
+    channel.port1.start();
+    granted.offerLifecycle(channel.port2, offered.offer);
+  }
+
+  function grant(target: Window): void {
+    clearHandshakeTimer();
+    const channel = new MessageChannel();
+    const generation = state.generation;
+    const granted = startSession({ port: channel.port1, generation, transport: options.transport });
     session = granted;
+    lifecycle = "negotiating";
+    workerArmed = false;
     const message: PortGrantMessage = { type: "paseo.web.port", v: 1, generation, limits };
-    setState({ status: "granted", generation });
+    setState({ status: "granted", generation, ...lifecycleFields() });
     // An exact target origin: if the frame navigated elsewhere meanwhile, nothing is delivered.
     target.postMessage(message, capability.contentOrigin, [channel.port2]);
+    offerLifecycle(granted, generation);
+  }
+
+  function countDrop(message: NavigationDroppedMessage): void {
+    if (message.cause === "suspended") {
+      if (suspendedDropGenerations.has(message.generation)) return;
+      suspendedDropGenerations.add(message.generation);
+    }
+    navigationDrops[message.cause] += 1;
+    publishLifecycle();
+  }
+
+  function acceptSideMessage(message: LifecycleToBrokerMessage): boolean {
+    if (message.type === "paseo.web.lifecycle.accept") {
+      const isOffered =
+        lifecycle === "negotiating" &&
+        side !== null &&
+        message.generation === side.generation &&
+        message.offer === side.offer;
+      if (!isOffered || side === null) return false;
+      if (side.timer !== null) clearTimeout(side.timer);
+      side.timer = null;
+      lifecycle = "ready";
+      publishLifecycle();
+      return true;
+    }
+    if (lifecycle !== "ready") return false;
+    if (message.type === "paseo.web.lifecycle.state") {
+      workerArmed = message.workerArmed;
+      publishLifecycle();
+      return true;
+    }
+    if (message.type === "paseo.web.navigation.dropped") {
+      countDrop(message);
+      return true;
+    }
+    // Informative, and it may race a newer generation; only the matching one is recorded.
+    if (
+      state.status === "suspended" &&
+      state.generation === message.generation &&
+      state.documentKept === null
+    ) {
+      setState({ ...state, documentKept: message.documentKept });
+    }
+    return true;
+  }
+
+  // The side port carries content from the content origin: a malformed message ends the view.
+  function onSideMessage(event: MessageEvent): void {
+    const message = parseLifecycleToBroker(event.data);
+    if (message === null || event.ports.length > 0 || !acceptSideMessage(message)) {
+      revoke("protocol_error");
+    }
+  }
+
+  function onSideMessageError(): void {
+    revoke("protocol_error");
+  }
+
+  function onSidePortClosed(): void {
+    if (state.status === "suspended" || state.status === "resuming") {
+      revoke("port_closed");
+      return;
+    }
+    closeSidePort();
+    lifecycle = "unavailable";
+    publishLifecycle();
+  }
+
+  function suspend(reason: LifecycleSuspendReason): boolean {
+    if (state.status === "resuming" && resumption !== null) {
+      resumption.lost ??= reason;
+      return true;
+    }
+    if (state.status !== "granted" || lifecycle !== "ready" || session === null) return false;
+    const { generation } = state;
+    fence();
+    setState({
+      status: "suspended",
+      generation,
+      reason,
+      documentKept: null,
+      lastResumeFailure: null,
+      ...lifecycleFields(),
+    });
+    sendToShell({ type: "paseo.web.suspend", v: 1, generation, reason });
+    return true;
+  }
+
+  function refuseAdoption(cause: WebProxyTerminalCause): void {
+    abandonResumption({ kind: "failed", reason: cause });
+    revoke(TERMINAL_WIRE_REASON[cause], cause);
+  }
+
+  function adopt(current: Resumption, documentKept: boolean): void {
+    resumption = null;
+    clearTimeout(current.timer);
+    current.port.removeEventListener("message", onAdoptionMessage);
+    current.port.removeEventListener("messageerror", onAdoptionMessageError);
+    current.port.removeEventListener("close", onAdoptionPortClosed);
+    session?.discard();
+    const { previous, generation, lost } = current;
+    const adopted = startSession({ port: current.port, generation, transport: current.transport });
+    session = adopted;
+    if (lost !== null) {
+      // The candidate leg died before the acknowledgement: the new generation is born fenced.
+      adopted.quiesce();
+      setState({
+        status: "suspended",
+        generation,
+        reason: lost,
+        documentKept: null,
+        lastResumeFailure: "transport_lost",
+        ...lifecycleFields(),
+      });
+      sendToShell({ type: "paseo.web.suspend", v: 1, generation, reason: lost });
+      current.settle({ kind: "failed", reason: "transport_lost" });
+      return;
+    }
+    if (frame !== null) frame.inert = false;
+    setState({ status: "granted", generation, ...lifecycleFields() });
+    current.settle({ kind: "resumed", previous, generation, documentPreserved: documentKept });
+  }
+
+  // The first message on the new port must be the acknowledgement, and nothing else.
+  function onAdoptionMessage(event: MessageEvent): void {
+    const current = resumption;
+    if (current === null) return;
+    const message = parseResumed(event.data);
+    const isAcknowledgement =
+      message !== null &&
+      event.ports.length === 0 &&
+      message.previous === current.previous &&
+      message.generation === current.generation;
+    if (!isAcknowledgement || message === null) {
+      refuseAdoption("ack_invalid");
+      return;
+    }
+    adopt(current, message.documentKept);
+  }
+
+  function onAdoptionMessageError(): void {
+    refuseAdoption("ack_port_closed");
+  }
+
+  function onAdoptionPortClosed(): void {
+    refuseAdoption("ack_port_closed");
+  }
+
+  function resume(input: { transport: WebProxyTransport }): Promise<WebProxyResumeResult> {
+    if (state.status !== "suspended") {
+      return Promise.resolve({ kind: "failed", reason: "not_suspended" });
+    }
+    const previous = state.generation;
+    const generation = previous + 1;
+    const channel = new MessageChannel();
+    const settled = Promise.withResolvers<WebProxyResumeResult>();
+    resumption = {
+      previous,
+      generation,
+      port: channel.port1,
+      transport: input.transport,
+      timer: setTimeout(() => refuseAdoption("ack_timeout"), options.handshakeTimeoutMs),
+      lost: null,
+      settle: settled.resolve,
+    };
+    channel.port1.addEventListener("message", onAdoptionMessage);
+    channel.port1.addEventListener("messageerror", onAdoptionMessageError);
+    channel.port1.addEventListener("close", onAdoptionPortClosed);
+    channel.port1.start();
+    setState({ status: "resuming", previous, generation, ...lifecycleFields() });
+    sendToShell({ type: "paseo.web.resume", v: 1, previous, generation, limits }, [channel.port2]);
+    return settled.promise;
   }
 
   function onWindowMessage(event: MessageEvent): void {
@@ -194,10 +548,12 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
   return {
     getFrame: () => frame,
     getState: () => state,
-    revoke,
+    revoke: (reason) => revoke(reason),
     reopen: () => {
       if (isTerminal(state)) navigate();
     },
     dispose,
+    suspend,
+    resume,
   };
 }
