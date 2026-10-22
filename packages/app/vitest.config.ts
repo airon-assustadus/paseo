@@ -3,6 +3,7 @@ import { playwright } from "@vitest/browser-playwright";
 import path from "path";
 import fs from "fs";
 import { webProxyBridgeCommandFor, webProxyRelayCommandsFor } from "./vitest.web-proxy-bridge";
+import { lifecycleCompatCommandFor } from "./src/web-proxy/__fixtures__/lifecycle-compat/command";
 
 const appNodeModules = path.resolve(__dirname, "node_modules");
 const rootNodeModules = path.resolve(__dirname, "../../node_modules");
@@ -61,6 +62,7 @@ export default defineConfig({
             // test calls them.
             commands: {
               webProxyBridge: webProxyBridgeCommandFor(__dirname),
+              webProxyLifecycleCompat: lifecycleCompatCommandFor(__dirname),
               ...webProxyRelayCommandsFor(__dirname),
             },
           },
