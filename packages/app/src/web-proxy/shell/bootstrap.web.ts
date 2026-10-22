@@ -1,19 +1,32 @@
 import {
   BRIDGE_VERSION,
+  createLifecycleToken,
   parseContentMessage,
   parseControlMessage,
+  parseLifecycleOffer,
+  parseLifecycleToShell,
   parsePortGrant,
+  suspendedReply,
   type BridgeLimits,
+  type BridgeRequestMode,
   type BridgeRevokeReason,
   type ContentMessage,
   type ControlMessage,
   type HelloMessage,
+  type LifecycleToBrokerMessage,
+  type ResumeMessage,
+  type SuspendMessage,
 } from "../bridge-messages";
 import {
   isResync,
+  parseLifecycleArmed,
   parseShellRequestMessage,
   parseWorkerToBootstrapMessage,
   readShellFetchFields,
+  type ShellAckMessage,
+  type ShellCancelMessage,
+  type ShellDropCause,
+  type ShellLifecycleArmMessage,
   type ShellResyncReplyMessage,
   type ShellSessionCloseMessage,
   type ShellSessionOpenMessage,
@@ -28,6 +41,7 @@ export type ShellBootstrapStatus =
   | "awaiting_grant"
   | "session_refused"
   | "ready"
+  | "suspended"
   | "revoked";
 
 export interface ShellBootstrapOptions {
@@ -113,9 +127,33 @@ interface Relay {
   openSession(worker: ServiceWorker): Promise<string | null>;
 }
 
-// Relays the worker's per-request ports to the single broker port. The broker port lives
-// here, in a window, because the browser may stop the worker whenever it is idle. This page
-// also keeps the copy of its admitted client ids that a restarted worker asks for.
+type NavigationMark = "open" | "completed" | "failed";
+
+interface PendingRequest {
+  workerPort: MessagePort;
+  mode: BridgeRequestMode;
+  headForwarded: boolean;
+}
+
+// One broker port and what was asked on it. A resumed view replaces the context; callbacks keep
+// the context they were born with, so nothing late from a previous generation reaches the next.
+interface GenerationContext {
+  generation: number;
+  limits: BridgeLimits;
+  port: MessagePort;
+  pending: Map<number, PendingRequest>;
+  state: "live" | "suspended" | "discarded";
+  // Navigations answered locally on suspend: a head the control still sends for one of them is
+  // a result this view dropped.
+  answeredOnSuspend: Set<number>;
+  dropReported: boolean;
+  // Removes the listeners and closes the port, without a revoke.
+  detach(): void;
+}
+
+// Relays the worker's per-request ports to the broker port of the current generation. The broker
+// port lives here, in a window, because the browser may stop the worker whenever it is idle. This
+// page also keeps the copy of its admitted client ids that a restarted worker asks for.
 function startRelay(input: {
   options: ShellBootstrapOptions;
   grant: Grant;
@@ -124,19 +162,71 @@ function startRelay(input: {
   const { options, grant, appFrame } = input;
   const doc = options.window.document;
   const workerUrl = new URL(options.workerUrl, options.window.location.href).href;
-  const pending = new Map<number, MessagePort>();
+  // Per shell instance and never reset: an id of a previous generation is never reused.
   let nextRequestId = 1;
   let revokedReason: BridgeRevokeReason | null = null;
   let sessionPort: MessagePort | null = null;
   let admitted: string[] = [];
   let awaitingReply: ((message: ShellWorkerToBootstrapMessage | null) => void) | null = null;
+  // Lifecycle: the side port the control offered, and the worker arm on the current binding.
+  let side: MessagePort | null = null;
+  let binding: ServiceWorker | null = null;
+  let isSessionReady = false;
+  let workerArmed = false;
+  let armAttempt = 0;
+  // Preservation reference (lifecycle contract §5.8), kept outside `pending` so it survives the
+  // end of a request.
+  let reference: Document | null = null;
+  const marks = new Map<number, NavigationMark>();
+  let current = openContext(grant.generation, grant.limits, grant.port);
 
-  function revokeMessage(reason: BridgeRevokeReason): ControlMessage {
-    return { type: "paseo.web.revoke", v: 1, generation: grant.generation, reason };
+  function openContext(generation: number, limits: BridgeLimits, port: MessagePort) {
+    const ctx: GenerationContext = {
+      generation,
+      limits,
+      port,
+      pending: new Map(),
+      state: "live",
+      answeredOnSuspend: new Set(),
+      dropReported: false,
+      detach,
+    };
+    function onMessage(event: MessageEvent): void {
+      onBrokerMessage(ctx, event);
+    }
+    // The broker always announces a revocation; a current port that dies without one is treated
+    // the same. A replaced port closing is only the end of its generation.
+    function onClose(): void {
+      if (ctx === current) revoke("port_closed");
+    }
+    function onMessageError(): void {
+      if (ctx === current) revoke("protocol_error");
+    }
+    function detach(): void {
+      ctx.state = "discarded";
+      port.removeEventListener("message", onMessage);
+      port.removeEventListener("close", onClose);
+      port.removeEventListener("messageerror", onMessageError);
+      port.close();
+    }
+    port.addEventListener("message", onMessage);
+    port.addEventListener("close", onClose);
+    port.addEventListener("messageerror", onMessageError);
+    port.start();
+    return ctx;
   }
 
-  function toBroker(message: ContentMessage, transfer: Transferable[] = []): void {
-    grant.port.postMessage(message, transfer);
+  function revokeMessage(reason: BridgeRevokeReason): ControlMessage {
+    return { type: "paseo.web.revoke", v: 1, generation: current.generation, reason };
+  }
+
+  function toBroker(
+    ctx: GenerationContext,
+    message: ContentMessage,
+    transfer: Transferable[] = [],
+  ) {
+    if (ctx.state !== "live") return;
+    ctx.port.postMessage(message, transfer);
   }
 
   function toWorker(
@@ -147,20 +237,95 @@ function startRelay(input: {
     port.postMessage(message, transfer);
   }
 
-  function release(requestId: number): void {
-    if (!pending.delete(requestId)) return;
-    toBroker({ type: "paseo.web.cancel", v: 1, generation: grant.generation, requestId });
+  function toControl(message: LifecycleToBrokerMessage): void {
+    side?.postMessage(message, []);
   }
 
-  function onWorkerPortMessage(requestId: number, data: unknown): void {
-    const message = parseShellRequestMessage(data);
-    if (!pending.has(requestId)) return;
+  function markNavigation(requestId: number, mark: NavigationMark): void {
+    marks.set(requestId, mark);
+  }
+
+  function computeDocumentKept(): boolean {
+    return (
+      reference !== null &&
+      marks.size === 0 &&
+      appFrame.isConnected &&
+      appFrame.contentDocument === reference
+    );
+  }
+
+  // A new reference only after a navigation that went through the bridge and completed.
+  function onAppFrameLoad(): void {
+    if (current.state === "suspended") return;
+    let highest = -1;
+    for (const [requestId, mark] of marks) {
+      if (mark === "open") return;
+      highest = Math.max(highest, requestId);
+    }
+    if (highest < 0 || marks.get(highest) !== "completed") return;
+    reference = appFrame.contentDocument;
+    marks.clear();
+  }
+
+  function release(ctx: GenerationContext, requestId: number): void {
+    if (!ctx.pending.delete(requestId)) return;
+    toBroker(ctx, { type: "paseo.web.cancel", v: 1, generation: ctx.generation, requestId });
+  }
+
+  function onDropped(dropped: {
+    ctx: GenerationContext;
+    requestId: number;
+    cause: ShellDropCause;
+  }): void {
+    const { ctx, requestId, cause } = dropped;
+    release(ctx, requestId);
+    // The worker kept the document with a 204: the failure this navigation was marked with
+    // never reached the frame.
+    if (marks.get(requestId) === "failed") marks.delete(requestId);
+    const { generation } = ctx;
+    toControl({ type: "paseo.web.navigation.dropped", v: 1, generation, requestId, cause });
+  }
+
+  function onWorkerPortMessage(received: {
+    ctx: GenerationContext;
+    requestId: number;
+    message: ShellAckMessage | ShellCancelMessage | null;
+  }): void {
+    const { ctx, requestId, message } = received;
+    const entry = ctx.pending.get(requestId);
+    if (entry === undefined) return;
     if (message === null || message.type === "paseo.shell.cancel") {
-      release(requestId);
+      // Only the head timeout cancels before a head; the worker already showed 504.
+      if (entry.mode === "navigate" && !entry.headForwarded) markNavigation(requestId, "failed");
+      release(ctx, requestId);
       return;
     }
-    const { generation } = grant;
-    toBroker({ type: "paseo.web.ack", v: 1, generation, requestId, bytes: message.bytes });
+    const { generation } = ctx;
+    toBroker(ctx, { type: "paseo.web.ack", v: 1, generation, requestId, bytes: message.bytes });
+  }
+
+  function listenToWorkerPort(request: {
+    ctx: GenerationContext;
+    requestId: number;
+    workerPort: MessagePort;
+    mode: BridgeRequestMode;
+  }): void {
+    const { ctx, requestId, workerPort, mode } = request;
+    let isDropReported = false;
+    workerPort.addEventListener("message", (portEvent) => {
+      const message = parseShellRequestMessage(portEvent.data);
+      // The drop follows the error that triggered it, after the request left `pending`.
+      if (message?.type === "paseo.shell.request.dropped") {
+        if (mode !== "navigate" || isDropReported || side === null) return;
+        isDropReported = true;
+        onDropped({ ctx, requestId, cause: message.cause });
+        return;
+      }
+      onWorkerPortMessage({ ctx, requestId, message });
+    });
+    // A worker stopped mid-response never sends cancel; release the host request instead.
+    workerPort.addEventListener("close", () => release(ctx, requestId));
+    workerPort.start();
   }
 
   function onFetch(fields: Record<string, unknown>, ports: ReadonlyArray<MessagePort>): void {
@@ -170,25 +335,26 @@ function startRelay(input: {
       toWorker(workerPort, revokeMessage(revokedReason));
       return;
     }
+    const ctx = current;
+    const { generation } = ctx;
     const requestId = nextRequestId++;
     const request = parseContentMessage(
-      { ...fields, type: "paseo.web.request", v: 1, generation: grant.generation, requestId },
-      grant.limits,
+      { ...fields, type: "paseo.web.request", v: 1, generation, requestId },
+      ctx.limits,
     );
     if (request === null || request.type !== "paseo.web.request") {
-      const { generation } = grant;
       const code = "invalid_request";
       toWorker(workerPort, { type: "paseo.web.response.error", v: 1, generation, requestId, code });
       return;
     }
-    pending.set(requestId, workerPort);
-    workerPort.addEventListener("message", (portEvent) =>
-      onWorkerPortMessage(requestId, portEvent.data),
-    );
-    // A worker stopped mid-response never sends cancel; release the host request instead.
-    workerPort.addEventListener("close", () => release(requestId));
-    workerPort.start();
-    toBroker(request, request.body === null ? [] : [request.body]);
+    // Suspended: answered here with the v1 primitives, never forwarded.
+    if (ctx.state === "suspended") {
+      toWorker(workerPort, suspendedReply(request.mode, requestId, generation));
+      return;
+    }
+    ctx.pending.set(requestId, { workerPort, mode: request.mode, headForwarded: false });
+    listenToWorkerPort({ ctx, requestId, workerPort, mode: request.mode });
+    toBroker(ctx, request, request.body === null ? [] : [request.body]);
   }
 
   function onSessionMessage(event: MessageEvent): void {
@@ -206,6 +372,51 @@ function startRelay(input: {
     const resolve = awaitingReply;
     awaitingReply = null;
     resolve?.(message);
+  }
+
+  function setWorkerArmed(armed: boolean): void {
+    if (workerArmed === armed) return;
+    workerArmed = armed;
+    toControl({ type: "paseo.web.lifecycle.state", v: 1, workerArmed: armed });
+  }
+
+  function disarm(): void {
+    armAttempt += 1;
+    setWorkerArmed(false);
+  }
+
+  // Arms the worker of the current binding, once the control accepted the lifecycle and the
+  // session is open. A worker that does not answer in time leaves this view unarmed.
+  function arm(): void {
+    if (side === null || binding === null || !isSessionReady || revokedReason !== null) return;
+    armAttempt += 1;
+    const attempt = armAttempt;
+    const nonce = createLifecycleToken();
+    const channel = new MessageChannel();
+    const timer = setTimeout(() => channel.port1.close(), options.sessionReplyTimeoutMs);
+    channel.port1.addEventListener(
+      "message",
+      (event) => {
+        clearTimeout(timer);
+        channel.port1.close();
+        const reply = parseLifecycleArmed(event.data);
+        if (attempt !== armAttempt || reply === null || reply.nonce !== nonce) return;
+        setWorkerArmed(reply.armed);
+      },
+      { once: true },
+    );
+    channel.port1.start();
+    const message: ShellLifecycleArmMessage = { type: "paseo.shell.lifecycle.arm", v: 1, nonce };
+    binding.postMessage(message, [channel.port2]);
+  }
+
+  function watchBinding(worker: ServiceWorker): void {
+    binding = worker;
+    worker.addEventListener("statechange", () => {
+      if (binding !== worker || worker.state !== "redundant") return;
+      binding = null;
+      disarm();
+    });
   }
 
   function adoptSessionPort(port: MessagePort): void {
@@ -230,7 +441,8 @@ function startRelay(input: {
   }
 
   // A restarted worker rebuilds its routes from the bootstraps it can still see. A revoked
-  // bootstrap stays silent, so a late answer can never bring its session back.
+  // bootstrap stays silent, so a late answer can never bring its session back. A suspended one
+  // still answers: it keeps routing to this page, which answers locally.
   function onWorkerMessage(event: MessageEvent): void {
     const source = event.source;
     if (!(source instanceof ServiceWorker) || source.scriptURL !== workerUrl) return;
@@ -242,16 +454,23 @@ function startRelay(input: {
     }
     const reply: ShellResyncReplyMessage = { type: "paseo.shell.resync.reply", admitted };
     port.postMessage(reply, []);
+    // A new binding, maybe of a restarted worker or of another version: arm it again.
     adoptSessionPort(port);
+    disarm();
+    watchBinding(source);
+    arm();
   }
 
   async function openSession(worker: ServiceWorker): Promise<string | null> {
     const channel = new MessageChannel();
     adoptSessionPort(channel.port1);
+    watchBinding(worker);
     const reply = nextReply();
     const open: ShellSessionOpenMessage = { type: "paseo.shell.session.open" };
     worker.postMessage(open, [channel.port2]);
     if ((await reply)?.type !== "paseo.shell.session.ready" || sessionPort === null) return null;
+    isSessionReady = true;
+    arm();
     const ticket = createTicket();
     const ticketReply = nextReply();
     const prepare: ShellTicketPrepareMessage = { type: "paseo.shell.ticket.prepare", ticket };
@@ -265,51 +484,153 @@ function startRelay(input: {
   function revoke(reason: BridgeRevokeReason): void {
     if (revokedReason !== null) return;
     revokedReason = reason;
+    armAttempt += 1;
     const close: ShellSessionCloseMessage = { type: "paseo.shell.session.close" };
     sessionPort?.postMessage(close, []);
     sessionPort?.close();
     sessionPort = null;
-    grant.port.removeEventListener("message", onBrokerMessage);
-    grant.port.removeEventListener("close", onBrokerPortClosed);
-    grant.port.removeEventListener("messageerror", onBrokerMessageError);
-    for (const workerPort of pending.values()) toWorker(workerPort, revokeMessage(reason));
-    pending.clear();
-    grant.port.close();
+    side?.close();
+    side = null;
+    for (const entry of current.pending.values()) {
+      toWorker(entry.workerPort, revokeMessage(reason));
+    }
+    current.pending.clear();
+    current.detach();
     appFrame.remove();
     showStatus(doc, "revoked");
   }
 
-  function onBrokerMessage(event: MessageEvent): void {
-    const message = parseControlMessage(event.data);
-    if (message === null || message.generation !== grant.generation) return;
+  function noteNavigationResponse(ctx: GenerationContext, message: ControlMessage): void {
+    if (message.type === "paseo.web.revoke") return;
+    const entry = ctx.pending.get(message.requestId);
+    if (entry === undefined || entry.mode !== "navigate") return;
+    const { requestId } = message;
+    if (message.type === "paseo.web.response.head") {
+      entry.headForwarded = true;
+      if (message.status !== 204 && message.status !== 205) markNavigation(requestId, "open");
+    } else if (message.type === "paseo.web.response.end") {
+      if (marks.get(requestId) === "open") markNavigation(requestId, "completed");
+    } else if (message.type === "paseo.web.response.error") {
+      markNavigation(requestId, "failed");
+    }
+  }
+
+  // A head the control sent before the suspension reached it: that navigation's result is gone.
+  function noteLateHead(ctx: GenerationContext, message: ControlMessage): void {
+    if (message.type !== "paseo.web.response.head" || message.status === 204) return;
+    if (!ctx.answeredOnSuspend.has(message.requestId) || ctx.dropReported) return;
+    ctx.dropReported = true;
+    const { generation } = ctx;
+    const { requestId } = message;
+    toControl({
+      type: "paseo.web.navigation.dropped",
+      v: 1,
+      generation,
+      requestId,
+      cause: "suspended",
+    });
+  }
+
+  function onControlMessage(ctx: GenerationContext, message: ControlMessage): void {
     if (message.type === "paseo.web.revoke") {
       revoke(message.reason);
       return;
     }
-    const workerPort = pending.get(message.requestId);
-    if (workerPort === undefined) return;
+    if (ctx.state === "suspended") noteLateHead(ctx, message);
+    const entry = ctx.pending.get(message.requestId);
+    if (entry === undefined) return;
+    noteNavigationResponse(ctx, message);
     if (message.type === "paseo.web.response.chunk") {
-      toWorker(workerPort, message, [message.chunk]);
+      toWorker(entry.workerPort, message, [message.chunk]);
       return;
     }
-    if (message.type !== "paseo.web.response.head") pending.delete(message.requestId);
-    toWorker(workerPort, message);
+    if (message.type !== "paseo.web.response.head") ctx.pending.delete(message.requestId);
+    toWorker(entry.workerPort, message);
   }
 
-  // The broker always announces a revocation; a port that dies without one is treated the same.
-  function onBrokerPortClosed(): void {
-    revoke("port_closed");
+  function acceptLifecycle(ctx: GenerationContext, event: MessageEvent): boolean {
+    const offer = parseLifecycleOffer(event.data);
+    const port = event.ports[0];
+    if (offer === null) return false;
+    const isAcceptable =
+      side === null &&
+      ctx.state === "live" &&
+      offer.generation === ctx.generation &&
+      event.ports.length === 1;
+    if (!isAcceptable || port === undefined) {
+      for (const received of event.ports) received.close();
+      return true;
+    }
+    side = port;
+    port.addEventListener("message", onSideMessage);
+    port.start();
+    toControl({
+      type: "paseo.web.lifecycle.accept",
+      v: 1,
+      generation: ctx.generation,
+      offer: offer.offer,
+    });
+    arm();
+    return true;
   }
 
-  function onBrokerMessageError(): void {
-    revoke("protocol_error");
+  function onBrokerMessage(ctx: GenerationContext, event: MessageEvent): void {
+    if (ctx !== current || acceptLifecycle(ctx, event)) return;
+    const message = parseControlMessage(event.data);
+    if (message === null || message.generation !== ctx.generation) return;
+    onControlMessage(ctx, message);
+  }
+
+  function suspend(message: SuspendMessage): void {
+    const ctx = current;
+    if (ctx.state !== "live" || message.generation !== ctx.generation) return;
+    ctx.state = "suspended";
+    for (const [requestId, entry] of ctx.pending) {
+      const isNavigationHead = entry.mode === "navigate" && !entry.headForwarded;
+      if (isNavigationHead) ctx.answeredOnSuspend.add(requestId);
+      const mode = isNavigationHead ? "navigate" : "subresource";
+      toWorker(entry.workerPort, suspendedReply(mode, requestId, ctx.generation));
+    }
+    ctx.pending.clear();
+    const documentKept = computeDocumentKept();
+    toControl({ type: "paseo.web.suspended", v: 1, generation: ctx.generation, documentKept });
+    showStatus(doc, "suspended");
+  }
+
+  function resume(message: ResumeMessage, ports: ReadonlyArray<MessagePort>): void {
+    const port = ports[0];
+    const previous = current;
+    const isAdoptable =
+      previous.state === "suspended" &&
+      message.previous === previous.generation &&
+      ports.length === 1 &&
+      port !== undefined;
+    if (!isAdoptable || port === undefined) {
+      for (const received of ports) received.close();
+      return;
+    }
+    const next = openContext(message.generation, message.limits, port);
+    const documentKept = computeDocumentKept();
+    const { generation } = next;
+    port.postMessage(
+      { type: "paseo.web.resumed", v: 1, previous: previous.generation, generation, documentKept },
+      [],
+    );
+    current = next;
+    previous.detach();
+    showStatus(doc, "ready");
+  }
+
+  function onSideMessage(event: MessageEvent): void {
+    if (revokedReason !== null) return;
+    const message = parseLifecycleToShell(event.data);
+    if (message === null) return;
+    if (message.type === "paseo.web.suspend") suspend(message);
+    else resume(message, event.ports);
   }
 
   options.window.navigator.serviceWorker.addEventListener("message", onWorkerMessage);
-  grant.port.addEventListener("message", onBrokerMessage);
-  grant.port.addEventListener("close", onBrokerPortClosed);
-  grant.port.addEventListener("messageerror", onBrokerMessageError);
-  grant.port.start();
+  appFrame.addEventListener("load", onAppFrameLoad);
   return { openSession };
 }
 
