@@ -15,7 +15,7 @@ import {
   type ShellClients,
   type ShellMessageInput,
 } from "./client-binding.web";
-import type { ShellFetchMessage, ShellRequestMessage } from "./relay-messages";
+import type { ShellDropCause, ShellFetchMessage, ShellRequestMessage } from "./relay-messages";
 
 export interface ShellWorkerConfig {
   controlOrigin: string;
@@ -220,6 +220,8 @@ function awaitResponse(input: {
   port: MessagePort;
   method: string;
   mode: BridgeRequestMode;
+  // A navigation on a binding armed when it started: losing its head keeps the document.
+  isProtected: boolean;
   config: ShellWorkerConfig;
 }): Promise<Response> {
   const { port, config } = input;
@@ -293,17 +295,29 @@ function awaitResponse(input: {
     }
   }
 
+  // A 204 aborts the navigation and the frame keeps its document; the bootstrap tells the control
+  // that the result is unknown. Nothing is replayed.
+  function drop(cause: ShellDropCause): void {
+    port.postMessage({ type: "paseo.shell.request.dropped", cause } satisfies ShellRequestMessage);
+    settle(new Response(null, { status: 204 }), "done");
+  }
+
   function onHeadPhaseMessage(message: ControlMessage): void {
     if (message.type === "paseo.web.response.head") onHead(message);
     else if (message.type === "paseo.web.revoke") fail(502, "session_revoked");
     else if (message.type === "paseo.web.response.error") {
-      fail(502, message.code, message.reason ?? null);
+      if (input.isProtected && message.reason === "transport_closed") drop("transport_closed");
+      else fail(502, message.code, message.reason ?? null);
     } else fail(502, "bridge_error");
   }
 
   headTimer = setTimeout(() => {
     // The bootstrap is gone, frozen or the broker stalled: say so instead of hanging.
     headTimer = null;
+    if (input.isProtected) {
+      drop("head_timeout");
+      return;
+    }
     port.postMessage({ type: "paseo.shell.cancel" } satisfies ShellRequestMessage);
     fail(504, "bridge_timeout");
   }, config.headTimeoutMs);
@@ -365,7 +379,8 @@ async function proxy(input: {
     },
   };
   const transfer: Transferable[] = body === null ? [channel.port2] : [channel.port2, body];
-  const response = awaitResponse({ port: channel.port1, method, mode, config });
+  const isProtected = mode === "navigate" && route.armed;
+  const response = awaitResponse({ port: channel.port1, method, mode, isProtected, config });
   route.port.postMessage(message, transfer);
   return response;
 }

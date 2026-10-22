@@ -1,8 +1,10 @@
 import {
   MAX_ADMITTED_CLIENTS,
   isSessionOpen,
+  parseLifecycleArm,
   parseResyncReply,
   parseSessionPortMessage,
+  type ShellLifecycleArmedMessage,
   type ShellRefusalReason,
   type ShellWorkerToBootstrapMessage,
 } from "./relay-messages";
@@ -56,8 +58,8 @@ export type BindingRefusal =
   | "session_unavailable";
 
 export type BindingRoute =
-  | { kind: "route"; port: MessagePort }
-  | { kind: "refused"; code: BindingRefusal };
+  // armed: the bootstrap armed the lifecycle on this binding when the request started.
+  { kind: "route"; port: MessagePort; armed: boolean } | { kind: "refused"; code: BindingRefusal };
 
 export interface ShellMessageInput {
   data: unknown;
@@ -87,6 +89,8 @@ interface Session {
   tickets: Map<string, number>;
   // resultingClientId reserved by a consumed ticket → expires at
   entries: Map<string, number>;
+  // Lives with the binding: a restarted worker or an adopted port starts unarmed.
+  armed: boolean;
 }
 
 interface ResyncReply {
@@ -247,6 +251,7 @@ export function createClientBinding(input: {
       admitted: new Map(),
       tickets: new Map(),
       entries: new Map(),
+      armed: false,
     };
     register(session);
     send(session, { type: "paseo.shell.session.ready" });
@@ -298,9 +303,25 @@ export function createClientBinding(input: {
       admitted,
       tickets: new Map(),
       entries: new Map(),
+      armed: false,
     };
     register(session);
     announce(session);
+  }
+
+  // A bootstrap arms right after it answered a resync: the adoption must land first.
+  async function arm(bootstrapId: string, nonce: string, port: MessagePort): Promise<void> {
+    if (resyncing !== null) await resyncing;
+    const session = sessions.get(bootstrapId);
+    if (session !== undefined) session.armed = true;
+    const reply: ShellLifecycleArmedMessage = {
+      type: "paseo.shell.lifecycle.armed",
+      v: 1,
+      nonce,
+      armed: session !== undefined,
+    };
+    port.postMessage(reply, []);
+    port.close();
   }
 
   // After a restart the worker knows nothing; live bootstraps hold the durable copy.
@@ -350,16 +371,19 @@ export function createClientBinding(input: {
   async function routeTo(session: Session, clientId: string): Promise<BindingRoute> {
     if (!(await isLive(session))) return refused("session_unavailable");
     if (!(await admit(session, clientId))) return refused("client_limit");
-    return { kind: "route", port: session.port };
+    return { kind: "route", port: session.port, armed: session.armed };
   }
 
   return {
     handleMessage({ data, sourceId, ports }) {
       const port = ports[0];
-      if (!isSessionOpen(data) || sourceId === null || ports.length !== 1 || port === undefined) {
+      if (sourceId === null || ports.length !== 1 || port === undefined) return;
+      const armRequest = parseLifecycleArm(data);
+      if (armRequest !== null) {
+        void arm(sourceId, armRequest.nonce, port);
         return;
       }
-      void openSession(sourceId, port);
+      if (isSessionOpen(data)) void openSession(sourceId, port);
     },
 
     async enter({ ticket, clientId, resultingClientId }) {
