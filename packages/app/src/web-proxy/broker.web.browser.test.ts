@@ -1,5 +1,14 @@
 import { page } from "@vitest/browser/context";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type TestContext,
+} from "vitest";
 import {
   createFixtureTransport,
   FIXTURE_BIG_BODY_BYTES,
@@ -1706,6 +1715,12 @@ describe("authoritative purge on the synthetic bench", () => {
     expect(await resumed).toEqual({ kind: "failed", reason: "terminal" });
   }, 30_000);
 
+  // A green run must keep the measured values: printed to the console and attached to the test.
+  async function keepMeasure(annotate: TestContext["annotate"], message: string): Promise<void> {
+    console.info(message);
+    await annotate(message);
+  }
+
   // Measured from the fence (the purge call) to the frame's removal, against M7's 2 s. A timer is
   // margin, not a guarantee: an excess here is a measured M7 failure.
   function removalTimes(brokers: WebProxyBroker[]): () => number[] {
@@ -1725,7 +1740,9 @@ describe("authoritative purge on the synthetic bench", () => {
     };
   }
 
-  it("R1/R6/G8: purges wp-a's sentinels, leaves wp-b and the cookie, and removes frames within M7", async () => {
+  it("R1/R6/G8: purges wp-a's sentinels, leaves wp-b and the cookie, and removes frames within M7", async ({
+    annotate,
+  }) => {
     expect((await probe(CONTENT_A, "seed")).report).toMatchObject({ cookie: true });
     expect((await probe(CONTENT_B, "seed")).report).toMatchObject({ cookie: true });
     const registry = createBenchRegistry();
@@ -1736,7 +1753,8 @@ describe("authoritative purge on the synthetic bench", () => {
     const times = removalTimes([first, second]);
     const report = await registry.revokeAuthorityBench("wp-a");
     const elapsed = times();
-    console.info(`G8/M7: fence to frame removal ${elapsed.map(Math.round).join(" ms, ")} ms`);
+    const measured = elapsed.map((value) => value.toFixed(1)).join(" ms, ");
+    await keepMeasure(annotate, `M7 R1 (fast path): fence to frame removal ${measured} ms`);
     expect(Math.max(...elapsed)).toBeLessThan(2000);
     expect(report).toMatchObject({ targeted: 2, docConfirmedAll: true, swConfirmedAll: true });
     expect(report.guard).toBe("released");
@@ -1750,7 +1768,10 @@ describe("authoritative purge on the synthetic bench", () => {
       database: false,
       cookie: true,
     });
-    console.info(`G6 observation: wp-a registrations after the purge: ${purged.registrations}`);
+    await keepMeasure(
+      annotate,
+      `G6 observation: wp-a registrations after the purge: ${purged.registrations}`,
+    );
     expect((await probe(CONTENT_B, "read")).report).toMatchObject({
       localStorage: "1",
       sessionStorage: "1",
@@ -1793,7 +1814,9 @@ describe("authoritative purge on the synthetic bench", () => {
     });
   }, 60_000);
 
-  it("B3/G5: a blocked database leaves every worker field unconfirmed before C's deadline", async () => {
+  it("B3/G5: a blocked database leaves every worker field unconfirmed before C's deadline", async ({
+    annotate,
+  }) => {
     await probe(CONTENT_A, "seed");
     const holder = await probe(CONTENT_A, "hold");
     const registry = createBenchRegistry();
@@ -1802,7 +1825,10 @@ describe("authoritative purge on the synthetic bench", () => {
     const times = removalTimes([broker]);
     const report = await registry.revokeAuthorityBench("wp-a");
     const [elapsed = Number.POSITIVE_INFINITY] = times();
-    console.info(`B3: fence to frame removal ${Math.round(elapsed)} ms with a blocked database`);
+    await keepMeasure(
+      annotate,
+      `M7 B3 (K budget 1300 ms, blocked database): fence to frame removal ${elapsed.toFixed(1)} ms`,
+    );
     expect(elapsed).toBeLessThan(2000);
     expect(report).toMatchObject({ docConfirmedAll: true, swConfirmedAll: false });
     expect(report.guard).toBe("purge_uncertain");
@@ -1816,4 +1842,24 @@ describe("authoritative purge on the synthetic bench", () => {
     );
     holder.frame.remove();
   }, 60_000);
+
+  it("G8/M7: a mute shell ends on the 1800 ms deadline and its frame still leaves within M7", async ({
+    annotate,
+  }) => {
+    const registry = createBenchRegistry();
+    const broker = admit(registry, "scripted", scriptedView({ purge: "silent" }));
+    await capable(broker);
+    const times = removalTimes([broker]);
+    const report = await registry.revokeAuthorityBench("scripted");
+    const [elapsed = Number.POSITIVE_INFINITY] = times();
+    await keepMeasure(
+      annotate,
+      `M7 mute K (C deadline 1800 ms): fence to frame removal ${elapsed.toFixed(1)} ms`,
+    );
+    expect(revokedOf(broker)?.purge).toMatchObject({ kind: "timeout", sent: true });
+    expect(report.guard).toBe("purge_uncertain");
+    // The deadline path, not a fast one: the view ended on C's own timer.
+    expect(elapsed).toBeGreaterThanOrEqual(1800);
+    expect(elapsed).toBeLessThan(2000);
+  }, 30_000);
 });
