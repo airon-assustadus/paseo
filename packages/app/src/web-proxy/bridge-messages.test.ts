@@ -3,6 +3,7 @@ import {
   DEFAULT_BRIDGE_LIMITS,
   createLifecycleToken,
   isLifecycleToken,
+  isPurgeOp,
   parseContentMessage,
   parseControlMessage,
   parseHello,
@@ -15,6 +16,7 @@ import {
   InvalidBridgeLimitsError,
   validateBridgeLimits,
 } from "./bridge-messages";
+import { parseShellPurge, parseShellPurged } from "./shell/relay-messages";
 
 const request = {
   type: "paseo.web.request",
@@ -288,5 +290,81 @@ describe("lifecycle messages", () => {
       reason: "transport_closed",
     });
     expect(parseControlMessage(subresource)).toEqual(subresource);
+  });
+});
+
+describe("authoritative purge messages", () => {
+  const op = "AAAAAAAAAAAAAAAAAAAAAg";
+  const nonce = "NNNNNNNNNNNNNNNNNNNNNN";
+  const flags = {
+    localStorage: true,
+    sessionStorage: false,
+    caches: true,
+    indexedDB: false,
+    unregistered: true,
+  };
+  const toShell = [
+    { type: "paseo.web.purge.query", v: 1, nonce },
+    { type: "paseo.web.purge", v: 1, op },
+  ];
+  const toBroker = [
+    { type: "paseo.web.purge.capable", v: 1, nonce },
+    { type: "paseo.web.purged", v: 1, op, ...flags },
+  ];
+  const shellPurge = { type: "paseo.shell.purge", v: 1, op };
+  const shellPurged = {
+    type: "paseo.shell.purged",
+    v: 1,
+    op,
+    caches: true,
+    indexedDB: false,
+    unregistered: true,
+  };
+
+  it("generates canonical operation ids", () => {
+    for (let index = 0; index < 64; index += 1)
+      expect(isPurgeOp(createLifecycleToken())).toBe(true);
+  });
+
+  it("accepts each exact message on its own parser only", () => {
+    for (const message of toShell) expect(parseLifecycleToShell(message)).toEqual(message);
+    for (const message of toBroker) expect(parseLifecycleToBroker(message)).toEqual(message);
+    expect(parseShellPurge(shellPurge)).toEqual(shellPurge);
+    expect(parseShellPurged(shellPurged)).toEqual(shellPurged);
+    for (const message of toShell) expect(parseLifecycleToBroker(message)).toBeNull();
+    for (const message of toBroker) expect(parseLifecycleToShell(message)).toBeNull();
+    expect(parseControlMessage(toShell[1])).toBeNull();
+    expect(parseContentMessage(toBroker[1], DEFAULT_BRIDGE_LIMITS)).toBeNull();
+  });
+
+  it.each([
+    ["a non-canonical last character", `${op.slice(0, 21)}B`],
+    ["21 characters", op.slice(0, 21)],
+    ["23 characters", `${op}A`],
+    ["a numeric epoch", 7],
+    ["padding", `${op.slice(0, 20)}==`],
+  ])("rejects an op with %s everywhere", (_label, value) => {
+    expect(isPurgeOp(value)).toBe(false);
+    expect(parseLifecycleToShell({ type: "paseo.web.purge", v: 1, op: value })).toBeNull();
+    expect(parseLifecycleToBroker({ ...toBroker[1], op: value })).toBeNull();
+    expect(parseShellPurge({ ...shellPurge, op: value })).toBeNull();
+    expect(parseShellPurged({ ...shellPurged, op: value })).toBeNull();
+  });
+
+  it.each([
+    ["the old epoch key", parseLifecycleToShell, { type: "paseo.web.purge", v: 1, epoch: 1 }],
+    ["an extra key on purge", parseLifecycleToShell, { ...toShell[1], epoch: 1 }],
+    ["a short nonce", parseLifecycleToShell, { ...toShell[0], nonce: "abc" }],
+    ["a missing flag", parseLifecycleToBroker, { type: "paseo.web.purged", v: 1, op }],
+    ["a string flag", parseLifecycleToBroker, { ...toBroker[1], caches: "true" }],
+    ["another version", parseLifecycleToBroker, { ...toBroker[0], v: 2 }],
+    [
+      "a worker report with a document flag",
+      parseShellPurged,
+      { ...shellPurged, localStorage: true },
+    ],
+    ["a worker purge with an extra key", parseShellPurge, { ...shellPurge, epoch: 1 }],
+  ])("rejects %s", (_label, parse, value) => {
+    expect((parse as (data: unknown) => unknown)(value)).toBeNull();
   });
 });

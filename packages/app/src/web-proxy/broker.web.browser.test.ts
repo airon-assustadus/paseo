@@ -1,5 +1,14 @@
 import { page } from "@vitest/browser/context";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type TestContext,
+} from "vitest";
 import {
   createFixtureTransport,
   FIXTURE_BIG_BODY_BYTES,
@@ -8,12 +17,13 @@ import {
   type FixtureTransport,
 } from "./__fixtures__/fixture-transport";
 import { HARNESS, harnessContentOrigin } from "./__fixtures__/shell/harness";
-import { DEFAULT_BRIDGE_LIMITS } from "./bridge-messages";
+import { DEFAULT_BRIDGE_LIMITS, createLifecycleToken } from "./bridge-messages";
 import {
   attachWebProxyBroker,
   WebProxyBrokerSetupError,
   type WebProxyBroker,
   type WebProxyBrokerState,
+  type WebProxyPurgeOutcome,
 } from "./broker.web";
 
 // Control = this test page on "localhost"; content = "wp-a.localhost"; adversary =
@@ -58,12 +68,13 @@ function mount(input: {
   index: FixtureIndex;
   bootstrapPath?: string;
   handshakeTimeoutMs?: number;
+  contentOrigin?: string;
 }): { broker: WebProxyBroker; transport: FixtureTransport; states: WebProxyBrokerState[] } {
   const transport = createFixtureTransport({ index: input.index });
   const states: WebProxyBrokerState[] = [];
   const broker = attachWebProxyBroker({
     capability: {
-      contentOrigin: CONTENT_A,
+      contentOrigin: input.contentOrigin ?? CONTENT_A,
       destinationOrigin: FIXTURE_DESTINATION_ORIGIN,
       pathPrefix: "/",
     },
@@ -459,6 +470,12 @@ describe("web proxy broker lifecycle", () => {
         v: 1,
         generation: 1,
         offer: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      },
+      // Asked once after ready (lifecycle contract §5.9); the shell answers, it never announces.
+      {
+        type: "paseo.web.purge.query",
+        v: 1,
+        nonce: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
       },
       { type: "paseo.web.suspend", v: 1, generation: 1, reason: "channel_lost" },
     ]);
@@ -1347,4 +1364,502 @@ describe("web proxy lifecycle R3", () => {
       shell.close();
     }
   });
+});
+
+// The synthetic bench's authoritative entry (lifecycle contract §5.9, R6): a registry per page,
+// views kept as tombstones with their evidence, admission refused while an operation is pending
+// or uncertain, and an uncertain guard that never releases.
+type BenchGuard = "idle" | "pending" | "released" | "purge_uncertain";
+
+interface BenchPurgeReport {
+  op: string | null;
+  targeted: number;
+  sentAny: boolean;
+  docConfirmedAll: boolean;
+  swConfirmedAll: boolean;
+  guard: Exclude<BenchGuard, "pending">;
+}
+
+interface BenchView {
+  broker: WebProxyBroker;
+  recorded: WebProxyPurgeOutcome | null;
+}
+
+interface BenchDestination {
+  guard: BenchGuard;
+  views: BenchView[];
+  pending: Promise<BenchPurgeReport> | null;
+}
+
+function isDocConfirmed(outcome: WebProxyPurgeOutcome): boolean {
+  return outcome.kind === "purged" && outcome.localStorage && outcome.sessionStorage;
+}
+
+function isWorkerConfirmed(outcome: WebProxyPurgeOutcome): boolean {
+  return outcome.kind === "purged" && outcome.caches && outcome.indexedDB && outcome.unregistered;
+}
+
+function reportOf(
+  op: string | null,
+  outcomes: WebProxyPurgeOutcome[],
+  guard: Exclude<BenchGuard, "pending">,
+): BenchPurgeReport {
+  const confirmedAll = (check: (outcome: WebProxyPurgeOutcome) => boolean) =>
+    outcomes.length > 0 && outcomes.every(check);
+  return {
+    op,
+    targeted: outcomes.length,
+    sentAny: outcomes.some((outcome) => outcome.sent),
+    docConfirmedAll: confirmedAll(isDocConfirmed),
+    swConfirmedAll: confirmedAll(isWorkerConfirmed),
+    guard,
+  };
+}
+
+function createBenchRegistry() {
+  const destinations = new Map<string, BenchDestination>();
+
+  function destinationOf(name: string): BenchDestination {
+    const existing = destinations.get(name);
+    if (existing !== undefined) return existing;
+    const created: BenchDestination = { guard: "idle", views: [], pending: null };
+    destinations.set(name, created);
+    return created;
+  }
+
+  function settledGuard(outcomes: WebProxyPurgeOutcome[]): "released" | "purge_uncertain" {
+    const isClean = (outcome: WebProxyPurgeOutcome) =>
+      !outcome.sent || (isDocConfirmed(outcome) && isWorkerConfirmed(outcome));
+    return outcomes.every(isClean) ? "released" : "purge_uncertain";
+  }
+
+  async function finish(
+    destination: BenchDestination,
+    op: string,
+    targets: Array<{ view: BenchView; result: Promise<WebProxyPurgeOutcome> }>,
+  ): Promise<BenchPurgeReport> {
+    const outcomes = await Promise.all(targets.map(({ result }) => result));
+    targets.forEach(({ view }, index) => {
+      view.recorded = outcomes[index] ?? null;
+    });
+    const guard = settledGuard(outcomes);
+    destination.guard = guard;
+    destination.pending = null;
+    return reportOf(op, outcomes, guard);
+  }
+
+  return {
+    mount(name: string, create: () => WebProxyBroker): WebProxyBroker | "refused" {
+      const destination = destinationOf(name);
+      if (destination.guard === "pending" || destination.guard === "purge_uncertain") {
+        return "refused";
+      }
+      const broker = create();
+      destination.views.push({ broker, recorded: null });
+      return broker;
+    },
+    guard: (name: string): BenchGuard => destinationOf(name).guard,
+    revokeAuthorityBench(name: string): Promise<BenchPurgeReport> {
+      const destination = destinationOf(name);
+      if (destination.pending !== null) return destination.pending;
+      if (destination.guard === "purge_uncertain") {
+        return Promise.resolve(reportOf(null, [], "purge_uncertain"));
+      }
+      const idle = destination.guard === "released" ? "released" : "idle";
+      const views = destination.views.filter((view) => view.recorded === null);
+      if (views.length === 0) return Promise.resolve(reportOf(null, [], idle));
+      // One synchronous turn: one op, the guard pending, and every view fenced before any await.
+      const op = createLifecycleToken();
+      destination.guard = "pending";
+      const targets = views.map((view) => ({ view, result: view.broker.purge({ op }) }));
+      destination.pending = finish(destination, op, targets);
+      return destination.pending;
+    },
+  };
+}
+
+describe("authoritative purge on the synthetic bench", () => {
+  const SCRIPTED = `${HARNESS.shellPathPrefix}scripted.html`;
+
+  interface ProbeReport {
+    action: string;
+    localStorage?: string | null;
+    sessionStorage?: string | null;
+    cache?: boolean;
+    database?: boolean;
+    cookie?: boolean;
+    registrations?: number;
+  }
+
+  function isProbeReport(data: unknown): data is ProbeReport {
+    return typeof data === "object" && data !== null && "action" in data;
+  }
+
+  function probeReports(origin: string, action: string): ProbeReport[] {
+    return messagesOf(origin, "fixture.probe")
+      .filter(isProbeReport)
+      .filter((report) => report.action === action);
+  }
+
+  // A sentinel probe on the content origin, framed by this page so it shares the shells' partition.
+  async function probe(origin: string, action: "seed" | "read" | "hold") {
+    const before = probeReports(origin, action).length;
+    const frame = document.createElement("iframe");
+    frame.src = `${origin}${HARNESS.shellPathPrefix}probe.html?action=${action}`;
+    container.append(frame);
+    const report = await vi.waitFor(() => {
+      const found = probeReports(origin, action)[before];
+      if (found === undefined) throw new Error(`waiting for the ${action} probe`);
+      return found;
+    }, SLOW);
+    if (action !== "hold") frame.remove();
+    return { frame, report };
+  }
+
+  const statesOf = new Map<WebProxyBroker, WebProxyBrokerState[]>();
+
+  function remember(view: { broker: WebProxyBroker; states: WebProxyBrokerState[] }) {
+    statesOf.set(view.broker, view.states);
+    return view.broker;
+  }
+
+  function scriptedView(query: Record<string, string> = {}): () => WebProxyBroker {
+    const params = new URLSearchParams(query).toString();
+    const bootstrapPath = params === "" ? SCRIPTED : `${SCRIPTED}?${params}`;
+    return () => remember(mount({ index: "app", bootstrapPath, handshakeTimeoutMs: 2000 }));
+  }
+
+  function realView(contentOrigin: string): () => WebProxyBroker {
+    return () => remember(mount({ index: "lifecycle", contentOrigin }));
+  }
+
+  function admit(
+    registry: ReturnType<typeof createBenchRegistry>,
+    name: string,
+    create: () => WebProxyBroker,
+  ) {
+    const broker = registry.mount(name, create);
+    if (broker === "refused") throw new Error(`mount of ${name} refused`);
+    return broker;
+  }
+
+  async function capable(broker: WebProxyBroker): Promise<void> {
+    await vi.waitFor(
+      () => expect(broker.getState()).toMatchObject({ lifecycle: "ready", purgeCapable: true }),
+      SLOW,
+    );
+  }
+
+  async function ready(broker: WebProxyBroker): Promise<void> {
+    await vi.waitFor(() => expect(broker.getState()).toMatchObject({ lifecycle: "ready" }), SLOW);
+  }
+
+  function signal(broker: WebProxyBroker, type: string): void {
+    currentFrame(broker).contentWindow?.postMessage({ type }, CONTENT_A);
+  }
+
+  async function settle(ms = 200): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function revokedOf(broker: WebProxyBroker) {
+    const state = broker.getState();
+    return state.status === "revoked" ? state : null;
+  }
+
+  it("R4/B4: a shell without the capability ends at once, unsupported, and releases the guard", async () => {
+    const registry = createBenchRegistry();
+    const broker = admit(registry, "scripted", scriptedView({ capable: "no" }));
+    await ready(broker);
+    const operation = registry.revokeAuthorityBench("scripted");
+    expect(broker.getFrame()).toBeNull();
+    const report = await operation;
+    expect(report).toMatchObject({ targeted: 1, sentAny: false, guard: "released" });
+    expect(report.docConfirmedAll).toBe(false);
+    expect(revokedOf(broker)?.purge).toMatchObject({ kind: "unsupported", sent: false });
+  }, 30_000);
+
+  it("B5: fences every view of the destination in the same synchronous turn", async () => {
+    const registry = createBenchRegistry();
+    const first = admit(registry, "scripted", scriptedView());
+    const second = admit(registry, "scripted", scriptedView());
+    await capable(first);
+    await capable(second);
+    const operation = registry.revokeAuthorityBench("scripted");
+    expect(first.getState().status).toBe("purging");
+    expect(second.getState().status).toBe("purging");
+    expect(currentFrame(first).inert).toBe(true);
+    expect(await operation).toMatchObject({
+      targeted: 2,
+      sentAny: true,
+      docConfirmedAll: true,
+      swConfirmedAll: true,
+      guard: "released",
+    });
+  }, 30_000);
+
+  it("B4/G1/G2: one uncertain view keeps the destination uncertain, refused and never released", async () => {
+    const registry = createBenchRegistry();
+    const unsupported = admit(registry, "scripted", scriptedView({ capable: "no" }));
+    const silent = admit(registry, "scripted", scriptedView({ purge: "silent" }));
+    await ready(unsupported);
+    await capable(silent);
+    const operation = registry.revokeAuthorityBench("scripted");
+    const created = { calls: 0 };
+    const create = () => {
+      created.calls += 1;
+      return scriptedView()();
+    };
+    expect(registry.mount("scripted", create)).toBe("refused");
+    expect(await operation).toMatchObject({ targeted: 2, sentAny: true, guard: "purge_uncertain" });
+    expect(revokedOf(silent)?.purge).toMatchObject({ kind: "timeout", sent: true });
+    expect(registry.mount("scripted", create)).toBe("refused");
+    expect(created.calls).toBe(0);
+    expect(await registry.revokeAuthorityBench("scripted")).toEqual({
+      op: null,
+      targeted: 0,
+      sentAny: false,
+      docConfirmedAll: false,
+      swConfirmedAll: false,
+      guard: "purge_uncertain",
+    });
+    const op = createLifecycleToken();
+    expect(await silent.purge({ op })).toEqual({ kind: "interrupted", op, sent: true });
+    expect(await unsupported.purge({ op })).toEqual({ kind: "interrupted", op, sent: false });
+  }, 30_000);
+
+  it("absorbs a loss while purging and ignores reports outside the purge or of another op", async () => {
+    const registry = createBenchRegistry();
+    const broker = admit(
+      registry,
+      "scripted",
+      scriptedView({ stray: "yes", purgeOn: "signal", purge: "other-op-first" }),
+    );
+    await capable(broker);
+    expect(broker.getState().status).toBe("granted");
+    const operation = registry.revokeAuthorityBench("scripted");
+    expect(broker.suspend("channel_lost")).toBe(true);
+    broker.revoke("transport_closed");
+    await settle();
+    expect(broker.getState().status).toBe("purging");
+    signal(broker, "fixture.scripted.purge");
+    expect(await operation).toMatchObject({ guard: "released", swConfirmedAll: true });
+    expect(revokedOf(broker)).toMatchObject({
+      reason: "transport_closed",
+      purge: { kind: "purged", sent: true },
+    });
+  }, 30_000);
+
+  it.each(["violate-side", "violate-g"])(
+    "G3: a violation (%s) closes no port and turns even a report into an interruption",
+    async (purge) => {
+      const registry = createBenchRegistry();
+      const broker = admit(registry, "scripted", scriptedView({ purge, purgeOn: "signal" }));
+      await capable(broker);
+      const operation = registry.revokeAuthorityBench("scripted");
+      await settle();
+      expect(broker.getState().status).toBe("purging");
+      expect(broker.getFrame()).not.toBeNull();
+      signal(broker, "fixture.scripted.purge");
+      expect(await operation).toMatchObject({ guard: "purge_uncertain" });
+      expect(revokedOf(broker)).toMatchObject({
+        reason: "protocol_error",
+        purge: { kind: "interrupted", sent: true },
+      });
+    },
+    30_000,
+  );
+
+  it("B1/G4: a purge while resuming ignores the late acknowledgement and settles the resume last", async () => {
+    const registry = createBenchRegistry();
+    const broker = admit(registry, "scripted", scriptedView({ closeOld: "yes" }));
+    await capable(broker);
+    expect(broker.suspend("channel_lost")).toBe(true);
+    const atResume: string[] = [];
+    const resumed = broker
+      .resume({ transport: createFixtureTransport({ index: "app" }) })
+      .then((result) => {
+        atResume.push(broker.getState().status);
+        return result;
+      });
+    expect(broker.getState().status).toBe("resuming");
+    const operation = registry.revokeAuthorityBench("scripted");
+    expect(broker.getState()).toMatchObject({ status: "purging", generation: 1 });
+    expect(await operation).toMatchObject({ guard: "released" });
+    expect(await resumed).toEqual({ kind: "failed", reason: "terminal" });
+    // The resume settles only at the purge's terminal, never while purging.
+    expect(atResume).toEqual(["revoked"]);
+    const granted = (statesOf.get(broker) ?? []).filter((state) => state.status === "granted");
+    expect(granted.map((state) => state.generation)).not.toContain(2);
+  }, 30_000);
+
+  it("G4: the pending resume stays pending until the purge's terminal", async () => {
+    const registry = createBenchRegistry();
+    const broker = admit(
+      registry,
+      "scripted",
+      scriptedView({ ackOn: "signal", purgeOn: "signal" }),
+    );
+    await capable(broker);
+    expect(broker.suspend("channel_lost")).toBe(true);
+    const outcome = { resume: "pending" };
+    const resumed = broker.resume({ transport: createFixtureTransport({ index: "app" }) });
+    void resumed.finally(() => {
+      outcome.resume = "settled";
+    });
+    const operation = registry.revokeAuthorityBench("scripted");
+    await settle();
+    expect(outcome.resume).toBe("pending");
+    signal(broker, "fixture.scripted.purge");
+    await operation;
+    expect(await resumed).toEqual({ kind: "failed", reason: "terminal" });
+  }, 30_000);
+
+  // A green run must keep the measured values: printed to the console and attached to the test.
+  async function keepMeasure(annotate: TestContext["annotate"], message: string): Promise<void> {
+    console.info(message);
+    await annotate(message);
+  }
+
+  // Measured from the fence (the purge call) to the frame's removal, against M7's 2 s. A timer is
+  // margin, not a guarantee: an excess here is a measured M7 failure.
+  function removalTimes(brokers: WebProxyBroker[]): () => number[] {
+    const started = performance.now();
+    const removed = new Map<WebProxyBroker, number>();
+    const observer = new MutationObserver(() => {
+      for (const broker of brokers) {
+        if (!removed.has(broker) && broker.getFrame() === null) {
+          removed.set(broker, performance.now() - started);
+        }
+      }
+    });
+    observer.observe(container, { childList: true });
+    return () => {
+      observer.disconnect();
+      return brokers.map((broker) => removed.get(broker) ?? Number.POSITIVE_INFINITY);
+    };
+  }
+
+  it("R1/R6/G8: purges wp-a's sentinels, leaves wp-b and the cookie, and removes frames within M7", async ({
+    annotate,
+  }) => {
+    expect((await probe(CONTENT_A, "seed")).report).toMatchObject({ cookie: true });
+    expect((await probe(CONTENT_B, "seed")).report).toMatchObject({ cookie: true });
+    const registry = createBenchRegistry();
+    const first = admit(registry, "wp-a", realView(CONTENT_A));
+    const second = admit(registry, "wp-a", realView(CONTENT_A));
+    const other = admit(registry, "wp-b", realView(CONTENT_B));
+    for (const broker of [first, second, other]) await capable(broker);
+    const times = removalTimes([first, second]);
+    const report = await registry.revokeAuthorityBench("wp-a");
+    const elapsed = times();
+    const measured = elapsed.map((value) => value.toFixed(1)).join(" ms, ");
+    await keepMeasure(annotate, `M7 R1 (fast path): fence to frame removal ${measured} ms`);
+    expect(Math.max(...elapsed)).toBeLessThan(2000);
+    expect(report).toMatchObject({ targeted: 2, docConfirmedAll: true, swConfirmedAll: true });
+    expect(report.guard).toBe("released");
+    expect(other.getState().status).toBe("granted");
+
+    const purged = (await probe(CONTENT_A, "read")).report;
+    expect(purged).toMatchObject({
+      localStorage: null,
+      sessionStorage: null,
+      cache: false,
+      database: false,
+      cookie: true,
+    });
+    await keepMeasure(
+      annotate,
+      `G6 observation: wp-a registrations after the purge: ${purged.registrations}`,
+    );
+    expect((await probe(CONTENT_B, "read")).report).toMatchObject({
+      localStorage: "1",
+      sessionStorage: "1",
+      cache: true,
+      database: true,
+      cookie: true,
+    });
+  }, 60_000);
+
+  it("R2: closing a view cleans nothing", async () => {
+    await probe(CONTENT_A, "seed");
+    const registry = createBenchRegistry();
+    const broker = admit(registry, "wp-a", realView(CONTENT_A));
+    await capable(broker);
+    broker.revoke("disposed");
+    expect(registry.guard("wp-a")).toBe("idle");
+    expect((await probe(CONTENT_A, "read")).report).toMatchObject({
+      localStorage: "1",
+      sessionStorage: "1",
+      cache: true,
+      database: true,
+    });
+  }, 60_000);
+
+  it("R3: a suspended view receives the purge over its side port", async () => {
+    await probe(CONTENT_A, "seed");
+    const registry = createBenchRegistry();
+    const broker = admit(registry, "wp-a", realView(CONTENT_A));
+    await capable(broker);
+    expect(broker.suspend("channel_lost")).toBe(true);
+    expect(await registry.revokeAuthorityBench("wp-a")).toMatchObject({
+      targeted: 1,
+      docConfirmedAll: true,
+      swConfirmedAll: true,
+      guard: "released",
+    });
+    expect((await probe(CONTENT_A, "read")).report).toMatchObject({
+      localStorage: null,
+      database: false,
+    });
+  }, 60_000);
+
+  it("B3/G5: a blocked database leaves every worker field unconfirmed before C's deadline", async ({
+    annotate,
+  }) => {
+    await probe(CONTENT_A, "seed");
+    const holder = await probe(CONTENT_A, "hold");
+    const registry = createBenchRegistry();
+    const broker = admit(registry, "wp-a", realView(CONTENT_A));
+    await capable(broker);
+    const times = removalTimes([broker]);
+    const report = await registry.revokeAuthorityBench("wp-a");
+    const [elapsed = Number.POSITIVE_INFINITY] = times();
+    await keepMeasure(
+      annotate,
+      `M7 B3 (K budget 1300 ms, blocked database): fence to frame removal ${elapsed.toFixed(1)} ms`,
+    );
+    expect(elapsed).toBeLessThan(2000);
+    expect(report).toMatchObject({ docConfirmedAll: true, swConfirmedAll: false });
+    expect(report.guard).toBe("purge_uncertain");
+    expect(revokedOf(broker)?.purge).toEqual(
+      expect.objectContaining({
+        kind: "purged",
+        caches: false,
+        indexedDB: false,
+        unregistered: false,
+      }),
+    );
+    holder.frame.remove();
+  }, 60_000);
+
+  it("G8/M7: a mute shell ends on the 1800 ms deadline and its frame still leaves within M7", async ({
+    annotate,
+  }) => {
+    const registry = createBenchRegistry();
+    const broker = admit(registry, "scripted", scriptedView({ purge: "silent" }));
+    await capable(broker);
+    const times = removalTimes([broker]);
+    const report = await registry.revokeAuthorityBench("scripted");
+    const [elapsed = Number.POSITIVE_INFINITY] = times();
+    await keepMeasure(
+      annotate,
+      `M7 mute K (C deadline 1800 ms): fence to frame removal ${elapsed.toFixed(1)} ms`,
+    );
+    expect(revokedOf(broker)?.purge).toMatchObject({ kind: "timeout", sent: true });
+    expect(report.guard).toBe("purge_uncertain");
+    // The deadline path, not a fast one: the view ended on C's own timer.
+    expect(elapsed).toBeGreaterThanOrEqual(1800);
+    expect(elapsed).toBeLessThan(2000);
+  }, 30_000);
 });

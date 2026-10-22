@@ -2,7 +2,12 @@
 // origin, so this channel is hygiene, not a boundary: the broker re-validates everything.
 // Replies from the bootstrap to the worker are K3 control messages, forwarded as received.
 
-import type { BridgeHeaders, BridgeMethod, BridgeRequestMode } from "../bridge-messages";
+import {
+  isPurgeOp,
+  type BridgeHeaders,
+  type BridgeMethod,
+  type BridgeRequestMode,
+} from "../bridge-messages";
 
 export interface ShellFetchRequest {
   method: BridgeMethod;
@@ -209,6 +214,42 @@ export function parseLifecycleArmed(data: unknown): ShellLifecycleArmedMessage |
   const isArmed = data.type === "paseo.shell.lifecycle.armed" && data.v === 1;
   if (!isArmed || !isTicket(data.nonce) || typeof data.armed !== "boolean") return null;
   return { type: "paseo.shell.lifecycle.armed", v: 1, nonce: data.nonce, armed: data.armed };
+}
+
+// Authoritative purge (lifecycle contract §5.9): the bootstrap asks the worker of its binding
+// with a port of its own. Booleans: true = confirmed for this operation and binding, false = not.
+export interface ShellPurgeMessage {
+  type: "paseo.shell.purge";
+  v: 1;
+  op: string;
+}
+
+export interface ShellPurgeResult {
+  caches: boolean;
+  indexedDB: boolean;
+  unregistered: boolean;
+}
+
+export interface ShellPurgedMessage extends ShellPurgeResult {
+  type: "paseo.shell.purged";
+  v: 1;
+  op: string;
+}
+
+export function parseShellPurge(data: unknown): ShellPurgeMessage | null {
+  if (!isRecord(data) || !hasKeys(data, ["type", "v", "op"])) return null;
+  if (data.type !== "paseo.shell.purge" || data.v !== 1 || !isPurgeOp(data.op)) return null;
+  return { type: "paseo.shell.purge", v: 1, op: data.op };
+}
+
+export function parseShellPurged(data: unknown): ShellPurgedMessage | null {
+  const keys = ["type", "v", "op", "caches", "indexedDB", "unregistered"];
+  if (!isRecord(data) || !hasKeys(data, keys)) return null;
+  if (data.type !== "paseo.shell.purged" || data.v !== 1 || !isPurgeOp(data.op)) return null;
+  const { caches, indexedDB, unregistered } = data;
+  if (typeof caches !== "boolean" || typeof indexedDB !== "boolean") return null;
+  if (typeof unregistered !== "boolean") return null;
+  return { type: "paseo.shell.purged", v: 1, op: data.op, caches, indexedDB, unregistered };
 }
 
 export function parseWorkerToBootstrapMessage(data: unknown): ShellWorkerToBootstrapMessage | null {

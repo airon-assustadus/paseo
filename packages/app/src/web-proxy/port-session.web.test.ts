@@ -85,6 +85,7 @@ function start(input: {
   limits?: BridgeLimits;
   capability?: WebProxyCapability;
   closePolicy?: () => "terminal" | "discard";
+  onViolation?: () => "revoke" | "absorb";
 }): Harness {
   const channel = new MessageChannel();
   openPorts.push(channel.port2);
@@ -118,6 +119,7 @@ function start(input: {
     onRevoked: (reason) => revocations.push(reason),
     onRedirectBlocked: (url) => blockedRedirects.push(url),
     closePolicy: input.closePolicy,
+    onViolation: input.onViolation,
   });
   function next(): Promise<unknown> {
     const queued = inbox.shift();
@@ -713,5 +715,28 @@ describe("quiesce and the tombstone", () => {
     });
     expect(received).toHaveLength(1);
     openPorts.push(...received);
+  });
+});
+
+describe("violations the broker absorbs during a purge", () => {
+  it("keeps the port open and the tombstone answering after a malformed message", async () => {
+    const violations: string[] = [];
+    const harness = start({
+      respond: () => Promise.resolve(ok(null)),
+      onViolation: () => {
+        violations.push("violation");
+        return "absorb";
+      },
+    });
+    harness.session.quiesce();
+    send(harness.content, { type: "paseo.web.bogus", v: 1 });
+    send(harness.content, requestMessage({ requestId: 3, mode: "navigate" }));
+    expect(await harness.next()).toMatchObject({
+      type: "paseo.web.response.head",
+      requestId: 3,
+      status: 204,
+    });
+    expect(violations).toEqual(["violation"]);
+    expect(harness.revocations).toEqual([]);
   });
 });

@@ -1,5 +1,6 @@
 import {
   DEFAULT_BRIDGE_LIMITS,
+  PURGE_DEADLINE_MS,
   createLifecycleToken,
   parseHello,
   parseLifecycleToBroker,
@@ -12,6 +13,7 @@ import {
   type LifecycleToShellMessage,
   type NavigationDroppedMessage,
   type PortGrantMessage,
+  type PurgedMessage,
 } from "./bridge-messages";
 import { startPortSession, type PortSession } from "./port-session.web";
 import { createCapability, type WebProxyCapability } from "./request-policy";
@@ -39,7 +41,28 @@ interface LifecycleFields {
   lifecycle: WebProxyLifecycle;
   workerArmed: boolean;
   navigationDrops: WebProxyNavigationDrops;
+  // The shell answered paseo.web.purge.capable. Diagnostic.
+  purgeCapable: boolean;
 }
+
+// Authoritative purge (lifecycle contract §5.9, synthetic bench only). `sent` says whether this
+// view ever posted paseo.web.purge: only sent: false proves the view caused no worker request.
+// The booleans are the cooperating shell's operational confirmation, never proof against hostile
+// content (L-P8).
+export type WebProxyPurgeOutcome =
+  | {
+      kind: "purged";
+      op: string;
+      sent: true;
+      localStorage: boolean;
+      sessionStorage: boolean;
+      caches: boolean;
+      indexedDB: boolean;
+      unregistered: boolean;
+    }
+  | { kind: "unsupported"; op: string; sent: false }
+  | { kind: "timeout"; op: string; sent: true }
+  | { kind: "interrupted"; op: string; sent: boolean };
 
 export type WebProxyBrokerState =
   | { status: "loading"; generation: number }
@@ -54,12 +77,15 @@ export type WebProxyBrokerState =
       lastResumeFailure: "transport_lost" | null;
     } & LifecycleFields)
   | ({ status: "resuming"; previous: number; generation: number } & LifecycleFields)
+  | ({ status: "purging"; generation: number; op: string } & LifecycleFields)
   | { status: "failed"; generation: number; reason: "handshake_timeout" }
   | {
       status: "revoked";
       generation: number;
       reason: BridgeRevokeReason;
       cause?: WebProxyTerminalCause;
+      // Only on the authoritative path.
+      purge?: WebProxyPurgeOutcome;
     };
 
 export type WebProxyResumeResult =
@@ -93,6 +119,19 @@ export interface WebProxyBroker {
   // Hands a new generation, served by `transport`, to the suspended shell. Authority starts
   // only with the shell's acknowledgement on the new port.
   resume(input: { transport: WebProxyTransport }): Promise<WebProxyResumeResult>;
+  // Authoritative close of this view: fences it at once, asks the shell to purge its origin, and
+  // ends the view on the report, on the deadline or on an interruption. Never called by a loss or
+  // by closeView.
+  purge(input: { op: string }): Promise<WebProxyPurgeOutcome>;
+}
+
+interface Purging {
+  op: string;
+  timer: ReturnType<typeof setTimeout>;
+  // A malformed message or messageerror on any port while purging: it never closes a port, and
+  // it turns the result into an interruption even if the report arrives.
+  violation: boolean;
+  settle(outcome: WebProxyPurgeOutcome): void;
 }
 
 export class WebProxyBrokerSetupError extends Error {
@@ -166,6 +205,11 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
   let resumption: Resumption | null = null;
   let lifecycle: WebProxyLifecycle = "negotiating";
   let workerArmed = false;
+  let purgeCapable = false;
+  let purgeQueryNonce: string | null = null;
+  // Sticky for the life of the view: once a purge was posted, it never reads false again.
+  let purgeSent = false;
+  let purging: Purging | null = null;
   const navigationDrops: WebProxyNavigationDrops = {
     head_timeout: 0,
     transport_closed: 0,
@@ -179,13 +223,17 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
   }
 
   function lifecycleFields(): LifecycleFields {
-    return { lifecycle, workerArmed, navigationDrops: { ...navigationDrops } };
+    return { lifecycle, workerArmed, navigationDrops: { ...navigationDrops }, purgeCapable };
   }
 
   function publishLifecycle(): void {
-    if (state.status === "granted" || state.status === "suspended" || state.status === "resuming") {
-      setState({ ...state, ...lifecycleFields() });
-    }
+    const status = state.status;
+    const hasLifecycle =
+      status === "granted" ||
+      status === "suspended" ||
+      status === "resuming" ||
+      status === "purging";
+    if (hasLifecycle) setState({ ...state, ...lifecycleFields() });
   }
 
   function clearHandshakeTimer(): void {
@@ -232,6 +280,12 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
 
   function revoke(reason: BridgeRevokeReason, cause?: WebProxyTerminalCause): void {
     if (isTerminal(state)) return;
+    if (purging !== null) {
+      // A loss is absorbed: the view is already fenced and only the purge decides its end.
+      if (reason !== "transport_closed")
+        finishPurge({ kind: "interrupted", op: purging.op, sent: true });
+      return;
+    }
     const current = session;
     session = null;
     current?.revoke(reason);
@@ -307,9 +361,17 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
         terminate({ status: "revoked", generation, reason });
       },
       onRedirectBlocked: (requestUrl) => options.onRedirectBlocked?.(requestUrl),
-      // While a new generation is being adopted, the shell drops this port on its own.
+      // While a new generation is being adopted or a purge runs, the shell may drop this port on
+      // its own; the purge goes on over the side port.
       closePolicy: () =>
-        session === started && state.status !== "resuming" ? "terminal" : "discard",
+        session === started && state.status !== "resuming" && state.status !== "purging"
+          ? "terminal"
+          : "discard",
+      onViolation: () => {
+        if (purging === null) return "revoke";
+        purging.violation = true;
+        return "absorb";
+      },
     });
     return started;
   }
@@ -379,11 +441,26 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
         generation: side.generation,
         offer: side.offer,
       });
+      // Asked once and never announced by the shell: a C without purge would revoke on it.
+      purgeQueryNonce = createLifecycleToken();
+      sendToShell({ type: "paseo.web.purge.query", v: 1, nonce: purgeQueryNonce });
       lifecycle = "ready";
       publishLifecycle();
       return true;
     }
     if (lifecycle !== "ready") return false;
+    if (message.type === "paseo.web.purge.capable") {
+      if (purgeQueryNonce === null || message.nonce !== purgeQueryNonce) return false;
+      purgeQueryNonce = null;
+      purgeCapable = true;
+      publishLifecycle();
+      return true;
+    }
+    if (message.type === "paseo.web.purged") {
+      // Outside a purge, or for another operation, a well-formed report changes nothing.
+      if (purging !== null && message.op === purging.op) finishPurge(purgedOutcome(message));
+      return true;
+    }
     if (message.type === "paseo.web.lifecycle.state") {
       workerArmed = message.workerArmed;
       publishLifecycle();
@@ -404,19 +481,31 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     return true;
   }
 
-  // The side port carries content from the content origin: a malformed message ends the view.
-  function onSideMessage(event: MessageEvent): void {
-    const message = parseLifecycleToBroker(event.data);
-    if (message === null || event.ports.length > 0 || !acceptSideMessage(message)) {
-      revoke("protocol_error");
+  // While purging, a violation is recorded instead of ending the view: no port closes before the
+  // purge's terminal, and the result becomes an interruption.
+  function violate(): void {
+    if (purging !== null) {
+      purging.violation = true;
+      return;
     }
-  }
-
-  function onSideMessageError(): void {
     revoke("protocol_error");
   }
 
+  // The side port carries content from the content origin: a malformed message ends the view.
+  function onSideMessage(event: MessageEvent): void {
+    const message = parseLifecycleToBroker(event.data);
+    if (message === null || event.ports.length > 0 || !acceptSideMessage(message)) violate();
+  }
+
+  function onSideMessageError(): void {
+    violate();
+  }
+
   function onSidePortClosed(): void {
+    if (purging !== null) {
+      finishPurge({ kind: "interrupted", op: purging.op, sent: true });
+      return;
+    }
     if (state.status === "suspended" || state.status === "resuming") {
       revoke("port_closed");
       return;
@@ -427,6 +516,8 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
   }
 
   function suspend(reason: LifecycleSuspendReason): boolean {
+    // Already fenced: a loss changes nothing while the purge runs.
+    if (purging !== null) return true;
     if (state.status === "resuming" && resumption !== null) {
       resumption.lost ??= reason;
       return true;
@@ -541,6 +632,88 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     grant(target);
   }
 
+  function purgedOutcome(message: PurgedMessage): WebProxyPurgeOutcome {
+    const { op, localStorage, sessionStorage, caches, indexedDB, unregistered } = message;
+    return {
+      kind: "purged",
+      op,
+      sent: true,
+      localStorage,
+      sessionStorage,
+      caches,
+      indexedDB,
+      unregistered,
+    };
+  }
+
+  // The purge's terminal: ports first (the retained candidate port included), then the frame,
+  // then the pending resume.
+  function finishPurge(outcome: WebProxyPurgeOutcome): void {
+    const current = purging;
+    if (current === null) return;
+    purging = null;
+    clearTimeout(current.timer);
+    const final: WebProxyPurgeOutcome = current.violation
+      ? { kind: "interrupted", op: current.op, sent: true }
+      : outcome;
+    const reason: BridgeRevokeReason = current.violation ? "protocol_error" : "transport_closed";
+    const { generation } = state;
+    const tomb = session;
+    session = null;
+    tomb?.revoke(reason);
+    const candidate = resumption;
+    resumption = null;
+    candidate?.port.close();
+    terminate({ status: "revoked", generation, reason, purge: final });
+    candidate?.settle({ kind: "failed", reason: "terminal" });
+    current.settle(final);
+  }
+
+  function endUnsupported(op: string): WebProxyPurgeOutcome {
+    const outcome: WebProxyPurgeOutcome = { kind: "unsupported", op, sent: false };
+    const generation = state.status === "resuming" ? state.previous : state.generation;
+    const current = session;
+    session = null;
+    current?.revoke("transport_closed");
+    terminate({ status: "revoked", generation, reason: "transport_closed", purge: outcome });
+    return outcome;
+  }
+
+  // B1: the late acknowledgement must not grant, publish or reopen, and neither the candidate port
+  // nor g closes before the purge's terminal; the resume promise stays pending until then (G4).
+  function detachAdoption(current: Resumption): void {
+    clearTimeout(current.timer);
+    current.port.removeEventListener("message", onAdoptionMessage);
+    current.port.removeEventListener("messageerror", onAdoptionMessageError);
+    current.port.removeEventListener("close", onAdoptionPortClosed);
+  }
+
+  // Synchronous until it returns the promise: the view is fenced before the caller moves on (B5).
+  function purge(input: { op: string }): Promise<WebProxyPurgeOutcome> {
+    const { op } = input;
+    if (isTerminal(state)) return Promise.resolve({ kind: "interrupted", op, sent: purgeSent });
+    if (purging !== null) return Promise.resolve({ kind: "interrupted", op, sent: true });
+    const status = state.status;
+    const isPurgeable =
+      purgeCapable &&
+      side !== null &&
+      (status === "granted" || status === "suspended" || status === "resuming");
+    if (!isPurgeable) return Promise.resolve(endUnsupported(op));
+    if (state.status === "resuming" && resumption !== null) detachAdoption(resumption);
+    const generation = state.status === "resuming" ? state.previous : state.generation;
+    fence();
+    const settled = Promise.withResolvers<WebProxyPurgeOutcome>();
+    const timer = setTimeout(
+      () => finishPurge({ kind: "timeout", op, sent: true }),
+      PURGE_DEADLINE_MS,
+    );
+    purging = { op, timer, violation: false, settle: settled.resolve };
+    setState({ status: "purging", generation, op, ...lifecycleFields() });
+    purgeSent = true;
+    sendToShell({ type: "paseo.web.purge", v: 1, op });
+    return settled.promise;
+  }
+
   function dispose(): void {
     revoke("disposed");
     clearHandshakeTimer();
@@ -562,5 +735,6 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     dispose,
     suspend,
     resume,
+    purge,
   };
 }

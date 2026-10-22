@@ -33,6 +33,9 @@ export interface PortSessionOptions {
   // What the content port closing means. The broker owns the answer: the current generation
   // ends the view, a generation it is already replacing is only dropped. Default: terminal.
   closePolicy?(): "terminal" | "discard";
+  // What a malformed message or messageerror means. During an authoritative purge the broker only
+  // records it, and no port closes before the purge's terminal. Default: revoke.
+  onViolation?(): "revoke" | "absorb";
 }
 
 export interface PortSession {
@@ -296,10 +299,15 @@ export function startPortSession(options: PortSessionOptions): PortSession {
     void serve(message, url, entry);
   }
 
+  function violate(): void {
+    if (options.onViolation?.() === "absorb") return;
+    revoke("protocol_error");
+  }
+
   function onMessage(event: MessageEvent): void {
     const message = parseContentMessage(event.data, limits);
     if (message === null || message.generation !== generation) {
-      revoke("protocol_error");
+      violate();
       return;
     }
     if (phase === "tombstone") {
@@ -331,7 +339,7 @@ export function startPortSession(options: PortSessionOptions): PortSession {
   }
 
   function onMessageError(): void {
-    revoke("protocol_error");
+    violate();
   }
 
   // The content side went away without a word (document destroyed, port garbage-collected).

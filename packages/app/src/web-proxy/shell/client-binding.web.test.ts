@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { PURGE_WORKER_BUDGET_MS } from "../bridge-messages";
 import {
   BINDING_LIMITS,
+  PURGE_SW_MAX_OPS,
   createClientBinding,
   type BindingConfig,
   type BindingRoute,
   type ClientBinding,
   type ShellClient,
+  type ShellPurgeHost,
+  type ShellPurgeRequest,
 } from "./client-binding.web";
 
 const ORIGIN = "https://wp-a.example";
@@ -43,7 +47,63 @@ afterEach(() => {
   for (const port of openPorts.splice(0)) port.close();
 });
 
-function createEnvironment() {
+interface FakeDeletion {
+  name: string;
+  succeed(): void;
+}
+
+interface FakePurgeHost extends ShellPurgeHost {
+  // One execution enumerates the caches once.
+  executions(): number;
+  deletions: FakeDeletion[];
+}
+
+// An origin with the given databases; each deletion stays pending (as "blocked" does) until the
+// test settles its request.
+function createPurgeHost(
+  input: {
+    databases?: string[];
+    failCaches?: boolean;
+    failDatabases?: boolean;
+    unregister?: () => Promise<boolean>;
+  } = {},
+): FakePurgeHost {
+  let executions = 0;
+  const deletions: FakeDeletion[] = [];
+  return {
+    executions: () => executions,
+    deletions,
+    caches: {
+      keys: async () => {
+        executions += 1;
+        if (input.failCaches === true) throw new Error("caches unavailable");
+        return ["page-cache"];
+      },
+      delete: async () => true,
+    },
+    indexedDB: {
+      databases: async () => {
+        if (input.failDatabases === true) throw new Error("indexedDB unavailable");
+        return (input.databases ?? []).map((name) => ({ name }));
+      },
+      deleteDatabase: (name) => {
+        const successes: Array<() => void> = [];
+        const request: ShellPurgeRequest = {
+          addEventListener: (type, listener) => {
+            if (type === "success") successes.push(listener);
+          },
+        };
+        deletions.push({ name, succeed: () => successes.forEach((listener) => listener()) });
+        return request;
+      },
+    },
+    unregister: input.unregister ?? (async () => true),
+  };
+}
+
+function waitUntilIgnored(): void {}
+
+function createEnvironment(purgeHost: ShellPurgeHost = createPurgeHost()) {
   const all = new Map<string, FakeClient>();
   const clock = { now: 1_000_000 };
   function add(id: string, path: string, frameType = "nested"): FakeClient {
@@ -68,6 +128,7 @@ function createEnvironment() {
       get: (id) => Promise.resolve(all.get(id)),
       matchAll: () => Promise.resolve([...all.values()]),
     },
+    purgeHost,
     now: () => clock.now,
   });
   return { all, clock, add, binding };
@@ -87,6 +148,7 @@ async function open(binding: ClientBinding, bootstrapId: string): Promise<Sessio
     data: { type: "paseo.shell.session.open" },
     sourceId: bootstrapId,
     ports: [channel.port2],
+    waitUntil: waitUntilIgnored,
   });
   await vi.waitFor(() => expect(inbox.length).toBeGreaterThan(0));
   return { port: channel.port1, inbox };
@@ -514,7 +576,12 @@ describe("lifecycle arm", () => {
     channel.port1.start();
     const ports = [channel.port2];
     if (input.extraPort === true) ports.push(new MessageChannel().port1);
-    input.binding.handleMessage({ data: input.data ?? ARM, sourceId: input.sourceId, ports });
+    input.binding.handleMessage({
+      data: input.data ?? ARM,
+      sourceId: input.sourceId,
+      ports,
+      waitUntil: waitUntilIgnored,
+    });
     return replies;
   }
 
@@ -589,6 +656,7 @@ describe("lifecycle arm", () => {
         get: (id) => Promise.resolve(env.all.get(id)),
         matchAll: () => Promise.resolve([...env.all.values()]),
       },
+      purgeHost: createPurgeHost(),
       now: () => env.clock.now,
     });
     const bootstrap = env.all.get("b1");
@@ -614,5 +682,190 @@ describe("lifecycle arm", () => {
     const route = await env.binding.routeSubresource("app-1");
     expect(route.kind).toBe("route");
     expect(armedOf(route)).toBe(false);
+  });
+});
+
+describe("authoritative purge in the worker", () => {
+  // Canonical base64url of 16 bytes: 21 characters and a last one in [AQgw].
+  function op(index: number): string {
+    return `${index.toString(36).padStart(21, "x")}A`;
+  }
+
+  function purgedOf(result: { caches: boolean; indexedDB: boolean; unregistered: boolean }) {
+    return (value: string) => ({ type: "paseo.shell.purged", v: 1, op: value, ...result });
+  }
+
+  const ALL_CONFIRMED = purgedOf({ caches: true, indexedDB: true, unregistered: true });
+  const NONE_CONFIRMED = purgedOf({ caches: false, indexedDB: false, unregistered: false });
+
+  function sendPurge(input: { binding: ClientBinding; sourceId: string; op: string }) {
+    const channel = new MessageChannel();
+    openPorts.push(channel.port1);
+    const replies: unknown[] = [];
+    channel.port1.addEventListener("message", (event) => replies.push(event.data));
+    channel.port1.start();
+    const waited: Array<Promise<unknown>> = [];
+    input.binding.handleMessage({
+      data: { type: "paseo.shell.purge", v: 1, op: input.op },
+      sourceId: input.sourceId,
+      ports: [channel.port2],
+      waitUntil: (promise) => waited.push(promise),
+    });
+    return { replies, waited };
+  }
+
+  function bootstraps(host: FakePurgeHost, ids: string[]) {
+    const env = createEnvironment(host);
+    for (const id of ids) env.add(id, CONFIG.bootstrapPath);
+    return env;
+  }
+
+  async function silence(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+
+  function settleDeletions(host: FakePurgeHost): void {
+    for (const deletion of host.deletions) deletion.succeed();
+  }
+
+  it("calls waitUntil during the dispatch with a promise bounded by the budget", async () => {
+    const host = createPurgeHost({ databases: ["page-db"] });
+    const env = bootstraps(host, ["b1"]);
+    const started = performance.now();
+    const { waited, replies } = sendPurge({ binding: env.binding, sourceId: "b1", op: op(1) });
+    expect(waited).toHaveLength(1);
+    await waited[0];
+    expect(performance.now() - started).toBeGreaterThanOrEqual(PURGE_WORKER_BUDGET_MS - 50);
+    expect(replies).toEqual([]);
+  });
+
+  it("keeps a blocked deletion pending and confirms only after it succeeds", async () => {
+    const host = createPurgeHost({ databases: ["page-db"] });
+    const env = bootstraps(host, ["b1"]);
+    const { replies } = sendPurge({ binding: env.binding, sourceId: "b1", op: op(1) });
+    await vi.waitFor(() => expect(host.deletions).toHaveLength(1));
+    await silence();
+    expect(replies).toEqual([]);
+    settleDeletions(host);
+    await vi.waitFor(() => expect(replies).toEqual([ALL_CONFIRMED(op(1))]));
+  });
+
+  it("shares one execution among every bootstrap that asks with the same op", async () => {
+    const host = createPurgeHost({ databases: ["page-db"] });
+    const env = bootstraps(host, ["b1", "b2"]);
+    const first = sendPurge({ binding: env.binding, sourceId: "b1", op: op(1) });
+    const second = sendPurge({ binding: env.binding, sourceId: "b2", op: op(1) });
+    await vi.waitFor(() => expect(host.deletions).toHaveLength(1));
+    settleDeletions(host);
+    await vi.waitFor(() => expect(second.replies).toEqual([ALL_CONFIRMED(op(1))]));
+    expect(first.replies).toEqual([ALL_CONFIRMED(op(1))]);
+    expect(host.executions()).toBe(1);
+  });
+
+  it("starts a different op only after the previous execution really finished", async () => {
+    const host = createPurgeHost({ databases: ["page-db"] });
+    const env = bootstraps(host, ["b1"]);
+    const first = sendPurge({ binding: env.binding, sourceId: "b1", op: op(1) });
+    const second = sendPurge({ binding: env.binding, sourceId: "b1", op: op(2) });
+    await vi.waitFor(() => expect(host.deletions).toHaveLength(1));
+    await silence();
+    expect(host.executions()).toBe(1);
+    settleDeletions(host);
+    await vi.waitFor(() => expect(first.replies).toEqual([ALL_CONFIRMED(op(1))]));
+    await vi.waitFor(() => expect(host.deletions).toHaveLength(2));
+    expect(host.executions()).toBe(2);
+    expect(second.replies).toEqual([]);
+    settleDeletions(host);
+    await vi.waitFor(() => expect(second.replies).toEqual([ALL_CONFIRMED(op(2))]));
+  });
+
+  it("reports nothing while one task is stuck, even though the others finished", async () => {
+    const unregistered = { calls: 0 };
+    const host = createPurgeHost({
+      databases: ["page-db"],
+      unregister: async () => {
+        unregistered.calls += 1;
+        return true;
+      },
+    });
+    const env = bootstraps(host, ["b1"]);
+    const { replies } = sendPurge({ binding: env.binding, sourceId: "b1", op: op(1) });
+    await vi.waitFor(() => expect(unregistered.calls).toBe(1));
+    await silence();
+    expect(replies).toEqual([]);
+  });
+
+  it("turns a failing task into false for that field only, never into true", async () => {
+    const host = createPurgeHost({
+      failCaches: true,
+      failDatabases: true,
+      unregister: async () => {
+        throw new Error("unregister failed");
+      },
+    });
+    const env = bootstraps(host, ["b1"]);
+    const { replies } = sendPurge({ binding: env.binding, sourceId: "b1", op: op(1) });
+    await vi.waitFor(() => expect(replies).toEqual([NONE_CONFIRMED(op(1))]));
+
+    const partial = createPurgeHost({ unregister: async () => false });
+    const second = bootstraps(partial, ["b1"]);
+    const answer = sendPurge({ binding: second.binding, sourceId: "b1", op: op(2) });
+    const expected = purgedOf({ caches: true, indexedDB: true, unregistered: false });
+    await vi.waitFor(() => expect(answer.replies).toEqual([expected(op(2))]));
+  });
+
+  it("refuses a new op once 16 accepted ops are pending, without running or queuing it", async () => {
+    const host = createPurgeHost({ databases: ["page-db"] });
+    const env = bootstraps(host, ["b1"]);
+    const accepted = Array.from({ length: PURGE_SW_MAX_OPS }, (_, index) =>
+      sendPurge({ binding: env.binding, sourceId: "b1", op: op(index + 1) }),
+    );
+    const refused = sendPurge({ binding: env.binding, sourceId: "b1", op: op(17) });
+    await vi.waitFor(() => expect(refused.replies).toEqual([NONE_CONFIRMED(op(17))]));
+    for (let done = 1; done <= PURGE_SW_MAX_OPS; done += 1) {
+      await vi.waitFor(() => expect(host.deletions).toHaveLength(done));
+      settleDeletions(host);
+    }
+    await vi.waitFor(() => expect(accepted.at(-1)?.replies).toHaveLength(1));
+    expect(host.executions()).toBe(PURGE_SW_MAX_OPS);
+    const again = sendPurge({ binding: env.binding, sourceId: "b1", op: op(17) });
+    await vi.waitFor(() => expect(again.replies).toEqual([NONE_CONFIRMED(op(17))]));
+    expect(host.executions()).toBe(PURGE_SW_MAX_OPS);
+  });
+
+  it("keeps resolved ops too: a 17th is refused and an old duplicate reuses its result", async () => {
+    const host = createPurgeHost();
+    const env = bootstraps(host, ["b1"]);
+    for (let index = 1; index <= PURGE_SW_MAX_OPS; index += 1) {
+      const { replies } = sendPurge({ binding: env.binding, sourceId: "b1", op: op(index) });
+      await vi.waitFor(() => expect(replies).toEqual([ALL_CONFIRMED(op(index))]));
+    }
+    const refused = sendPurge({ binding: env.binding, sourceId: "b1", op: op(17) });
+    await vi.waitFor(() => expect(refused.replies).toEqual([NONE_CONFIRMED(op(17))]));
+    const duplicate = sendPurge({ binding: env.binding, sourceId: "b1", op: op(1) });
+    await vi.waitFor(() => expect(duplicate.replies).toEqual([ALL_CONFIRMED(op(1))]));
+    expect(host.executions()).toBe(PURGE_SW_MAX_OPS);
+  });
+
+  it("answers only bootstraps, with or without a session", async () => {
+    const host = createPurgeHost();
+    const env = createEnvironment(host);
+    env.add("app-1", "/");
+    env.add("b9", CONFIG.bootstrapPath);
+    const fromPage = sendPurge({ binding: env.binding, sourceId: "app-1", op: op(1) });
+    expect(fromPage.waited).toHaveLength(1);
+    await silence();
+    expect(fromPage.replies).toEqual([]);
+    expect(host.executions()).toBe(0);
+    const sessionless = sendPurge({ binding: env.binding, sourceId: "b9", op: op(2) });
+    await vi.waitFor(() => expect(sessionless.replies).toEqual([ALL_CONFIRMED(op(2))]));
+  });
+
+  it("drops every session before purging", async () => {
+    const env = createEnvironment(createPurgeHost());
+    await enterApp({ env, bootstrapId: "b1", clientId: "app-1", ticket: TICKET_A });
+    const { replies } = sendPurge({ binding: env.binding, sourceId: "b1", op: op(1) });
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    expect((await env.binding.routeSubresource("app-1")).kind).toBe("refused");
   });
 });

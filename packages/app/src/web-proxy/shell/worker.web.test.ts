@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ControlMessage } from "../bridge-messages";
-import type { ShellClient } from "./client-binding.web";
+import type { ShellClient, ShellPurgeHost } from "./client-binding.web";
 import { readShellFetchFields } from "./relay-messages";
 import {
   createShellWorker,
@@ -118,6 +118,18 @@ function chunk(text: string): ControlMessage {
 
 const END: ControlMessage = { type: "paseo.web.response.end", v: 1, generation: 1, requestId: 1 };
 
+// An origin with nothing stored: every purge task confirms at once.
+const EMPTY_ORIGIN: ShellPurgeHost = {
+  caches: { keys: async () => [], delete: async () => true },
+  indexedDB: {
+    databases: async () => [],
+    deleteDatabase: () => ({ addEventListener: () => {} }),
+  },
+  unregister: async () => true,
+};
+
+function waitUntilIgnored(): void {}
+
 function createWorker(config: ShellWorkerConfig, clients: Map<string, ShellClient>): ShellWorker {
   return createShellWorker({
     config,
@@ -125,6 +137,7 @@ function createWorker(config: ShellWorkerConfig, clients: Map<string, ShellClien
       get: (id) => Promise.resolve(clients.get(id)),
       matchAll: () => Promise.resolve([...clients.values()]),
     },
+    purgeHost: EMPTY_ORIGIN,
     origin: ORIGIN,
   });
 }
@@ -143,6 +156,7 @@ async function admittedApp(config: ShellWorkerConfig = CONFIG): Promise<Harness>
     data: { type: "paseo.shell.session.open" },
     sourceId: "b1",
     ports: [channel.port2],
+    waitUntil: waitUntilIgnored,
   });
   await vi.waitFor(() => expect(others).toContainEqual({ type: "paseo.shell.session.ready" }));
   channel.port1.postMessage({ type: "paseo.shell.ticket.prepare", ticket: TICKET });
@@ -517,6 +531,7 @@ describe("createShellWorker lifecycle arm", () => {
       data: { type: "paseo.shell.lifecycle.arm", v: 1, nonce: NONCE },
       sourceId: "b1",
       ports: [channel.port2],
+      waitUntil: waitUntilIgnored,
     });
     return vi.waitFor(() => {
       const [first] = replies;
@@ -634,5 +649,32 @@ describe("createShellWorker lifecycle arm", () => {
     expect(response.status).toBe(204);
     expect(response.body).toBeNull();
     await vi.waitFor(() => expect(forwarded.fromWorker).toEqual([{ type: "paseo.shell.cancel" }]));
+  });
+});
+
+describe("createShellWorker authoritative purge", () => {
+  it("hands the message event's waitUntil to the purge during the dispatch, and answers", async () => {
+    const harness = await admittedApp();
+    const channel = new MessageChannel();
+    openPorts.push(channel.port1);
+    const replies: unknown[] = [];
+    channel.port1.addEventListener("message", (event) => replies.push(event.data));
+    channel.port1.start();
+    const waited: Array<Promise<unknown>> = [];
+    const op = "AAAAAAAAAAAAAAAAAAAAAA";
+    harness.worker.message({
+      data: { type: "paseo.shell.purge", v: 1, op },
+      sourceId: "b1",
+      ports: [channel.port2],
+      waitUntil: (promise) => waited.push(promise),
+    });
+    expect(waited).toHaveLength(1);
+    await vi.waitFor(() =>
+      expect(replies).toEqual([
+        { type: "paseo.shell.purged", v: 1, op, caches: true, indexedDB: true, unregistered: true },
+      ]),
+    );
+    // The purge dropped the session: the admitted document has no route any more.
+    expect((await subresource(harness, `${ORIGIN}/after`)).status).toBeGreaterThanOrEqual(400);
   });
 });

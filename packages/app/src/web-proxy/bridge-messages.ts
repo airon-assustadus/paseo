@@ -488,12 +488,59 @@ export interface NavigationDroppedMessage {
   cause: NavigationDropCause;
 }
 
-export type LifecycleToShellMessage = LifecycleReadyMessage | SuspendMessage | ResumeMessage;
+// Authoritative purge (lifecycle contract §5.9, synthetic bench only). C asks once whether the
+// shell can purge; the shell never announces it, because a C without purge treats any unrequested
+// side message as a protocol error.
+export interface PurgeQueryMessage {
+  type: "paseo.web.purge.query";
+  v: 1;
+  nonce: string;
+}
+
+export interface PurgeCapableMessage {
+  type: "paseo.web.purge.capable";
+  v: 1;
+  nonce: string;
+}
+
+export interface PurgeMessage {
+  type: "paseo.web.purge";
+  v: 1;
+  op: string;
+}
+
+// true = confirmed for this operation and binding at the moment it ran; false = not confirmed.
+export interface PurgedMessage {
+  type: "paseo.web.purged";
+  v: 1;
+  op: string;
+  localStorage: boolean;
+  sessionStorage: boolean;
+  caches: boolean;
+  indexedDB: boolean;
+  unregistered: boolean;
+}
+
+export type LifecycleToShellMessage =
+  | LifecycleReadyMessage
+  | SuspendMessage
+  | ResumeMessage
+  | PurgeQueryMessage
+  | PurgeMessage;
 export type LifecycleToBrokerMessage =
   | LifecycleAcceptMessage
   | LifecycleStateMessage
   | SuspendedMessage
-  | NavigationDroppedMessage;
+  | NavigationDroppedMessage
+  | PurgeCapableMessage
+  | PurgedMessage;
+
+// Neither is an authority timer: authority ended at the fence. They are engineering margin under
+// M7 (2 s), which the bench measures; a late timer is a measured M7 failure, never a guarantee.
+// C: counted from the view's fence.
+export const PURGE_DEADLINE_MS = 1800;
+// K: counted from the receipt of paseo.web.purge. SW: ceiling of the promise given to waitUntil.
+export const PURGE_WORKER_BUDGET_MS = 1300;
 
 const SUSPEND_REASONS: readonly LifecycleSuspendReason[] = ["channel_lost", "expired"];
 const DROP_CAUSES: readonly NavigationDropCause[] = [
@@ -508,6 +555,15 @@ export function isLifecycleToken(value: unknown): value is string {
   return typeof value === "string" && LIFECYCLE_TOKEN.test(value);
 }
 
+// Canonical base64url of 16 bytes: the last character carries only two bits.
+const PURGE_OP = /^[A-Za-z0-9_-]{21}[AQgw]$/;
+
+export function isPurgeOp(value: unknown): value is string {
+  return typeof value === "string" && PURGE_OP.test(value);
+}
+
+// Also the generator of purge operation ids: btoa leaves the trailing bits zero, so the result is
+// canonical and passes isPurgeOp.
 export function createLifecycleToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   const binary = String.fromCharCode(...bytes);
@@ -559,7 +615,53 @@ export function parseLifecycleToShell(data: unknown): LifecycleToShellMessage | 
     if (limits === null) return null;
     return { type: "paseo.web.resume", v: 1, previous, generation, limits };
   }
+  return parsePurgeToShell(data);
+}
+
+function parsePurgeToShell(data: Record<string, unknown>): PurgeQueryMessage | PurgeMessage | null {
+  if (data.type === "paseo.web.purge.query") {
+    if (!isVersioned(data, data.type, ["type", "v", "nonce"]) || !isLifecycleToken(data.nonce)) {
+      return null;
+    }
+    return { type: "paseo.web.purge.query", v: 1, nonce: data.nonce };
+  }
+  if (data.type === "paseo.web.purge") {
+    if (!isVersioned(data, data.type, ["type", "v", "op"]) || !isPurgeOp(data.op)) return null;
+    return { type: "paseo.web.purge", v: 1, op: data.op };
+  }
   return null;
+}
+
+const PURGED_FLAGS = [
+  "localStorage",
+  "sessionStorage",
+  "caches",
+  "indexedDB",
+  "unregistered",
+] as const;
+
+function parsePurged(data: Record<string, unknown>): PurgedMessage | null {
+  if (!isVersioned(data, "paseo.web.purged", ["type", "v", "op", ...PURGED_FLAGS])) return null;
+  const { op, localStorage, sessionStorage, caches, indexedDB, unregistered } = data;
+  if (!isPurgeOp(op)) return null;
+  const flags = [localStorage, sessionStorage, caches, indexedDB, unregistered];
+  if (!flags.every((flag) => typeof flag === "boolean")) return null;
+  return {
+    type: "paseo.web.purged",
+    v: 1,
+    op,
+    localStorage: localStorage === true,
+    sessionStorage: sessionStorage === true,
+    caches: caches === true,
+    indexedDB: indexedDB === true,
+    unregistered: unregistered === true,
+  };
+}
+
+function parsePurgeCapable(data: Record<string, unknown>): PurgeCapableMessage | null {
+  if (!isVersioned(data, "paseo.web.purge.capable", ["type", "v", "nonce"])) return null;
+  if (!isLifecycleToken(data.nonce)) return null;
+  return { type: "paseo.web.purge.capable", v: 1, nonce: data.nonce };
 }
 
 export function parseLifecycleToBroker(data: unknown): LifecycleToBrokerMessage | null {
@@ -590,6 +692,10 @@ export function parseLifecycleToBroker(data: unknown): LifecycleToBrokerMessage 
       if (!isOneOf(cause, DROP_CAUSES)) return null;
       return { type: "paseo.web.navigation.dropped", v: 1, generation, requestId, cause };
     }
+    case "paseo.web.purge.capable":
+      return parsePurgeCapable(data);
+    case "paseo.web.purged":
+      return parsePurged(data);
     default:
       return null;
   }
