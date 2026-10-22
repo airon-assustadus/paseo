@@ -14,6 +14,7 @@ import {
   type BindingRoute,
   type ShellClients,
   type ShellMessageInput,
+  type ShellPurgeHost,
 } from "./client-binding.web";
 import type { ShellDropCause, ShellFetchMessage, ShellRequestMessage } from "./relay-messages";
 
@@ -439,6 +440,7 @@ function validateShellWorkerConfig(config: ShellWorkerConfig): ShellWorkerConfig
 export function createShellWorker(input: {
   config: ShellWorkerConfig;
   clients: ShellClients;
+  purgeHost: ShellPurgeHost;
   origin: string;
   now?: () => number;
 }): ShellWorker {
@@ -455,6 +457,7 @@ export function createShellWorker(input: {
       resyncTimeoutMs: config.resyncTimeoutMs,
     },
     clients: input.clients,
+    purgeHost: input.purgeHost,
     now: input.now ?? Date.now,
   });
 
@@ -508,6 +511,7 @@ interface ShellExtendableMessageEvent {
   data: unknown;
   source: { id: string } | null;
   ports: ReadonlyArray<MessagePort>;
+  waitUntil(promise: Promise<unknown>): void;
 }
 
 interface ShellExtendableEvent {
@@ -517,6 +521,9 @@ interface ShellExtendableEvent {
 interface ShellWorkerScope {
   location: { origin: string };
   clients: ShellClients;
+  caches: CacheStorage;
+  indexedDB: IDBFactory;
+  registration: { unregister(): Promise<boolean> };
   skipWaiting(): Promise<void>;
   addEventListener(type: "install", listener: (event: ShellExtendableEvent) => void): void;
   addEventListener(type: "fetch", listener: (event: ShellFetchEvent) => void): void;
@@ -542,15 +549,22 @@ function isShellWorkerScope(value: unknown): value is ShellWorkerScope {
 
 export function installShellWorker(scope: unknown, config: ShellWorkerConfig): void {
   if (!isShellWorkerScope(scope)) throw new ShellWorkerScopeError();
+  const { registration } = scope;
   const worker = createShellWorker({
     config,
     clients: scope.clients,
+    purgeHost: {
+      caches: scope.caches,
+      indexedDB: scope.indexedDB,
+      unregister: () => registration.unregister(),
+    },
     origin: scope.location.origin,
   });
   scope.addEventListener("install", (event) => event.waitUntil(scope.skipWaiting()));
   scope.addEventListener("message", (event) => {
     const sourceId = event.source === null ? null : event.source.id;
-    worker.message({ data: event.data, sourceId, ports: event.ports });
+    const waitUntil = (promise: Promise<unknown>) => event.waitUntil(promise);
+    worker.message({ data: event.data, sourceId, ports: event.ports, waitUntil });
   });
   scope.addEventListener("fetch", (event) => {
     const decision = worker.fetch({

@@ -1,10 +1,14 @@
+import { PURGE_WORKER_BUDGET_MS } from "../bridge-messages";
 import {
   MAX_ADMITTED_CLIENTS,
   isSessionOpen,
   parseLifecycleArm,
   parseResyncReply,
+  parseShellPurge,
   parseSessionPortMessage,
   type ShellLifecycleArmedMessage,
+  type ShellPurgedMessage,
+  type ShellPurgeResult,
   type ShellRefusalReason,
   type ShellWorkerToBootstrapMessage,
 } from "./relay-messages";
@@ -65,6 +69,42 @@ export interface ShellMessageInput {
   data: unknown;
   sourceId: string | null;
   ports: ReadonlyArray<MessagePort>;
+  // The message event's waitUntil, callable only while the event is being dispatched.
+  waitUntil(promise: Promise<unknown>): void;
+}
+
+// Accepted purge operations per worker instance (lifecycle contract §5.9, R6): none ever leaves,
+// so a duplicate never runs twice; once full, a new op is refused without running.
+export const PURGE_SW_MAX_OPS = 16;
+
+// What the worker purges, injected so the unit tests can fake it. The real scope's CacheStorage,
+// IDBFactory and registration satisfy it.
+export interface ShellPurgeRequest {
+  addEventListener(type: "success" | "error", listener: () => void): void;
+}
+
+export interface ShellPurgeHost {
+  caches: { keys(): Promise<ReadonlyArray<string>>; delete(name: string): Promise<boolean> };
+  indexedDB: {
+    databases(): Promise<ReadonlyArray<{ name?: string }>>;
+    deleteDatabase(name: string): ShellPurgeRequest;
+  };
+  unregister(): Promise<boolean>;
+}
+
+const NOT_CONFIRMED: ShellPurgeResult = { caches: false, indexedDB: false, unregistered: false };
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// A task that throws is a task not confirmed; an error never becomes true.
+async function confirmed(task: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return await task();
+  } catch {
+    return false;
+  }
 }
 
 export interface NavigationInput {
@@ -106,10 +146,14 @@ function refused(code: BindingRefusal): BindingRoute {
 export function createClientBinding(input: {
   config: BindingConfig;
   clients: ShellClients;
+  purgeHost: ShellPurgeHost;
   now: () => number;
 }): ClientBinding {
-  const { config, clients, now } = input;
+  const { config, clients, purgeHost, now } = input;
   const sessions = new Map<string, Session>();
+  // Memory of this worker instance only (L-P2): a restart forgets every op.
+  const purgeRuns = new Map<string, Promise<ShellPurgeResult>>();
+  let purgeTail: Promise<unknown> = Promise.resolve();
   const closed: string[] = [];
   let resyncing: Promise<void> | null = null;
   let lastResyncAt = Number.NEGATIVE_INFINITY;
@@ -353,6 +397,74 @@ export function createClientBinding(input: {
     return resyncing;
   }
 
+  // "blocked" is not an outcome: the deletion waits for the other connections to close.
+  function deleteDatabase(name: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const request = purgeHost.indexedDB.deleteDatabase(name);
+      request.addEventListener("success", () => resolve(true));
+      request.addEventListener("error", () => resolve(false));
+    });
+  }
+
+  async function purgeCaches(): Promise<boolean> {
+    const names = await purgeHost.caches.keys();
+    await Promise.all(names.map((name) => purgeHost.caches.delete(name)));
+    return true;
+  }
+
+  async function purgeDatabases(): Promise<boolean> {
+    const databases = await purgeHost.indexedDB.databases();
+    const deleted = await Promise.all(
+      databases.map(({ name }) =>
+        name === undefined ? Promise.resolve(false) : deleteDatabase(name),
+      ),
+    );
+    return deleted.every(Boolean);
+  }
+
+  // Never rejects. The three tasks start together and none waits for another; the result is
+  // reported only when all three have finished.
+  async function executePurge(): Promise<ShellPurgeResult> {
+    try {
+      for (const session of Array.from(sessions.values())) dropSession(session);
+    } catch {
+      // Dropping routes confirms nothing, so a failure here changes no field.
+    }
+    const [caches, indexedDB, unregistered] = await Promise.all([
+      confirmed(purgeCaches),
+      confirmed(purgeDatabases),
+      confirmed(async () => (await purgeHost.unregister()) === true),
+    ]);
+    return { caches, indexedDB, unregistered };
+  }
+
+  function replyPurged(port: MessagePort, op: string, result: ShellPurgeResult): void {
+    const message: ShellPurgedMessage = { type: "paseo.shell.purged", v: 1, op, ...result };
+    port.postMessage(message, []);
+    port.close();
+  }
+
+  // Only a bootstrap may ask, with or without a session: the first execution drops every session,
+  // and the second view of the same operation must still be answered.
+  async function attendPurge(op: string, sourceId: string, port: MessagePort): Promise<void> {
+    if (!isBootstrap(await clients.get(sourceId))) {
+      port.close();
+      return;
+    }
+    let run = purgeRuns.get(op);
+    if (run === undefined) {
+      if (purgeRuns.size >= PURGE_SW_MAX_OPS) {
+        replyPurged(port, op, NOT_CONFIRMED);
+        return;
+      }
+      // A different op starts after the previous execution really finished, not after its budget.
+      run = purgeTail.then(executePurge);
+      purgeTail = run;
+      purgeRuns.set(op, run);
+    }
+    replyPurged(port, op, await run);
+  }
+
   async function knownOwner(clientId: string): Promise<Session | null> {
     const owned = ownerOf(clientId);
     if (owned !== null) return owned;
@@ -375,9 +487,17 @@ export function createClientBinding(input: {
   }
 
   return {
-    handleMessage({ data, sourceId, ports }) {
+    handleMessage({ data, sourceId, ports, waitUntil }) {
       const port = ports[0];
       if (sourceId === null || ports.length !== 1 || port === undefined) return;
+      const purgeRequest = parseShellPurge(data);
+      if (purgeRequest !== null) {
+        // Called during the dispatch and bounded: past the budget the bootstrap stopped waiting, and
+        // the browser may stop the worker mid-execution (L-P2). Nothing is confirmed unresolved.
+        const attended = attendPurge(purgeRequest.op, sourceId, port);
+        waitUntil(Promise.race([attended, delay(PURGE_WORKER_BUDGET_MS)]));
+        return;
+      }
       const armRequest = parseLifecycleArm(data);
       if (armRequest !== null) {
         void arm(sourceId, armRequest.nonce, port);
