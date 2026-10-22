@@ -1437,6 +1437,142 @@ describe("fixture event pages", () => {
   });
 });
 
+describe("Node-side authority revocation", () => {
+  it("fences every session, cancels uncredited WS/TCP streams and refuses old and new requests", async () => {
+    const host = await startHost({ tcp: true });
+    const download = await openSession(host);
+    const stream = await openTcpSession(host);
+    const idle = await authenticate(host);
+    download.send(
+      requestFrame({
+        requestId: 1,
+        url: `${host.fixture.http.origin}/large?bytes=4194304&n=revoke-large`,
+      }),
+    );
+    await download.take("head");
+    let received = 0;
+    while (received < BRIDGE_HARNESS_LIMITS.initialWindowBytes) {
+      received += Buffer.from((await download.take("body")).data, "base64").byteLength;
+    }
+    expect(pendingOfType(download, "end")).toEqual([]);
+    stream.send(
+      requestFrame({
+        requestId: 1,
+        url: `${host.fixture.http.origin}/sse?count=1000&intervalMs=5&n=revoke-sse`,
+      }),
+    );
+    await stream.take("head");
+    const before = host.backend.events.ofKind("request").length;
+    const first = host.revokeSessions();
+    expect(first).toEqual({
+      atMs: expect.any(Number),
+      sessionsRevoked: 2,
+      requestsActiveAtFence: 2,
+    });
+    expect(Number.isFinite(first.atMs)).toBe(true);
+    expect(first.atMs).toBeGreaterThanOrEqual(0);
+    download.send(
+      requestFrame({ requestId: 2, url: `${host.fixture.http.origin}/?n=after-fence` }),
+    );
+    expect(await download.take("closed")).toEqual({ type: "closed", reason: "revoked" });
+    expect(await stream.take("closed")).toEqual({ type: "closed", reason: "revoked" });
+    expect(
+      (await host.backend.events.waitFor("large.closed", (e) => e.nonce === "revoke-large"))
+        .completed,
+    ).toBe(false);
+    expect(
+      (await host.backend.events.waitFor("sse.closed", (e) => e.nonce === "revoke-sse")).completed,
+    ).toBe(false);
+    const opened = host.stats.sessionsOpened;
+    for (const client of [idle, await authenticateTcp(host)]) {
+      client.send({
+        type: "session.open",
+        scope: { origin: host.fixture.http.origin, pathPrefix: "/" },
+        ttlMs: 300_000,
+      });
+      expect(await client.take("session.open_failed")).toEqual({
+        type: "session.open_failed",
+        code: "permission_denied",
+      });
+    }
+    expect(host.stats.sessionsOpened).toBe(opened);
+    expect(host.backend.events.ofKind("request")).toHaveLength(before);
+    expect(host.revokeSessions()).toEqual({
+      atMs: first.atMs,
+      sessionsRevoked: 0,
+      requestsActiveAtFence: 0,
+    });
+    const independent = await startHost();
+    await openSession(independent);
+    expect(independent.stats.sessionsOpened).toBe(1);
+  });
+
+  it("cancels all sessions even when a terminal notification writer throws", async () => {
+    let notices = 0;
+    const terminalBeforeRelease: boolean[] = [];
+    const host = await startHost({
+      tcp: true,
+      harness: {
+        writeClosed: (write) => {
+          terminalBeforeRelease.push(host.backend.events.ofKind("sse.closed").length === 0);
+          if (++notices === 1) throw new Error("private-terminal-sentinel");
+          write();
+        },
+      },
+    });
+    const first = await openSession(host);
+    const second = await openTcpSession(host);
+    for (const [client, nonce] of [
+      [first, "notify-fail"],
+      [second, "notify-ok"],
+    ] as const) {
+      client.send(
+        requestFrame({
+          requestId: 1,
+          url: `${host.fixture.http.origin}/sse?count=1000&intervalMs=5&n=${nonce}`,
+        }),
+      );
+      await client.take("head");
+    }
+    expect(host.revokeSessions()).toMatchObject({ sessionsRevoked: 2, requestsActiveAtFence: 2 });
+    await first.closed;
+    expect(await second.take("closed")).toEqual({ type: "closed", reason: "revoked" });
+    for (const nonce of ["notify-fail", "notify-ok"]) {
+      expect(
+        (await host.backend.events.waitFor("sse.closed", (e) => e.nonce === nonce)).completed,
+      ).toBe(false);
+    }
+    expect(notices).toBe(2);
+    expect(terminalBeforeRelease).toEqual([true, true]);
+    expect(JSON.stringify(host.diagnostics())).not.toContain("private-terminal-sentinel");
+    expect(host.revokeSessions().sessionsRevoked).toBe(0);
+  });
+
+  it("does not replay a held POST or deliver it when released after revocation", async () => {
+    const host = await startHost();
+    const client = await openSession(host);
+    client.send(
+      requestFrame({
+        requestId: 1,
+        method: "POST",
+        url: `${host.fixture.http.origin}/post/revoke-held?hold=1&n=revoke-held`,
+        body: { kind: "none" },
+      }),
+    );
+    await host.backend.events.waitFor("post.count", (e) => e.token === "revoke-held");
+    host.revokeSessions();
+    expect(await client.take("closed")).toEqual({ type: "closed", reason: "revoked" });
+    await host.backend.events.waitFor("post.abandoned", (e) => e.token === "revoke-held");
+    expect(host.backend.releasePost("revoke-held")).toBe(1);
+    expect(
+      (await host.backend.events.waitFor("post.released", (e) => e.token === "revoke-held"))
+        .delivered,
+    ).toBe(false);
+    expect(host.backend.postCount("revoke-held")).toBe(1);
+    expect(pendingOfType(client, "head")).toEqual([]);
+  });
+});
+
 describe("close", () => {
   it("shuts sessions, sockets, the fixture and both listeners, once", async () => {
     const host = await startHost();

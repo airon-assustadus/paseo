@@ -155,6 +155,8 @@ export interface BridgeHostHarnessOptions {
   /** Extra allowlist targets, for destinations that need a name lookup. */
   extraAllowlistTargets?: readonly string[];
   fixtureLimits?: Partial<FixtureLimits>;
+  /** Notification writer port: tests can fail delivery without replacing the session executor. */
+  writeClosed?: (write: () => void) => void;
   /** Throws at the start of that step, after the previous ones opened: proves partial cleanup. */
   failStep?: BridgeHostStep;
 }
@@ -230,6 +232,14 @@ export interface BridgeHostStats {
   truncatedFrames: number;
 }
 
+export interface BridgeRevocationResult {
+  /** First authority fence, in this host process's monotonic milliseconds. */
+  atMs: number;
+  sessionsRevoked: number;
+  /** Observed before revoke, not a count of released sockets. */
+  requestsActiveAtFence: number;
+}
+
 export interface BridgeHost extends BridgeHostInfo {
   diagnostics(): BridgeTraceSnapshot;
   readonly stats: BridgeHostStats;
@@ -237,6 +247,8 @@ export interface BridgeHost extends BridgeHostInfo {
   readonly backend: WebProxyFixture;
   /** Replays the next `request` frame once, so a test can watch the core refuse it. */
   duplicateNextRequest(): void;
+  /** Irreversible Node-only fence for this host, never a bridge protocol operation. */
+  revokeSessions(): BridgeRevocationResult;
   close(): Promise<void>;
 }
 
@@ -348,6 +360,8 @@ interface BridgeTransport {
 }
 
 interface BridgeRuntime {
+  authorityRevoked: boolean;
+  writeClosed: BridgeHostHarnessOptions["writeClosed"];
   trace: BridgeTrace;
   token: Buffer;
   allowlists: AllowlistStore;
@@ -374,6 +388,7 @@ interface BridgeRuntime {
 
 interface BridgeConnection {
   shutdown(): Promise<void>;
+  revokeSession(): Omit<BridgeRevocationResult, "atMs">;
 }
 
 export function startBridgeHost(options: StartBridgeHostOptions): Promise<BridgeHost> {
@@ -474,6 +489,8 @@ async function openBridgeHost(
       return closing === null && unauthenticated < BRIDGE_MAX_UNAUTHENTICATED;
     }
     const runtime: BridgeRuntime = {
+      authorityRevoked: false,
+      writeClosed: harness.writeClosed,
       trace,
       token,
       allowlists: bridgeAllowlists(backend, harness.extraAllowlistTargets ?? []),
@@ -495,6 +512,28 @@ async function openBridgeHost(
         connections.delete(connection);
       },
     };
+    let revokedAt: number | null = null;
+    let revocationFailure: Error | null = null;
+    function revokeSessions(): BridgeRevocationResult {
+      revokedAt ??= performance.now();
+      runtime.authorityRevoked = true;
+      let sessionsRevoked = 0;
+      let requestsActiveAtFence = 0;
+      // Closing a connection can remove it from the shared registry during notification.
+      const currentConnections = [...connections];
+      for (const connection of currentConnections) {
+        try {
+          const counts = connection.revokeSession();
+          sessionsRevoked += counts.sessionsRevoked;
+          requestsActiveAtFence += counts.requestsActiveAtFence;
+        } catch {
+          // Attempt every connection, but never report an unexpected executor failure as success.
+          revocationFailure ??= new Error("Bridge session revocation failed");
+        }
+      }
+      if (revocationFailure !== null) throw revocationFailure;
+      return { atMs: revokedAt, sessionsRevoked, requestsActiveAtFence };
+    }
     const wss = new WebSocketServer({
       noServer: true,
       maxPayload: BRIDGE_MAX_PAYLOAD_BYTES,
@@ -560,6 +599,7 @@ async function openBridgeHost(
         };
       },
       diagnostics: () => trace.snapshot(),
+      revokeSessions,
       duplicateNextRequest: () => {
         runtime.duplicateArmed = true;
       },
@@ -874,8 +914,24 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
       if (state === "closed") return;
       state = "closed";
       forgetAllRequests();
-      write({ type: "closed", reason });
-      transport.close(hostClosing ? 1001 : 1000);
+      try {
+        const notice = () => {
+          write({ type: "closed", reason });
+        };
+        if (runtime.writeClosed) runtime.writeClosed(notice);
+        else notice();
+      } catch {
+        // The core cancels exchanges after this callback. Failed delivery must not interrupt it.
+      }
+      try {
+        transport.close(hostClosing ? 1001 : 1000);
+      } catch {
+        try {
+          transport.destroy();
+        } catch {
+          // A transport failure cannot prevent the core's local cancellation either.
+        }
+      }
     },
   };
 
@@ -1054,6 +1110,10 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
       terminate(1008);
       return;
     }
+    if (runtime.authorityRevoked) {
+      send({ type: "session.open_failed", code: "permission_denied" });
+      return;
+    }
     const limits = lowerLimits(runtime.limits, requested);
     if (limits === null) {
       send({ type: "session.open_failed", code: "invalid_configuration" });
@@ -1067,7 +1127,7 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
         scope,
         ttlMs,
         limits,
-        isAuthorized: () => state !== "closed" && transport.isOpen(),
+        isAuthorized: () => !runtime.authorityRevoked && state !== "closed" && transport.isOpen(),
         protectedLocalPorts: () => runtime.protectedPorts,
         lookup: runtime.lookup,
         tlsCa: runtime.tlsCa,
@@ -1206,7 +1266,15 @@ function attachConnection(transport: BridgeTransport, runtime: BridgeRuntime): B
     }
   }
 
-  const connection: BridgeConnection = { shutdown };
+  function revokeSession(): Omit<BridgeRevocationResult, "atMs"> {
+    if (session === null || !session.isOpen)
+      return { sessionsRevoked: 0, requestsActiveAtFence: 0 };
+    const requestsActiveAtFence = session.activeRequests;
+    session.revoke("revoked");
+    return { sessionsRevoked: 1, requestsActiveAtFence };
+  }
+
+  const connection: BridgeConnection = { shutdown, revokeSession };
   return connection;
 }
 
