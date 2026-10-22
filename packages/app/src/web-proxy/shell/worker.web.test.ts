@@ -503,3 +503,136 @@ describe("configuration", () => {
     );
   });
 });
+
+describe("createShellWorker lifecycle arm", () => {
+  const NONCE = "NNNNNNNNNNNNNNNNNNNNNN";
+
+  async function arm(harness: Harness): Promise<unknown> {
+    const channel = new MessageChannel();
+    openPorts.push(channel.port1);
+    const replies: unknown[] = [];
+    channel.port1.addEventListener("message", (event) => replies.push(event.data));
+    channel.port1.start();
+    harness.worker.message({
+      data: { type: "paseo.shell.lifecycle.arm", v: 1, nonce: NONCE },
+      sourceId: "b1",
+      ports: [channel.port2],
+    });
+    return vi.waitFor(() => {
+      const [first] = replies;
+      if (first === undefined) throw new Error("no armed reply yet");
+      return first;
+    });
+  }
+
+  // A navigation of the app frame: the document app-1 is replaced by app-2.
+  function appNavigation(harness: Harness, path: string): Promise<Response> {
+    return respond(
+      harness.worker.fetch({
+        request: navigation(`${ORIGIN}${path}`),
+        clientId: "app-1",
+        resultingClientId: "app-2",
+      }),
+    );
+  }
+
+  const transportClosed: ControlMessage = {
+    type: "paseo.web.response.error",
+    v: 1,
+    generation: 1,
+    requestId: 1,
+    code: "transport_error",
+    reason: "transport_closed",
+  };
+
+  it("arms the bootstrap's own session and says so", async () => {
+    const harness = await admittedApp();
+    expect(await arm(harness)).toEqual({
+      type: "paseo.shell.lifecycle.armed",
+      v: 1,
+      nonce: NONCE,
+      armed: true,
+    });
+  });
+
+  it("keeps the document of a protected navigation whose head times out, and says why", async () => {
+    const harness = await admittedApp({ ...CONFIG, headTimeoutMs: 20 });
+    await arm(harness);
+    const response = await appNavigation(harness, "/next");
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    const forwarded = await forwardedAt(harness, 1);
+    await vi.waitFor(() =>
+      expect(forwarded.fromWorker).toEqual([
+        { type: "paseo.shell.request.dropped", cause: "head_timeout" },
+      ]),
+    );
+  });
+
+  it("still answers bridge_timeout to an unarmed navigation and to an armed subresource", async () => {
+    const unarmed = await admittedApp({ ...CONFIG, headTimeoutMs: 20 });
+    expect((await appNavigation(unarmed, "/next")).status).toBe(504);
+    const forwarded = await forwardedAt(unarmed, 1);
+    await vi.waitFor(() => expect(forwarded.fromWorker).toEqual([{ type: "paseo.shell.cancel" }]));
+
+    const armed = await admittedApp({ ...CONFIG, headTimeoutMs: 20 });
+    await arm(armed);
+    const response = await subresource(armed, `${ORIGIN}/slow`);
+    expect(response.status).toBe(504);
+    expect(response.headers.get("x-paseo-web-proxy-error")).toBe("bridge_timeout");
+  });
+
+  it("keeps the document when a protected navigation loses its transport before the head", async () => {
+    const harness = await admittedApp();
+    await arm(harness);
+    const pending = appNavigation(harness, "/next");
+    const forwarded = await forwardedAt(harness, 1);
+    reply(forwarded.port, transportClosed);
+    expect((await pending).status).toBe(204);
+    await vi.waitFor(() =>
+      expect(forwarded.fromWorker).toEqual([
+        { type: "paseo.shell.request.dropped", cause: "transport_closed" },
+      ]),
+    );
+  });
+
+  it("answers 502 to an unarmed transport loss and to a revoke even when armed", async () => {
+    const unarmed = await admittedApp();
+    const lost = appNavigation(unarmed, "/next");
+    reply((await forwardedAt(unarmed, 1)).port, transportClosed);
+    expect((await lost).status).toBe(502);
+
+    const armed = await admittedApp();
+    await arm(armed);
+    const revoked = appNavigation(armed, "/next");
+    const forwarded = await forwardedAt(armed, 1);
+    reply(forwarded.port, { type: "paseo.web.revoke", v: 1, generation: 1, reason: "disposed" });
+    const response = await revoked;
+    expect(response.status).toBe(502);
+    expect(response.headers.get("x-paseo-web-proxy-error")).toBe("session_revoked");
+    expect(forwarded.fromWorker).toEqual([]);
+  });
+
+  it("leaves the body phase of a protected navigation unchanged", async () => {
+    const harness = await admittedApp();
+    await arm(harness);
+    const pending = appNavigation(harness, "/next");
+    const forwarded = await forwardedAt(harness, 1);
+    reply(forwarded.port, head(200));
+    const response = await pending;
+    reply(forwarded.port, transportClosed);
+    await expect(response.text()).rejects.toMatchObject({ reason: "transport_closed" });
+  });
+
+  it("turns a v1 204 head into a null 204 response and releases the host request", async () => {
+    const harness = await admittedApp();
+    await arm(harness);
+    const pending = appNavigation(harness, "/next");
+    const forwarded = await forwardedAt(harness, 1);
+    reply(forwarded.port, head(204));
+    const response = await pending;
+    expect(response.status).toBe(204);
+    expect(response.body).toBeNull();
+    await vi.waitFor(() => expect(forwarded.fromWorker).toEqual([{ type: "paseo.shell.cancel" }]));
+  });
+});

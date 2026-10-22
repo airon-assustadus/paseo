@@ -11,7 +11,7 @@ export const FIXTURE_DESTINATION_ORIGIN = "http://127.0.0.1:4173";
 export const FIXTURE_BIG_BODY_BYTES = 600_000;
 export const FIXTURE_SECRET_COOKIE = "sid=fixture-httponly-secret";
 
-export type FixtureIndex = "app" | "navigate-parent" | "hang" | "framing";
+export type FixtureIndex = "app" | "navigate-parent" | "hang" | "framing" | "lifecycle";
 
 export interface RecordedRequest {
   url: string;
@@ -26,6 +26,7 @@ export interface FixtureTransport extends WebProxyTransport {
   // Resolves when a pending /hang request's signal aborts.
   waitForHangAbort(): Promise<void>;
   waitForHangRequest(): Promise<void>;
+  failNavigationBody(): void;
 }
 
 const APP_HTML = `<!doctype html>
@@ -143,12 +144,97 @@ child.addEventListener("load", () => {
 document.body.append(child);
 </script></body></html>`;
 
+// A page the test drives by message (ticket04 lifecycle, P1–P6). Each document draws a random
+// identity, so a report tells whether the frame still holds the same document, with its typed
+// text and focus. "/" is page A; "/b" is page B, and "/b-stream" is B with a body that never ends.
+function lifecycleHtml(page: "A" | "B", complete = true): string {
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Lifecycle ${page}</title></head><body>
+<h1>Lifecycle ${page}</h1>
+<input id="note" value="">
+<button id="press" type="button">Press</button>
+<a id="hold" href="hold">hold</a>
+<form id="form" method="post" action="hold-post"><input name="v" value="1"></form>
+<script>
+${REPORT_TO_ANCESTORS}
+const identity = crypto.randomUUID();
+function centerOf(id) {
+  const box = document.getElementById(id).getBoundingClientRect();
+  return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
+}
+function report(kind, extra) {
+  const active = document.activeElement;
+  reportToAncestors({
+    type: "fixture.lifecycle",
+    kind,
+    page: "${page}",
+    identity,
+    note: document.getElementById("note").value,
+    focused: active === null || active === document.body ? null : active.id,
+    press: centerOf("press"),
+    notePosition: centerOf("note"),
+    ...extra,
+  });
+}
+document.getElementById("press").addEventListener("click", () => report("pressed"));
+document.getElementById("note").addEventListener("focus", () => report("focused"));
+window.addEventListener("load", () => report("load"));
+window.addEventListener("message", (event) => {
+  const command = event.data;
+  if (command === null || typeof command !== "object" || command.type !== "fixture.lifecycle.command") return;
+  if (command.name === "type") {
+    const note = document.getElementById("note");
+    note.focus();
+    note.value = command.text;
+  }
+  if (command.name === "link") document.getElementById("hold").click();
+  if (command.name === "post") document.getElementById("form").requestSubmit();
+  if (command.name === "go") location.assign(command.path);
+  if (command.name === "fetch") {
+    fetch(command.path).then((response) => response.text()).then(
+      (text) => report("fetched", { text }),
+      () => report("fetch_failed"),
+    );
+    return;
+  }
+  if (command.name === "navigate-parent") {
+    const injected = parent.document.createElement("script");
+    injected.textContent = "location.replace(location.href)";
+    parent.document.body.append(injected);
+    return;
+  }
+  report(command.name);
+});
+report("loaded");
+</script>`;
+  return complete ? `${html}</body></html>` : html;
+}
+
 const INDEX_HTML: Record<FixtureIndex, string> = {
   app: APP_HTML,
   "navigate-parent": NAVIGATE_PARENT_HTML,
   hang: HANG_HTML,
   framing: FRAMING_HTML,
+  lifecycle: lifecycleHtml("A"),
 };
+
+// Never answers: the request stays in its head phase until the bridge aborts it.
+function held(signal: AbortSignal): Promise<WebProxyTransportResponse> {
+  return new Promise((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason));
+  });
+}
+
+// Sends a head and part of a body, then nothing: the request stays in its body phase.
+function openEndedHtml(text: string): WebProxyTransportResponse {
+  const bytes = new TextEncoder().encode(text);
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+    },
+  });
+  return { status: 200, statusText: "OK", headers: [["content-type", "text/html"]], body };
+}
 
 function textStream(text: string): ReadableStream<Uint8Array> {
   const bytes = new TextEncoder().encode(text);
@@ -191,6 +277,9 @@ export function createFixtureTransport(options: { index: FixtureIndex }): Fixtur
   const requests: RecordedRequest[] = [];
   const hangRequested = createDeferred();
   const hangAborted = createDeferred();
+  let failNavigationBody: () => void = () => {
+    throw new Error("no pending navigation body");
+  };
 
   function route(
     request: WebProxyTransportRequest,
@@ -237,6 +326,22 @@ export function createFixtureTransport(options: { index: FixtureIndex }): Fixtur
         return Promise.resolve(
           respond(200, [...html, ["content-security-policy", "img-src 'none'"]], FRAMED_HTML),
         );
+      case "/b":
+        return Promise.resolve(respond(200, html, lifecycleHtml("B")));
+      case "/b-stream":
+        return Promise.resolve(openEndedHtml(lifecycleHtml("B", false)));
+      case "/b-error": {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(lifecycleHtml("B", false)));
+            failNavigationBody = () => controller.error(new Error("fixture body failed"));
+          },
+        });
+        return Promise.resolve({ status: 200, statusText: "OK", headers: html, body });
+      }
+      case "/hold":
+      case "/hold-post":
+        return held(signal);
       case "/hang":
         hangRequested.resolve();
         return new Promise((_resolve, reject) => {
@@ -254,6 +359,7 @@ export function createFixtureTransport(options: { index: FixtureIndex }): Fixtur
     requests,
     waitForHangAbort: () => hangAborted.promise,
     waitForHangRequest: () => hangRequested.promise,
+    failNavigationBody: () => failNavigationBody(),
     request(request, signal) {
       const bodyText = request.body === null ? null : new TextDecoder().decode(request.body);
       requests.push({

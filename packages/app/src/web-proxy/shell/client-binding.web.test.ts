@@ -496,3 +496,123 @@ describe("resync after a worker restart", () => {
     );
   });
 });
+
+describe("lifecycle arm", () => {
+  const NONCE = "NNNNNNNNNNNNNNNNNNNNNN";
+  const ARM = { type: "paseo.shell.lifecycle.arm", v: 1, nonce: NONCE };
+
+  function sendArm(input: {
+    binding: ClientBinding;
+    sourceId: string;
+    data?: unknown;
+    extraPort?: boolean;
+  }): unknown[] {
+    const channel = new MessageChannel();
+    openPorts.push(channel.port1);
+    const replies: unknown[] = [];
+    channel.port1.addEventListener("message", (event) => replies.push(event.data));
+    channel.port1.start();
+    const ports = [channel.port2];
+    if (input.extraPort === true) ports.push(new MessageChannel().port1);
+    input.binding.handleMessage({ data: input.data ?? ARM, sourceId: input.sourceId, ports });
+    return replies;
+  }
+
+  function armedReply(armed: boolean) {
+    return { type: "paseo.shell.lifecycle.armed", v: 1, nonce: NONCE, armed };
+  }
+
+  function armedOf(route: BindingRoute): boolean | null {
+    return route.kind === "route" ? route.armed : null;
+  }
+
+  function hasResync(client: FakeClient): boolean {
+    return client.inbox.some((entry) => typeOf(entry.message) === "paseo.shell.resync");
+  }
+
+  function answerResync(client: FakeClient, admitted: string[]): void {
+    const delivery = client.inbox.findLast(
+      (entry) => typeOf(entry.message) === "paseo.shell.resync",
+    );
+    const port = delivery?.ports[0];
+    if (port === undefined) throw new Error("no resync request");
+    port.postMessage({ type: "paseo.shell.resync.reply", admitted });
+  }
+
+  it("arms only the sender's session, without a word on the session port", async () => {
+    const env = createEnvironment();
+    const first = await enterApp({ env, bootstrapId: "b1", clientId: "app-1", ticket: TICKET_A });
+    await enterApp({ env, bootstrapId: "b2", clientId: "app-2", ticket: TICKET_B });
+    expect(armedOf(first.route)).toBe(false);
+    const before = [...first.session.inbox];
+
+    const replies = sendArm({ binding: env.binding, sourceId: "b1" });
+    await vi.waitFor(() => expect(replies).toEqual([armedReply(true)]));
+
+    expect(armedOf(await env.binding.routeSubresource("app-1"))).toBe(true);
+    expect(armedOf(await env.binding.routeSubresource("app-2"))).toBe(false);
+    expect(first.session.inbox).toEqual(before);
+  });
+
+  it("answers false to a bootstrap without a session", async () => {
+    const env = createEnvironment();
+    env.add("b1", CONFIG.bootstrapPath);
+    const replies = sendArm({ binding: env.binding, sourceId: "b1" });
+    await vi.waitFor(() => expect(replies).toEqual([armedReply(false)]));
+  });
+
+  it("waits for the resync in flight, so the adopted session is the one armed", async () => {
+    const env = createEnvironment();
+    const bootstrap = env.add("b1", CONFIG.bootstrapPath);
+    env.add("app-1", "/");
+    const pending = env.binding.routeSubresource("app-1");
+    await vi.waitFor(() => expect(bootstrap.inbox).toHaveLength(1));
+    const replies = sendArm({ binding: env.binding, sourceId: "b1" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(replies).toEqual([]);
+
+    answerResync(bootstrap, ["app-1"]);
+    expect((await pending).kind).toBe("route");
+    await vi.waitFor(() => expect(replies).toEqual([armedReply(true)]));
+    expect(armedOf(await env.binding.routeSubresource("app-1"))).toBe(true);
+  });
+
+  it("binds a restarted worker without the arm", async () => {
+    const env = createEnvironment();
+    await enterApp({ env, bootstrapId: "b1", clientId: "app-1", ticket: TICKET_A });
+    const replies = sendArm({ binding: env.binding, sourceId: "b1" });
+    await vi.waitFor(() => expect(replies).toEqual([armedReply(true)]));
+
+    const restarted = createClientBinding({
+      config: CONFIG,
+      clients: {
+        get: (id) => Promise.resolve(env.all.get(id)),
+        matchAll: () => Promise.resolve([...env.all.values()]),
+      },
+      now: () => env.clock.now,
+    });
+    const bootstrap = env.all.get("b1");
+    if (bootstrap === undefined) throw new Error("bootstrap missing");
+    const pending = restarted.routeSubresource("app-1");
+    await vi.waitFor(() => expect(hasResync(bootstrap)).toBe(true));
+    answerResync(bootstrap, ["app-1"]);
+    expect(armedOf(await pending)).toBe(false);
+  });
+
+  it.each([
+    ["another version", { ...ARM, v: 2 }, false],
+    ["a short nonce", { ...ARM, nonce: "abc" }, false],
+    ["an extra key", { ...ARM, armed: true }, false],
+    ["an unknown message", { type: "paseo.shell.unknown" }, false],
+    ["two ports", ARM, true],
+  ])("ignores %s on the worker's message event", async (_label, data, extraPort) => {
+    const env = createEnvironment();
+    await enterApp({ env, bootstrapId: "b1", clientId: "app-1", ticket: TICKET_A });
+    const replies = sendArm({ binding: env.binding, sourceId: "b1", data, extraPort });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(replies).toEqual([]);
+    const route = await env.binding.routeSubresource("app-1");
+    expect(route.kind).toBe("route");
+    expect(armedOf(route)).toBe(false);
+  });
+});

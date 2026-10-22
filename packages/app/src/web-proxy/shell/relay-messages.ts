@@ -26,7 +26,16 @@ export interface ShellCancelMessage {
   type: "paseo.shell.cancel";
 }
 
-export type ShellRequestMessage = ShellAckMessage | ShellCancelMessage;
+export type ShellDropCause = "head_timeout" | "transport_closed";
+
+// An armed worker answered a protected navigation with 204 instead of a failure page; the
+// bootstrap treats it as a cancel and tells the control (ticket04 lifecycle contract §5.4).
+export interface ShellRequestDroppedMessage {
+  type: "paseo.shell.request.dropped";
+  cause: ShellDropCause;
+}
+
+export type ShellRequestMessage = ShellAckMessage | ShellCancelMessage | ShellRequestDroppedMessage;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -48,6 +57,10 @@ export function parseShellRequestMessage(data: unknown): ShellRequestMessage | n
   const isAck = data.type === "paseo.shell.ack" && Object.keys(data).length === 2;
   if (isAck && typeof data.bytes === "number" && Number.isSafeInteger(data.bytes)) {
     return { type: "paseo.shell.ack", bytes: data.bytes };
+  }
+  const isDropped = data.type === "paseo.shell.request.dropped" && Object.keys(data).length === 2;
+  if (isDropped && (data.cause === "head_timeout" || data.cause === "transport_closed")) {
+    return { type: "paseo.shell.request.dropped", cause: data.cause };
   }
   return null;
 }
@@ -166,6 +179,36 @@ export function parseResyncReply(data: unknown): ShellResyncReplyMessage | null 
   if (!isRecord(data) || !hasKeys(data, ["type", "admitted"])) return null;
   if (data.type !== "paseo.shell.resync.reply" || !isClientIdList(data.admitted)) return null;
   return { type: "paseo.shell.resync.reply", admitted: [...data.admitted] };
+}
+
+// Lifecycle arm, sent to the binding's ServiceWorker object with a port of its own. A worker
+// published before the lifecycle ignores it, and the bootstrap stays unarmed.
+export interface ShellLifecycleArmMessage {
+  type: "paseo.shell.lifecycle.arm";
+  v: 1;
+  nonce: string;
+}
+
+export interface ShellLifecycleArmedMessage {
+  type: "paseo.shell.lifecycle.armed";
+  v: 1;
+  nonce: string;
+  armed: boolean;
+}
+
+export function parseLifecycleArm(data: unknown): ShellLifecycleArmMessage | null {
+  if (!isRecord(data) || !hasKeys(data, ["type", "v", "nonce"])) return null;
+  if (data.type !== "paseo.shell.lifecycle.arm" || data.v !== 1 || !isTicket(data.nonce)) {
+    return null;
+  }
+  return { type: "paseo.shell.lifecycle.arm", v: 1, nonce: data.nonce };
+}
+
+export function parseLifecycleArmed(data: unknown): ShellLifecycleArmedMessage | null {
+  if (!isRecord(data) || !hasKeys(data, ["type", "v", "nonce", "armed"])) return null;
+  const isArmed = data.type === "paseo.shell.lifecycle.armed" && data.v === 1;
+  if (!isArmed || !isTicket(data.nonce) || typeof data.armed !== "boolean") return null;
+  return { type: "paseo.shell.lifecycle.armed", v: 1, nonce: data.nonce, armed: data.armed };
 }
 
 export function parseWorkerToBootstrapMessage(data: unknown): ShellWorkerToBootstrapMessage | null {

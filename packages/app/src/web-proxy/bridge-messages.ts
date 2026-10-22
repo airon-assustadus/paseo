@@ -414,3 +414,222 @@ export function parseControlMessage(data: unknown): ControlMessage | null {
   if (data.type === "paseo.web.response.error") return parseResponseError(data);
   return null;
 }
+
+// --- Lifecycle (ticket04-lifecycle-suspension-design.md v2) -------------------------------------
+// Nothing below changes a v1 message. A broker offers the capability on the granted request port,
+// carrying a side port; everything else travels on that side port or, for the adoption ACK, as the
+// first message of the new generation's request port. Old peers ignore the offer and keep v1.
+
+export type LifecycleSuspendReason = "channel_lost" | "expired";
+export type NavigationDropCause = "head_timeout" | "transport_closed" | "suspended";
+
+export interface LifecycleOfferMessage {
+  type: "paseo.web.lifecycle.offer";
+  v: 1;
+  generation: number;
+  offer: string;
+}
+
+export interface LifecycleAcceptMessage {
+  type: "paseo.web.lifecycle.accept";
+  v: 1;
+  generation: number;
+  offer: string;
+}
+
+export interface LifecycleReadyMessage {
+  type: "paseo.web.lifecycle.ready";
+  v: 1;
+  generation: number;
+  offer: string;
+}
+
+export interface LifecycleStateMessage {
+  type: "paseo.web.lifecycle.state";
+  v: 1;
+  workerArmed: boolean;
+}
+
+export interface SuspendMessage {
+  type: "paseo.web.suspend";
+  v: 1;
+  generation: number;
+  reason: LifecycleSuspendReason;
+}
+
+export interface SuspendedMessage {
+  type: "paseo.web.suspended";
+  v: 1;
+  generation: number;
+  documentKept: boolean;
+}
+
+export interface ResumeMessage {
+  type: "paseo.web.resume";
+  v: 1;
+  previous: number;
+  generation: number;
+  limits: BridgeLimits;
+}
+
+export interface ResumedMessage {
+  type: "paseo.web.resumed";
+  v: 1;
+  previous: number;
+  generation: number;
+  documentKept: boolean;
+}
+
+export interface NavigationDroppedMessage {
+  type: "paseo.web.navigation.dropped";
+  v: 1;
+  generation: number;
+  requestId: number;
+  cause: NavigationDropCause;
+}
+
+export type LifecycleToShellMessage = LifecycleReadyMessage | SuspendMessage | ResumeMessage;
+export type LifecycleToBrokerMessage =
+  | LifecycleAcceptMessage
+  | LifecycleStateMessage
+  | SuspendedMessage
+  | NavigationDroppedMessage;
+
+const SUSPEND_REASONS: readonly LifecycleSuspendReason[] = ["channel_lost", "expired"];
+const DROP_CAUSES: readonly NavigationDropCause[] = [
+  "head_timeout",
+  "transport_closed",
+  "suspended",
+];
+// 16 random bytes in base64url, the ticket's format: correlation, not a secret from same-origin code.
+const LIFECYCLE_TOKEN = /^[A-Za-z0-9_-]{22}$/;
+
+export function isLifecycleToken(value: unknown): value is string {
+  return typeof value === "string" && LIFECYCLE_TOKEN.test(value);
+}
+
+export function createLifecycleToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const binary = String.fromCharCode(...bytes);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function isGeneration(value: unknown): value is number {
+  return isPositiveInteger(value, Number.MAX_SAFE_INTEGER);
+}
+
+function isVersioned(
+  record: Record<string, unknown>,
+  type: string,
+  keys: readonly string[],
+): boolean {
+  return hasExactKeys(record, keys) && record.type === type && record.v === BRIDGE_VERSION;
+}
+
+export function parseLifecycleOffer(data: unknown): LifecycleOfferMessage | null {
+  if (!isRecord(data)) return null;
+  if (!isVersioned(data, "paseo.web.lifecycle.offer", ["type", "v", "generation", "offer"])) {
+    return null;
+  }
+  const { generation, offer } = data;
+  if (!isGeneration(generation) || !isLifecycleToken(offer)) return null;
+  return { type: "paseo.web.lifecycle.offer", v: 1, generation, offer };
+}
+
+export function parseLifecycleToShell(data: unknown): LifecycleToShellMessage | null {
+  if (!isRecord(data)) return null;
+  if (data.type === "paseo.web.lifecycle.ready") {
+    if (!isVersioned(data, data.type, ["type", "v", "generation", "offer"])) return null;
+    const { generation, offer } = data;
+    if (!isGeneration(generation) || !isLifecycleToken(offer)) return null;
+    return { type: "paseo.web.lifecycle.ready", v: 1, generation, offer };
+  }
+  if (data.type === "paseo.web.suspend") {
+    if (!isVersioned(data, "paseo.web.suspend", ["type", "v", "generation", "reason"])) return null;
+    const { generation, reason } = data;
+    if (!isGeneration(generation) || !isOneOf(reason, SUSPEND_REASONS)) return null;
+    return { type: "paseo.web.suspend", v: 1, generation, reason };
+  }
+  if (data.type === "paseo.web.resume") {
+    const keys = ["type", "v", "previous", "generation", "limits"];
+    if (!isVersioned(data, "paseo.web.resume", keys)) return null;
+    const { previous, generation } = data;
+    if (!isGeneration(previous) || !isGeneration(generation) || generation <= previous) return null;
+    const limits = parseLimits(data.limits);
+    if (limits === null) return null;
+    return { type: "paseo.web.resume", v: 1, previous, generation, limits };
+  }
+  return null;
+}
+
+export function parseLifecycleToBroker(data: unknown): LifecycleToBrokerMessage | null {
+  if (!isRecord(data)) return null;
+  switch (data.type) {
+    case "paseo.web.lifecycle.accept": {
+      if (!isVersioned(data, data.type, ["type", "v", "generation", "offer"])) return null;
+      const { generation, offer } = data;
+      if (!isGeneration(generation) || !isLifecycleToken(offer)) return null;
+      return { type: "paseo.web.lifecycle.accept", v: 1, generation, offer };
+    }
+    case "paseo.web.lifecycle.state": {
+      if (!isVersioned(data, data.type, ["type", "v", "workerArmed"])) return null;
+      if (typeof data.workerArmed !== "boolean") return null;
+      return { type: "paseo.web.lifecycle.state", v: 1, workerArmed: data.workerArmed };
+    }
+    case "paseo.web.suspended": {
+      if (!isVersioned(data, data.type, ["type", "v", "generation", "documentKept"])) return null;
+      const { generation, documentKept } = data;
+      if (!isGeneration(generation) || typeof documentKept !== "boolean") return null;
+      return { type: "paseo.web.suspended", v: 1, generation, documentKept };
+    }
+    case "paseo.web.navigation.dropped": {
+      const keys = ["type", "v", "generation", "requestId", "cause"];
+      if (!isVersioned(data, data.type, keys)) return null;
+      const { generation, requestId, cause } = data;
+      if (!isGeneration(generation) || !isPositiveInteger(requestId, MAX_REQUEST_ID)) return null;
+      if (!isOneOf(cause, DROP_CAUSES)) return null;
+      return { type: "paseo.web.navigation.dropped", v: 1, generation, requestId, cause };
+    }
+    default:
+      return null;
+  }
+}
+
+export function parseResumed(data: unknown): ResumedMessage | null {
+  if (!isRecord(data)) return null;
+  const keys = ["type", "v", "previous", "generation", "documentKept"];
+  if (!isVersioned(data, "paseo.web.resumed", keys)) return null;
+  const { previous, generation, documentKept } = data;
+  if (!isGeneration(previous) || !isGeneration(generation) || generation <= previous) return null;
+  if (typeof documentKept !== "boolean") return null;
+  return { type: "paseo.web.resumed", v: 1, previous, generation, documentKept };
+}
+
+// The answer a suspended generation gives to any request, built from v1 primitives that every
+// worker already handles: a navigation still without a head gets an empty 204, which aborts the
+// navigation and keeps the document; anything else fails as a closed transport. C and K share it.
+export function suspendedReply(
+  mode: BridgeRequestMode,
+  requestId: number,
+  generation: number,
+): ResponseHeadMessage | ResponseErrorMessage {
+  if (mode === "navigate") {
+    return {
+      type: "paseo.web.response.head",
+      v: 1,
+      generation,
+      requestId,
+      status: 204,
+      statusText: "",
+      headers: [],
+    };
+  }
+  return {
+    type: "paseo.web.response.error",
+    v: 1,
+    generation,
+    requestId,
+    code: "transport_error",
+    reason: "transport_closed",
+  };
+}

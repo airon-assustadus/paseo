@@ -1,10 +1,13 @@
 import {
   parseContentMessage,
+  suspendedReply,
   type BridgeErrorCode,
   type BridgeErrorReason,
   type BridgeLimits,
+  type BridgeRequestMode,
   type BridgeRevokeReason,
   type ControlMessage,
+  type LifecycleOfferMessage,
   type RequestMessage,
 } from "./bridge-messages";
 import {
@@ -27,28 +30,47 @@ export interface PortSessionOptions {
   transport: WebProxyTransport;
   onRevoked(reason: BridgeRevokeReason): void;
   onRedirectBlocked(requestUrl: string): void;
+  // What the content port closing means. The broker owns the answer: the current generation
+  // ends the view, a generation it is already replacing is only dropped. Default: terminal.
+  closePolicy?(): "terminal" | "discard";
 }
 
 export interface PortSession {
   revoke(reason: BridgeRevokeReason): void;
+  // Ends this generation's authority synchronously: every request in flight is answered on
+  // this port and aborted, and the port becomes a tombstone that never reaches the transport.
+  quiesce(): void;
+  offerLifecycle(sidePort: MessagePort, offer: string): void;
+  // Lets go of the port without a revoke: the generation was replaced, not ended.
+  discard(): void;
 }
 
 interface InFlightRequest {
   abort: AbortController;
+  mode: BridgeRequestMode;
+  headSent: boolean;
   unackedBytes: number;
   wakeForCredit: (() => void) | null;
 }
+
+type PortSessionPhase = "serving" | "tombstone" | "closed";
 
 // Serves one granted MessagePort. The port is the capability: whatever arrives on it is
 // treated as hostile content and every malformed message ends the grant.
 export function startPortSession(options: PortSessionOptions): PortSession {
   const { port, generation, capability, limits, transport } = options;
   const inFlight = new Map<number, InFlightRequest>();
-  let revoked = false;
+  let phase: PortSessionPhase = "serving";
 
-  function send(message: ControlMessage, transfer: Transferable[] = []): void {
-    if (revoked) return;
+  function post(message: ControlMessage | LifecycleOfferMessage, transfer: Transferable[]): void {
+    if (phase === "closed") return;
     port.postMessage(message, transfer);
+  }
+
+  // The normal flow. A tombstone drops whatever a late continuation still tries to send.
+  function send(message: ControlMessage, transfer: Transferable[] = []): void {
+    if (phase !== "serving") return;
+    post(message, transfer);
   }
 
   function sendError(requestId: number, code: BridgeErrorCode, reason?: BridgeErrorReason): void {
@@ -71,17 +93,44 @@ export function startPortSession(options: PortSessionOptions): PortSession {
     entry.wakeForCredit?.();
   }
 
-  function revoke(reason: BridgeRevokeReason): void {
-    if (revoked) return;
-    send({ type: "paseo.web.revoke", v: 1, generation, reason });
-    revoked = true;
+  function close(): void {
+    phase = "closed";
     for (const entry of inFlight.values()) abortEntry(entry);
     inFlight.clear();
     port.removeEventListener("message", onMessage);
     port.removeEventListener("messageerror", onMessageError);
     port.removeEventListener("close", onClose);
     port.close();
+  }
+
+  function revoke(reason: BridgeRevokeReason): void {
+    if (phase === "closed") return;
+    post({ type: "paseo.web.revoke", v: 1, generation, reason }, []);
+    close();
     options.onRevoked(reason);
+  }
+
+  function discard(): void {
+    if (phase === "closed") return;
+    close();
+  }
+
+  function quiesce(): void {
+    if (phase !== "serving") return;
+    phase = "tombstone";
+    // Map order is arrival order, and each answer queues behind what this port already sent.
+    for (const [requestId, entry] of inFlight) {
+      // Once a head left, only an error can end that response; 204 is for a navigation's head.
+      const mode = entry.headSent ? "subresource" : entry.mode;
+      post(suspendedReply(mode, requestId, generation), []);
+      abortEntry(entry);
+    }
+    inFlight.clear();
+  }
+
+  function offerLifecycle(sidePort: MessagePort, offer: string): void {
+    if (phase !== "serving") return;
+    post({ type: "paseo.web.lifecycle.offer", v: 1, generation, offer }, [sidePort]);
   }
 
   function waitForCredit(entry: InFlightRequest, bytes: number): Promise<void> {
@@ -167,6 +216,7 @@ export function startPortSession(options: PortSessionOptions): PortSession {
       options.onRedirectBlocked(url.href);
       return;
     }
+    entry.headSent = true;
     send({
       type: "paseo.web.response.head",
       v: 1,
@@ -237,6 +287,8 @@ export function startPortSession(options: PortSessionOptions): PortSession {
     const { url } = resolved;
     const entry: InFlightRequest = {
       abort: new AbortController(),
+      mode: message.mode,
+      headSent: false,
       unackedBytes: 0,
       wakeForCredit: null,
     };
@@ -248,6 +300,13 @@ export function startPortSession(options: PortSessionOptions): PortSession {
     const message = parseContentMessage(event.data, limits);
     if (message === null || message.generation !== generation) {
       revoke("protocol_error");
+      return;
+    }
+    if (phase === "tombstone") {
+      // Answered here, body dropped; acks and cancels have nothing left to act on.
+      if (message.type === "paseo.web.request") {
+        post(suspendedReply(message.mode, message.requestId, generation), []);
+      }
       return;
     }
     if (message.type === "paseo.web.request") {
@@ -278,6 +337,10 @@ export function startPortSession(options: PortSessionOptions): PortSession {
   // The content side went away without a word (document destroyed, port garbage-collected).
   // Browsers without MessagePort "close" rely on the frame load check and on revocation.
   function onClose(): void {
+    if (options.closePolicy?.() === "discard") {
+      discard();
+      return;
+    }
     revoke("port_closed");
   }
 
@@ -286,5 +349,5 @@ export function startPortSession(options: PortSessionOptions): PortSession {
   port.addEventListener("close", onClose);
   port.start();
 
-  return { revoke };
+  return { revoke, quiesce, offerLifecycle, discard };
 }

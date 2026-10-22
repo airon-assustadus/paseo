@@ -31,6 +31,45 @@ const CORE_WINDOW_BYTES = 65_536;
 const SESSION_TTL_MS = 60_000;
 const LARGE_BYTES = 4_194_304;
 
+describe("published lifecycle compatibility", () => {
+  it("P1 published SW preserves GET and POST documents", async () => {
+    const result = await commands.webProxyLifecycleCompat("probe");
+    expect(result.proofs.map((proof) => proof.id)).toEqual([
+      "P1-published-GET",
+      "P1-published-POST",
+    ]);
+  }, 180_000);
+
+  it("P7 restarted worker ARM window", async () => {
+    const result = await commands.webProxyLifecycleCompat("restart");
+    expect(result.proofs.map((proof) => proof.id)).toEqual(["P7"]);
+  }, 180_000);
+
+  it("P4 published control M1 and M6", async () => {
+    const result = await commands.webProxyLifecycleCompat("published");
+    expect(result.proofs.map((proof) => proof.id)).toEqual(["M1", "M6-oldSW", "M6-newSW"]);
+  }, 240_000);
+
+  it("P4 candidate control M2 to M5 with published bytes", async () => {
+    const result = await commands.webProxyLifecycleCompat("matrix");
+    expect(result.proofs.map((proof) => proof.id)).toEqual(["M2", "M3", "M4", "M5"]);
+  }, 360_000);
+
+  it("P4 worker rollback and mixed bootstrap cache", async () => {
+    const result = await commands.webProxyLifecycleCompat("transitions");
+    expect(result.proofs.map((proof) => proof.id)).toEqual([
+      "P4-worker-upgrade",
+      "P4-worker-rollback",
+      "P4-mixed-K",
+    ]);
+  }, 180_000);
+
+  it("P6 real control overlay and ordinary input after resume", async () => {
+    const result = await commands.webProxyLifecycleCompat("overlay");
+    expect(result.proofs.map((proof) => proof.id)).toEqual(["P6"]);
+  }, 180_000);
+});
+
 interface Stack {
   connection: BridgeConnection;
   transport: NetworkFetchTransport;

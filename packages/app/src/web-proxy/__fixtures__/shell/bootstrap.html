@@ -19,6 +19,12 @@
     <script type="module">
       import { startShellBootstrap } from "../../shell/bootstrap.web.ts";
       import { HARNESS, harnessControlOrigin } from "./harness.ts";
+      import { delayLifecycleDelivery } from "./lifecycle-order.ts";
+
+      const deliveryOrder = new URLSearchParams(location.search).get("deliveryOrder");
+      if (deliveryOrder !== null) {
+        delayLifecycleDelivery(harnessControlOrigin(location), deliveryOrder);
+      }
 
       void startShellBootstrap({
         window,

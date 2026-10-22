@@ -84,6 +84,7 @@ function start(input: {
   ) => Promise<WebProxyTransportResponse>;
   limits?: BridgeLimits;
   capability?: WebProxyCapability;
+  closePolicy?: () => "terminal" | "discard";
 }): Harness {
   const channel = new MessageChannel();
   openPorts.push(channel.port2);
@@ -116,6 +117,7 @@ function start(input: {
     transport,
     onRevoked: (reason) => revocations.push(reason),
     onRedirectBlocked: (url) => blockedRedirects.push(url),
+    closePolicy: input.closePolicy,
   });
   function next(): Promise<unknown> {
     const queued = inbox.shift();
@@ -564,5 +566,152 @@ describe("startPortSession", () => {
     release.resolve();
     send(harness.content, requestMessage({ requestId: 3 }));
     expect(await harness.next()).toMatchObject({ type: "paseo.web.response.head", requestId: 3 });
+  });
+});
+
+describe("quiesce and the tombstone", () => {
+  const navigationNoContent = {
+    type: "paseo.web.response.head",
+    v: 1,
+    generation: 1,
+    status: 204,
+    statusText: "",
+    headers: [],
+  };
+  const transportClosed = {
+    type: "paseo.web.response.error",
+    v: 1,
+    generation: 1,
+    code: "transport_error",
+    reason: "transport_closed",
+  };
+
+  it("answers every request in flight on this port, in arrival order, after what it already sent", async () => {
+    const harness = start({
+      respond: (request, signal) =>
+        request.url.endsWith("/streaming")
+          ? Promise.resolve(ok(openEnded(new Uint8Array([1, 2]))))
+          : hanging(request, signal),
+    });
+    send(harness.content, requestMessage({ path: "/streaming", mode: "navigate" }));
+    expect(await harness.next()).toMatchObject({ type: "paseo.web.response.head", requestId: 1 });
+    expect(await harness.next()).toMatchObject({ type: "paseo.web.response.chunk", requestId: 1 });
+    send(harness.content, requestMessage({ requestId: 2, mode: "navigate" }));
+    send(harness.content, requestMessage({ requestId: 3 }));
+    await vi.waitFor(() => expect(harness.calls).toHaveLength(3));
+
+    harness.session.quiesce();
+
+    expect(await harness.next()).toEqual({ ...transportClosed, requestId: 1 });
+    expect(await harness.next()).toEqual({ ...navigationNoContent, requestId: 2 });
+    expect(await harness.next()).toEqual({ ...transportClosed, requestId: 3 });
+    expect(abortedFlags(harness)).toEqual([true, true, true]);
+    await harness.expectSilence();
+    expect(harness.revocations).toEqual([]);
+  });
+
+  it("drops what a late transport continuation tries to send", async () => {
+    const late = Promise.withResolvers<WebProxyTransportResponse>();
+    const harness = start({ respond: () => late.promise });
+    send(harness.content, requestMessage({ mode: "navigate" }));
+    await vi.waitFor(() => expect(harness.calls).toHaveLength(1));
+    harness.session.quiesce();
+    expect(await harness.next()).toEqual({ ...navigationNoContent, requestId: 1 });
+
+    late.resolve(ok(streamOf(new Uint8Array([1]))));
+    await harness.expectSilence();
+  });
+
+  it("answers new requests locally, ignores acks and cancels, and never calls the transport", async () => {
+    const harness = start({ respond: () => Promise.resolve(ok(null)) });
+    harness.session.quiesce();
+    send(harness.content, requestMessage({ requestId: 4, mode: "navigate" }));
+    send(harness.content, requestMessage({ requestId: 5, method: "POST", body: bytes("x") }));
+    send(harness.content, { type: "paseo.web.ack", v: 1, generation: 1, requestId: 4, bytes: 1 });
+    send(harness.content, { type: "paseo.web.cancel", v: 1, generation: 1, requestId: 5 });
+
+    expect(await harness.next()).toEqual({ ...navigationNoContent, requestId: 4 });
+    expect(await harness.next()).toEqual({ ...transportClosed, requestId: 5 });
+    await harness.expectSilence();
+    expect(harness.calls).toEqual([]);
+    expect(harness.revocations).toEqual([]);
+  });
+
+  it.each([
+    ["a malformed message", { type: "paseo.web.bogus", v: 1 }],
+    ["another generation", requestMessage({ generation: 2 })],
+  ])("ends the grant on %s", async (_label, message) => {
+    const harness = start({ respond: () => Promise.resolve(ok(null)) });
+    harness.session.quiesce();
+    send(harness.content, message);
+    expect(await harness.next()).toEqual({
+      type: "paseo.web.revoke",
+      v: 1,
+      generation: 1,
+      reason: "protocol_error",
+    });
+    expect(harness.revocations).toEqual(["protocol_error"]);
+  });
+
+  it("revokes through the tombstone's own port", async () => {
+    const harness = start({ respond: () => Promise.resolve(ok(null)) });
+    harness.session.quiesce();
+    harness.session.revoke("disposed");
+    expect(await harness.next()).toEqual({
+      type: "paseo.web.revoke",
+      v: 1,
+      generation: 1,
+      reason: "disposed",
+    });
+    expect(harness.revocations).toEqual(["disposed"]);
+  });
+
+  it("ends the view when the port closes while it is the current generation", async () => {
+    const harness = start({
+      respond: () => Promise.resolve(ok(null)),
+      closePolicy: () => "terminal",
+    });
+    harness.session.quiesce();
+    harness.content.close();
+    await vi.waitFor(() => expect(harness.revocations).toEqual(["port_closed"]));
+  });
+
+  it("only drops the port when it closes while the broker is replacing the generation", async () => {
+    const harness = start({ respond: hanging, closePolicy: () => "discard" });
+    send(harness.content, requestMessage());
+    await vi.waitFor(() => expect(harness.calls).toHaveLength(1));
+    harness.content.close();
+    await vi.waitFor(() => expect(abortedFlags(harness)).toEqual([true]));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(harness.revocations).toEqual([]);
+  });
+
+  it("discards without a revoke and stops answering", async () => {
+    const harness = start({ respond: hanging });
+    send(harness.content, requestMessage());
+    await vi.waitFor(() => expect(harness.calls).toHaveLength(1));
+    harness.session.discard();
+    expect(abortedFlags(harness)).toEqual([true]);
+    send(harness.content, requestMessage({ requestId: 2 }));
+    await harness.expectSilence();
+    expect(harness.calls).toHaveLength(1);
+    expect(harness.revocations).toEqual([]);
+  });
+
+  it("offers the lifecycle side port on the request port, with the port attached", async () => {
+    const harness = start({ respond: () => Promise.resolve(ok(null)) });
+    const received: MessagePort[] = [];
+    harness.content.addEventListener("message", (event) => received.push(...event.ports));
+    const side = new MessageChannel();
+    openPorts.push(side.port1);
+    harness.session.offerLifecycle(side.port2, "AAAAAAAAAAAAAAAAAAAAAA");
+    expect(await harness.next()).toEqual({
+      type: "paseo.web.lifecycle.offer",
+      v: 1,
+      generation: 1,
+      offer: "AAAAAAAAAAAAAAAAAAAAAA",
+    });
+    expect(received).toHaveLength(1);
+    openPorts.push(...received);
   });
 });
