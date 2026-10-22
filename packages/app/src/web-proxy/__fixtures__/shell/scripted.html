@@ -17,6 +17,24 @@
         const ack = params.get("ack") ?? "valid";
         const ackOn = params.get("ackOn") ?? "resume";
         const afterAck = params.get("afterAck") ?? "none";
+        // Purge: capable yes | no. purge: reply | silent | violate-side | violate-g |
+        // other-op-first. purgeOn: purge | signal. closeOld: close g after acknowledging a resume.
+        // stray: send a purged report right after the lifecycle is ready.
+        const capable = params.get("capable") ?? "yes";
+        const purgeMode = params.get("purge") ?? "reply";
+        const purgeOn = params.get("purgeOn") ?? "purge";
+        const closeOld = params.get("closeOld") === "yes";
+        const stray = params.get("stray") === "yes";
+        const OTHER_OP = "BBBBBBBBBBBBBBBBBBBBBA";
+        const ALL_CONFIRMED = {
+          localStorage: true,
+          sessionStorage: true,
+          caches: true,
+          indexedDB: true,
+          unregistered: true,
+        };
+        let pendingPurge = null;
+        let purgeSignalled = false;
         let granted = false;
         let requestPort = null;
         let sidePort = null;
@@ -74,9 +92,50 @@
           report("accepted", {});
         }
 
+        function answerPurge() {
+          const { op } = pendingPurge;
+          pendingPurge = null;
+          if (purgeMode === "silent") return;
+          if (purgeMode === "other-op-first") {
+            sidePort.postMessage({
+              type: "paseo.web.purged",
+              v: 1,
+              op: OTHER_OP,
+              ...ALL_CONFIRMED,
+            });
+          }
+          sidePort.postMessage({ type: "paseo.web.purged", v: 1, op, ...ALL_CONFIRMED });
+          report("purged", { op });
+        }
+
+        function maybeAnswerPurge() {
+          if (pendingPurge === null || (purgeOn === "signal" && !purgeSignalled)) return;
+          answerPurge();
+        }
+
+        function onPurgeSide(data) {
+          if (data.type === "paseo.web.lifecycle.ready" && stray) {
+            sidePort.postMessage({
+              type: "paseo.web.purged",
+              v: 1,
+              op: OTHER_OP,
+              ...ALL_CONFIRMED,
+            });
+          }
+          if (data.type === "paseo.web.purge.query" && capable === "yes") {
+            sidePort.postMessage({ type: "paseo.web.purge.capable", v: 1, nonce: data.nonce });
+          }
+          if (data.type !== "paseo.web.purge") return;
+          pendingPurge = data;
+          if (purgeMode === "violate-side") sidePort.postMessage({ type: "paseo.web.bogus" });
+          if (purgeMode === "violate-g") requestPort.postMessage({ type: "paseo.web.bogus" });
+          maybeAnswerPurge();
+        }
+
         function onSide(event) {
           const data = event.data;
           report("side", { data });
+          onPurgeSide(data);
           if (data.type === "paseo.web.suspend") {
             sidePort.postMessage({
               type: "paseo.web.suspended",
@@ -122,6 +181,7 @@
           }
           if (ack === "old-port") requestPort.postMessage(resumed);
           if (ack === "close") port.close();
+          if (ack === "valid" && closeOld) requestPort.close();
           if (afterAck === "request") request(port, data.generation);
           report("acknowledged", { ack });
         }
@@ -139,6 +199,9 @@
             maybeAcknowledge();
           } else if (event.data.type === "fixture.scripted.accept") {
             acceptOffer();
+          } else if (event.data.type === "fixture.scripted.purge") {
+            purgeSignalled = true;
+            maybeAnswerPurge();
           }
         });
 

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Purge sentinel probe</title>
+  </head>
+  <body>
+    <p>Synthetic sentinels of the purge bench, read from outside the shell.</p>
+    <script type="module">
+      // action: seed | read | hold. Only the synthetic sentinels this probe writes are touched or
+      // reported; the probe never lists or reads anything else.
+      const action = new URLSearchParams(location.search).get("action");
+      const report = (detail) =>
+        parent.postMessage({ type: "fixture.probe", action, ...detail }, "*");
+
+      function openSentinel() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open("sentinel", 1);
+          request.addEventListener("upgradeneeded", () => request.result.createObjectStore("s"));
+          request.addEventListener("success", () => resolve(request.result));
+          request.addEventListener("error", () => reject(request.error));
+        });
+      }
+
+      if (action === "seed") {
+        localStorage.setItem("sentinel", "1");
+        sessionStorage.setItem("sentinel", "1");
+        // Host-only and partitioned, so the framed probe can set it under the test page.
+        document.cookie = "sentinel=1; path=/; Secure; SameSite=None; Partitioned";
+        const cache = await caches.open("sentinel");
+        await cache.put("/sentinel", new Response("1"));
+        (await openSentinel()).close();
+        report({ done: true, cookie: document.cookie.split("; ").includes("sentinel=1") });
+      }
+      if (action === "read") {
+        const cacheNames = await caches.keys();
+        const databases = await indexedDB.databases();
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        report({
+          localStorage: localStorage.getItem("sentinel"),
+          sessionStorage: sessionStorage.getItem("sentinel"),
+          cache: cacheNames.includes("sentinel"),
+          database: databases.some((database) => database.name === "sentinel"),
+          cookie: document.cookie.split("; ").includes("sentinel=1"),
+          registrations: registrations.length,
+        });
+      }
+      if (action === "hold") {
+        // Keeps a connection open and ignores versionchange: a deletion of this database stays
+        // blocked while this frame lives.
+        const database = await openSentinel();
+        database.addEventListener("versionchange", () => {});
+        report({ holding: true });
+      }
+    </script>
+  </body>
+</html>
