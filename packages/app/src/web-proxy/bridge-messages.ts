@@ -437,6 +437,13 @@ export interface LifecycleAcceptMessage {
   offer: string;
 }
 
+export interface LifecycleReadyMessage {
+  type: "paseo.web.lifecycle.ready";
+  v: 1;
+  generation: number;
+  offer: string;
+}
+
 export interface LifecycleStateMessage {
   type: "paseo.web.lifecycle.state";
   v: 1;
@@ -481,7 +488,7 @@ export interface NavigationDroppedMessage {
   cause: NavigationDropCause;
 }
 
-export type LifecycleToShellMessage = SuspendMessage | ResumeMessage;
+export type LifecycleToShellMessage = LifecycleReadyMessage | SuspendMessage | ResumeMessage;
 export type LifecycleToBrokerMessage =
   | LifecycleAcceptMessage
   | LifecycleStateMessage
@@ -531,6 +538,12 @@ export function parseLifecycleOffer(data: unknown): LifecycleOfferMessage | null
 
 export function parseLifecycleToShell(data: unknown): LifecycleToShellMessage | null {
   if (!isRecord(data)) return null;
+  if (data.type === "paseo.web.lifecycle.ready") {
+    if (!isVersioned(data, data.type, ["type", "v", "generation", "offer"])) return null;
+    const { generation, offer } = data;
+    if (!isGeneration(generation) || !isLifecycleToken(offer)) return null;
+    return { type: "paseo.web.lifecycle.ready", v: 1, generation, offer };
+  }
   if (data.type === "paseo.web.suspend") {
     if (!isVersioned(data, "paseo.web.suspend", ["type", "v", "generation", "reason"])) return null;
     const { generation, reason } = data;

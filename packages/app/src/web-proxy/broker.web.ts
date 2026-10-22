@@ -373,6 +373,12 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
       if (!isOffered || side === null) return false;
       if (side.timer !== null) clearTimeout(side.timer);
       side.timer = null;
+      sendToShell({
+        type: "paseo.web.lifecycle.ready",
+        v: 1,
+        generation: side.generation,
+        offer: side.offer,
+      });
       lifecycle = "ready";
       publishLifecycle();
       return true;

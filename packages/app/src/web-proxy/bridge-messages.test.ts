@@ -180,6 +180,7 @@ describe("lifecycle messages", () => {
   const token = "AAAAAAAAAAAAAAAAAAAAAA";
   const offer = { type: "paseo.web.lifecycle.offer", v: 1, generation: 2, offer: token };
   const suspend = { type: "paseo.web.suspend", v: 1, generation: 2, reason: "channel_lost" };
+  const ready = { type: "paseo.web.lifecycle.ready", v: 1, generation: 2, offer: token };
   const resume = {
     type: "paseo.web.resume",
     v: 1,
@@ -216,6 +217,9 @@ describe("lifecycle messages", () => {
 
   it("accepts each exact message on its own parser only", () => {
     expect(parseLifecycleOffer(offer)).toEqual(offer);
+    expect(parseLifecycleToShell(ready)).toEqual(ready);
+    expect(parseLifecycleToBroker(ready)).toBeNull();
+    expect(parseControlMessage(ready)).toBeNull();
     expect(parseLifecycleToShell(suspend)).toEqual(suspend);
     expect(parseLifecycleToShell(resume)).toEqual(resume);
     expect(parseResumed(resumed)).toEqual(resumed);
@@ -230,6 +234,11 @@ describe("lifecycle messages", () => {
     ["an extra key", parseLifecycleOffer, { ...offer, url: "https://x.invalid" }],
     ["a short offer", parseLifecycleOffer, { ...offer, offer: "abc" }],
     ["another version", parseLifecycleOffer, { ...offer, v: 2 }],
+    ["ready with another version", parseLifecycleToShell, { ...ready, v: 2 }],
+    ["ready with generation zero", parseLifecycleToShell, { ...ready, generation: 0 }],
+    ["ready with another field", parseLifecycleToShell, { ...ready, capabilities: [] }],
+    ["ready with a short token", parseLifecycleToShell, { ...ready, offer: "abc" }],
+    ["ready without offer", parseLifecycleToShell, { type: ready.type, v: 1, generation: 2 }],
     ["an unknown reason", parseLifecycleToShell, { ...suspend, reason: "revoked" }],
     ["generation zero", parseLifecycleToShell, { ...suspend, generation: 0 }],
     ["a generation not above previous", parseLifecycleToShell, { ...resume, generation: 2 }],

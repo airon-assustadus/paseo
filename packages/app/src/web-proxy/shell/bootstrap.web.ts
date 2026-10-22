@@ -170,6 +170,8 @@ function startRelay(input: {
   let awaitingReply: ((message: ShellWorkerToBootstrapMessage | null) => void) | null = null;
   // Lifecycle: the side port the control offered, and the worker arm on the current binding.
   let side: MessagePort | null = null;
+  let acceptedOffer: { generation: number; offer: string } | null = null;
+  let lifecycleConfirmed = false;
   let binding: ServiceWorker | null = null;
   let isSessionReady = false;
   let workerArmed = false;
@@ -238,6 +240,7 @@ function startRelay(input: {
   }
 
   function toControl(message: LifecycleToBrokerMessage): void {
+    if (message.type !== "paseo.web.lifecycle.accept" && !lifecycleConfirmed) return;
     side?.postMessage(message, []);
   }
 
@@ -268,7 +271,12 @@ function startRelay(input: {
   }
 
   function release(ctx: GenerationContext, requestId: number): void {
-    if (!ctx.pending.delete(requestId)) return;
+    const entry = ctx.pending.get(requestId);
+    if (entry === undefined) return;
+    if (entry.mode === "navigate" && (!entry.headForwarded || marks.get(requestId) === "open")) {
+      markNavigation(requestId, "failed");
+    }
+    ctx.pending.delete(requestId);
     toBroker(ctx, { type: "paseo.web.cancel", v: 1, generation: ctx.generation, requestId });
   }
 
@@ -295,8 +303,6 @@ function startRelay(input: {
     const entry = ctx.pending.get(requestId);
     if (entry === undefined) return;
     if (message === null || message.type === "paseo.shell.cancel") {
-      // Only the head timeout cancels before a head; the worker already showed 504.
-      if (entry.mode === "navigate" && !entry.headForwarded) markNavigation(requestId, "failed");
       release(ctx, requestId);
       return;
     }
@@ -316,7 +322,7 @@ function startRelay(input: {
       const message = parseShellRequestMessage(portEvent.data);
       // The drop follows the error that triggered it, after the request left `pending`.
       if (message?.type === "paseo.shell.request.dropped") {
-        if (mode !== "navigate" || isDropReported || side === null) return;
+        if (mode !== "navigate" || isDropReported) return;
         isDropReported = true;
         onDropped({ ctx, requestId, cause: message.cause });
         return;
@@ -388,7 +394,14 @@ function startRelay(input: {
   // Arms the worker of the current binding, once the control accepted the lifecycle and the
   // session is open. A worker that does not answer in time leaves this view unarmed.
   function arm(): void {
-    if (side === null || binding === null || !isSessionReady || revokedReason !== null) return;
+    if (
+      !lifecycleConfirmed ||
+      side === null ||
+      binding === null ||
+      !isSessionReady ||
+      revokedReason !== null
+    )
+      return;
     armAttempt += 1;
     const attempt = armAttempt;
     const nonce = createLifecycleToken();
@@ -491,6 +504,8 @@ function startRelay(input: {
     sessionPort = null;
     side?.close();
     side = null;
+    acceptedOffer = null;
+    lifecycleConfirmed = false;
     for (const entry of current.pending.values()) {
       toWorker(entry.workerPort, revokeMessage(reason));
     }
@@ -562,7 +577,15 @@ function startRelay(input: {
       return true;
     }
     side = port;
+    acceptedOffer = { generation: offer.generation, offer: offer.offer };
     port.addEventListener("message", onSideMessage);
+    port.addEventListener("close", () => {
+      if (side !== port) return;
+      side = null;
+      acceptedOffer = null;
+      lifecycleConfirmed = false;
+      disarm();
+    });
     port.start();
     toControl({
       type: "paseo.web.lifecycle.accept",
@@ -570,7 +593,6 @@ function startRelay(input: {
       generation: ctx.generation,
       offer: offer.offer,
     });
-    arm();
     return true;
   }
 
@@ -588,6 +610,9 @@ function startRelay(input: {
     for (const [requestId, entry] of ctx.pending) {
       const isNavigationHead = entry.mode === "navigate" && !entry.headForwarded;
       if (isNavigationHead) ctx.answeredOnSuspend.add(requestId);
+      if (entry.mode === "navigate" && entry.headForwarded && marks.get(requestId) === "open") {
+        markNavigation(requestId, "failed");
+      }
       const mode = isNavigationHead ? "navigate" : "subresource";
       toWorker(entry.workerPort, suspendedReply(mode, requestId, ctx.generation));
     }
@@ -625,6 +650,15 @@ function startRelay(input: {
     if (revokedReason !== null) return;
     const message = parseLifecycleToShell(event.data);
     if (message === null) return;
+    if (message.type === "paseo.web.lifecycle.ready") {
+      if (lifecycleConfirmed || acceptedOffer === null || event.ports.length !== 0) return;
+      if (message.generation !== acceptedOffer.generation || message.offer !== acceptedOffer.offer)
+        return;
+      lifecycleConfirmed = true;
+      arm();
+      return;
+    }
+    if (!lifecycleConfirmed) return;
     if (message.type === "paseo.web.suspend") suspend(message);
     else resume(message, event.ports);
   }

@@ -8,6 +8,7 @@ import {
   type FixtureTransport,
 } from "./__fixtures__/fixture-transport";
 import { HARNESS, harnessContentOrigin } from "./__fixtures__/shell/harness";
+import { DEFAULT_BRIDGE_LIMITS } from "./bridge-messages";
 import {
   attachWebProxyBroker,
   WebProxyBrokerSetupError,
@@ -453,6 +454,12 @@ describe("web proxy broker lifecycle", () => {
     expect(frame.inert).toBe(true);
     await vi.waitFor(() => expect(broker.getState()).toMatchObject({ documentKept: true }), SLOW);
     expect(sideMessages()).toEqual([
+      {
+        type: "paseo.web.lifecycle.ready",
+        v: 1,
+        generation: 1,
+        offer: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      },
       { type: "paseo.web.suspend", v: 1, generation: 1, reason: "channel_lost" },
     ]);
     expect(broker.suspend("expired")).toBe(false);
@@ -650,4 +657,694 @@ describe("web proxy broker lifecycle", () => {
     });
     expect(container.querySelector("iframe")).toBeNull();
   }, 30_000);
+});
+
+describe("web proxy lifecycle through the real shell", () => {
+  interface Point {
+    x: number;
+    y: number;
+  }
+
+  interface LifecycleReport {
+    kind: string;
+    page: string;
+    identity: string;
+    note: string;
+    focused: string | null;
+    press: Point;
+    notePosition: Point;
+    text?: string;
+  }
+
+  function isLifecycleReport(data: unknown): data is LifecycleReport {
+    return typeof data === "object" && data !== null && "kind" in data && "identity" in data;
+  }
+
+  function lifecycleReports(): LifecycleReport[] {
+    return messagesOf(CONTENT_A, "fixture.lifecycle").filter(isLifecycleReport);
+  }
+
+  function reportsOfKind(kind: string, pageName?: string): LifecycleReport[] {
+    return lifecycleReports().filter(
+      (report) => report.kind === kind && (pageName === undefined || report.page === pageName),
+    );
+  }
+
+  async function nextReport(kind: string, pageName?: string): Promise<LifecycleReport> {
+    const seen = reportsOfKind(kind, pageName).length;
+    return vi.waitFor(() => {
+      const report = reportsOfKind(kind, pageName)[seen];
+      if (report === undefined) throw new Error(`waiting for a ${kind} report`);
+      return report;
+    }, SLOW);
+  }
+
+  async function firstReport(kind: string, pageName: string): Promise<LifecycleReport> {
+    return vi.waitFor(() => {
+      const [report] = reportsOfKind(kind, pageName);
+      if (report === undefined) throw new Error(`waiting for a ${kind} report of ${pageName}`);
+      return report;
+    }, SLOW);
+  }
+
+  // The app frame is the shell's only frame; a cross-origin window still exposes its frames.
+  function command(broker: WebProxyBroker, name: string, extra: Record<string, string> = {}) {
+    const app = currentFrame(broker).contentWindow?.frames[0];
+    if (app === undefined) throw new Error("the shell has no app frame");
+    app.postMessage({ type: "fixture.lifecycle.command", name, ...extra }, CONTENT_A);
+  }
+
+  async function probe(broker: WebProxyBroker): Promise<LifecycleReport> {
+    const next = nextReport("probe");
+    command(broker, "probe");
+    return next;
+  }
+
+  function pathsOf(transport: FixtureTransport): string[] {
+    return transport.requests.map((request) => new URL(request.url).pathname);
+  }
+
+  async function waitForPath(transport: FixtureTransport, path: string): Promise<void> {
+    await vi.waitFor(() => expect(pathsOf(transport)).toContain(path), SLOW);
+  }
+
+  async function loaded(bootstrapPath?: string) {
+    const view = mount({ index: "lifecycle", bootstrapPath });
+    const first = await firstReport("loaded", "A");
+    await vi.waitFor(
+      () => expect(view.broker.getState()).toMatchObject({ lifecycle: "ready", workerArmed: true }),
+      SLOW,
+    );
+    return { ...view, first };
+  }
+
+  async function typed(broker: WebProxyBroker, text: string): Promise<void> {
+    const next = nextReport("type");
+    command(broker, "type", { text });
+    expect(await next).toMatchObject({ note: text, focused: "note" });
+  }
+
+  function clickApp(broker: WebProxyBroker, position: Point): Promise<void> {
+    const shell = page.frameLocator(page.elementLocator(currentFrame(broker)));
+    return shell.getByTestId("paseo-web-proxy-app").click({ position, force: true });
+  }
+
+  async function settle(ms = 500): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  it("P1: keeps the document, its text and focus when a protected link loses its head", async () => {
+    const { broker, transport, first: loadedPage } = await loaded();
+    await typed(broker, "kept text");
+    command(broker, "link");
+    await waitForPath(transport, "/hold");
+    // The harness worker's head deadline is 2 s; armed, it answers 204 and says so.
+    await vi.waitFor(
+      () =>
+        expect(broker.getState()).toMatchObject({
+          navigationDrops: { head_timeout: 1, transport_closed: 0, suspended: 0 },
+        }),
+      SLOW,
+    );
+    expect(await probe(broker)).toMatchObject({
+      page: "A",
+      identity: loadedPage.identity,
+      note: "kept text",
+      focused: "note",
+    });
+    expect(pathsOf(transport).filter((path) => path === "/hold")).toHaveLength(1);
+  }, 45_000);
+
+  it("P1/P3: keeps the document over a suspended form POST and resumes without a replay", async () => {
+    const { broker, transport, first: loadedPage } = await loaded();
+    await typed(broker, "before loss");
+    command(broker, "post");
+    await waitForPath(transport, "/hold-post");
+    const beforeLoss = transport.requests.length;
+
+    expect(broker.suspend("channel_lost")).toBe(true);
+    await vi.waitFor(() => expect(broker.getState()).toMatchObject({ documentKept: true }), SLOW);
+    expect(await probe(broker)).toMatchObject({
+      page: "A",
+      identity: loadedPage.identity,
+      note: "before loss",
+    });
+
+    const candidate = createFixtureTransport({ index: "lifecycle" });
+    expect(await broker.resume({ transport: candidate })).toEqual({
+      kind: "resumed",
+      previous: 1,
+      generation: 2,
+      documentPreserved: true,
+    });
+    const fetched = nextReport("fetched");
+    command(broker, "fetch", { path: "api/echo?after=resume" });
+    expect((await fetched).text).toMatch(/^GET \?after=resume/);
+    expect(await probe(broker)).toMatchObject({ identity: loadedPage.identity });
+
+    expect(transport.requests).toHaveLength(beforeLoss);
+    expect(candidate.requests.map((request) => request.initiator.generation)).toEqual([2]);
+    expect(pathsOf(candidate)).not.toContain("/");
+    const posts = [...pathsOf(transport), ...pathsOf(candidate)].filter(
+      (path) => path === "/hold-post",
+    );
+    expect(posts).toHaveLength(1);
+  }, 45_000);
+
+  it("P2: reports the document lost when the loss comes in a navigation's body phase", async () => {
+    const { broker } = await loaded();
+    command(broker, "go", { path: "b-stream" });
+    await firstReport("loaded", "B");
+    expect(broker.suspend("channel_lost")).toBe(true);
+    await vi.waitFor(() => expect(broker.getState()).toMatchObject({ documentKept: false }), SLOW);
+  }, 45_000);
+
+  it("P2: anchors a new reference after a navigation that completed and loaded", async () => {
+    const { broker, first } = await loaded();
+    command(broker, "go", { path: "b" });
+    const second = await firstReport("load", "B");
+    expect(second.identity).not.toBe(first.identity);
+    expect(broker.suspend("channel_lost")).toBe(true);
+    await vi.waitFor(() => expect(broker.getState()).toMatchObject({ documentKept: true }), SLOW);
+    expect(await probe(broker)).toMatchObject({ page: "B", identity: second.identity });
+  }, 45_000);
+
+  function orderPath(hold: string): string {
+    return `${HARNESS.bootstrapPath}?deliveryOrder=${hold}`;
+  }
+
+  async function delivered(kind: string, message: string): Promise<void> {
+    await vi.waitFor(
+      () =>
+        expect(messagesOf(CONTENT_A, "fixture.lifecycle.order")).toContainEqual({
+          type: "fixture.lifecycle.order",
+          kind,
+          message,
+        }),
+      SLOW,
+    );
+  }
+
+  it.each(["head", "suspend"])(
+    "P2: preserves a pending navigation with %s delivery delayed",
+    async (hold) => {
+      const { broker, transport, first } = await loaded(orderPath(hold));
+      await typed(broker, "ordered text");
+      command(broker, "link");
+      await waitForPath(transport, "/hold");
+      expect(broker.suspend("channel_lost")).toBe(true);
+      const held = hold === "head" ? "paseo.web.response.head" : "paseo.web.suspend";
+      const passed = hold === "head" ? "paseo.web.suspend" : "paseo.web.response.head";
+      await delivered("held", held);
+      await delivered("delivered", passed);
+      expect(await probe(broker)).toMatchObject({ identity: first.identity, note: "ordered text" });
+      currentFrame(broker).contentWindow?.postMessage("fixture.release", CONTENT_A);
+      await delivered("delivered", held);
+      await vi.waitFor(() => expect(broker.getState()).toMatchObject({ documentKept: true }), SLOW);
+      expect(await probe(broker)).toMatchObject({ identity: first.identity, note: "ordered text" });
+      expect(pathsOf(transport).filter((path) => path === "/hold")).toHaveLength(1);
+    },
+    45_000,
+  );
+
+  it("P2: retains the failed navigation mark after its pending request was removed", async () => {
+    const { broker, transport } = await loaded(orderPath("none"));
+    command(broker, "go", { path: "b-error" });
+    await firstReport("loaded", "B");
+    transport.failNavigationBody();
+    await delivered("delivered", "paseo.web.response.error");
+    expect(broker.suspend("channel_lost")).toBe(true);
+    await vi.waitFor(() => expect(broker.getState()).toMatchObject({ documentKept: false }), SLOW);
+  }, 45_000);
+
+  it("P2: refuses a preservation claim before any document reference exists", async () => {
+    const { broker, transport } = mount({ index: "lifecycle", bootstrapPath: orderPath("none") });
+    // Fence in the first request's continuation, before its head can be delivered to K.
+    const original = transport.request.bind(transport);
+    transport.request = async (request, signal) => {
+      const response = await original(request, signal);
+      broker.suspend("channel_lost");
+      return response;
+    };
+    await vi.waitFor(
+      () => expect(broker.getState()).toMatchObject({ status: "suspended", documentKept: false }),
+      SLOW,
+    );
+    expect(pathsOf(transport)).toEqual(["/"]);
+  }, 45_000);
+
+  it("P2: preserves the old document when K intercepts a replacement head before forwarding", async () => {
+    const { broker, first } = await loaded(orderPath("navigation-head"));
+    await typed(broker, "before replacement");
+    command(broker, "go", { path: "b" });
+    await delivered("held", "paseo.web.response.head");
+    expect(broker.suspend("channel_lost")).toBe(true);
+    await vi.waitFor(() => expect(broker.getState()).toMatchObject({ documentKept: true }), SLOW);
+    expect(await probe(broker)).toMatchObject({
+      identity: first.identity,
+      note: "before replacement",
+    });
+    currentFrame(broker).contentWindow?.postMessage("fixture.release", CONTENT_A);
+    await vi.waitFor(
+      () => expect(broker.getState()).toMatchObject({ navigationDrops: { suspended: 1 } }),
+      SLOW,
+    );
+    expect(await probe(broker)).toMatchObject({
+      identity: first.identity,
+      note: "before replacement",
+    });
+    expect(reportsOfKind("loaded", "B")).toEqual([]);
+  }, 45_000);
+
+  it("P5: ends a suspended or resuming view at once, and on a navigation of the shell frame", async () => {
+    const revoked = await loaded();
+    expect(revoked.broker.suspend("channel_lost")).toBe(true);
+    const started = performance.now();
+    revoked.broker.revoke("transport_closed");
+    expect(revoked.broker.getFrame()).toBeNull();
+    expect(performance.now() - started).toBeLessThan(2000);
+
+    const resuming = await loaded();
+    expect(resuming.broker.suspend("expired")).toBe(true);
+    const result = resuming.broker.resume({
+      transport: createFixtureTransport({ index: "lifecycle" }),
+    });
+    resuming.broker.revoke("disposed");
+    expect(await result).toEqual({ kind: "failed", reason: "terminal" });
+    expect(resuming.broker.getState()).toEqual({
+      status: "revoked",
+      generation: 1,
+      reason: "disposed",
+    });
+
+    const navigated = await loaded();
+    expect(navigated.broker.suspend("channel_lost")).toBe(true);
+    command(navigated.broker, "navigate-parent");
+    await vi.waitFor(
+      () =>
+        expect(navigated.broker.getState()).toEqual({
+          status: "revoked",
+          generation: 1,
+          reason: "frame_navigated",
+        }),
+      SLOW,
+    );
+
+    const disposed = await loaded();
+    expect(disposed.broker.suspend("channel_lost")).toBe(true);
+    disposed.broker.dispose();
+    expect(disposed.broker.getState()).toMatchObject({ status: "revoked", reason: "disposed" });
+    expect(container.querySelector("iframe")).toBeNull();
+  }, 90_000);
+
+  it("P6: blocks pointer input and focus while suspended", async () => {
+    const { broker, first: loadedPage } = await loaded();
+    // The same click reaches the page before the suspension, so its absence later means something.
+    const reached = nextReport("pressed");
+    await clickApp(broker, loadedPage.press);
+    await reached;
+    expect(broker.suspend("channel_lost")).toBe(true);
+    await clickApp(broker, loadedPage.notePosition);
+    await clickApp(broker, loadedPage.press);
+    await settle();
+    expect(reportsOfKind("focused")).toEqual([]);
+    expect(reportsOfKind("pressed")).toHaveLength(1);
+  }, 45_000);
+
+  // Measured on Playwright's Chromium headless shell 1208: once a click was aimed at the inert
+  // frame, later clicks never reach the app, also after inert is cleared and also with a bare
+  // inert toggle and no lifecycle code. This case clears inert without such a click; the
+  // control's overlay is what keeps taps away from the inert frame on a device.
+  it("P6: gives pointer input back on resume", async () => {
+    const { broker, first: loadedPage } = await loaded();
+    expect(broker.suspend("channel_lost")).toBe(true);
+    const candidate = createFixtureTransport({ index: "lifecycle" });
+    expect(await broker.resume({ transport: candidate })).toMatchObject({ kind: "resumed" });
+    expect(currentFrame(broker).inert).toBe(false);
+    const pressed = nextReport("pressed");
+    await clickApp(broker, loadedPage.press);
+    expect(await pressed).toMatchObject({ identity: loadedPage.identity });
+  }, 45_000);
+});
+
+describe("web proxy lifecycle R3", () => {
+  const token = "AAAAAAAAAAAAAAAAAAAAAA";
+  const scriptedPath = `${HARNESS.shellPathPrefix}scripted.html`;
+  type Message = Record<string, unknown>;
+  interface Report {
+    event: string;
+    data: Message;
+  }
+
+  function reports(event: string): Report[] {
+    return messagesOf(CONTENT_A, "fixture.r3").filter(
+      (item): item is Report =>
+        typeof item === "object" && item !== null && "event" in item && item.event === event,
+    );
+  }
+
+  async function realShell(offer = true, holdArm = false) {
+    const frame = appendFrame(`${CONTENT_A}${scriptedPath}?real=r3${holdArm ? "&holdArm=1" : ""}`);
+    const requests: Message[] = [];
+    const sideMessages: Message[] = [];
+    let generation = 1;
+    let requestPort: MessagePort;
+    const ports: MessagePort[] = [];
+    function openPort() {
+      const channel = new MessageChannel();
+      ports.push(channel.port1);
+      requestPort = channel.port1;
+      requestPort.addEventListener("message", (event) => requests.push(event.data));
+      requestPort.start();
+      return channel.port2;
+    }
+    await vi.waitFor(() => {
+      expect(messagesOf(CONTENT_A, "paseo.web.hello").length).toBeGreaterThan(0);
+    }, SLOW);
+    frame.contentWindow?.postMessage(
+      { type: "paseo.web.port", v: 1, generation, limits: DEFAULT_BRIDGE_LIMITS },
+      CONTENT_A,
+      [openPort()],
+    );
+    await vi.waitFor(() => expect(reports("bootstrap")).toHaveLength(1), SLOW);
+    const lateral = new MessageChannel();
+    ports.push(lateral.port1);
+    lateral.port1.addEventListener("message", (event) => sideMessages.push(event.data));
+    lateral.port1.start();
+    if (offer) {
+      requestPort!.postMessage(
+        { type: "paseo.web.lifecycle.offer", v: 1, generation, offer: token },
+        [lateral.port2],
+      );
+      await vi.waitFor(
+        () =>
+          expect(sideMessages).toContainEqual({
+            type: "paseo.web.lifecycle.accept",
+            v: 1,
+            generation,
+            offer: token,
+          }),
+        SLOW,
+      );
+    } else lateral.port2.close();
+    function command(name: string, label = "") {
+      frame.contentWindow?.postMessage({ type: "fixture.r3.command", name, label }, CONTENT_A);
+    }
+    async function workerMessage(label: string, type: string) {
+      await vi.waitFor(
+        () =>
+          expect(
+            reports("worker").some((entry) => {
+              const data = entry.data;
+              return data.label === label && (data.message as Message).type === type;
+            }),
+          ).toBe(true),
+        SLOW,
+      );
+    }
+    async function request(label: string) {
+      command("fetch", label);
+      return vi.waitFor(() => {
+        const message = requests.find(
+          (item) => item.type === "paseo.web.request" && item.path === `/r3-${label}`,
+        );
+        if (message === undefined) throw new Error("waiting for the scripted navigation");
+        return message.requestId;
+      }, SLOW);
+    }
+    async function head(label: string, requestId: unknown, status = 200) {
+      requestPort!.postMessage(
+        {
+          type: "paseo.web.response.head",
+          v: 1,
+          generation,
+          requestId,
+          status,
+          statusText: "",
+          headers: [],
+        },
+        [],
+      );
+      await workerMessage(label, "paseo.web.response.head");
+    }
+    async function complete(label: string) {
+      const requestId = await request(label);
+      await head(label, requestId);
+      requestPort!.postMessage({ type: "paseo.web.response.end", v: 1, generation, requestId }, []);
+      await workerMessage(label, "paseo.web.response.end");
+      const before = reports("load").length;
+      command("load");
+      await vi.waitFor(() => expect(reports("load")).toHaveLength(before + 1), SLOW);
+    }
+    function ready(overrides: Message = {}) {
+      lateral.port1.postMessage({
+        type: "paseo.web.lifecycle.ready",
+        v: 1,
+        generation: 1,
+        offer: token,
+        ...overrides,
+      });
+    }
+    async function confirm() {
+      ready();
+      await vi.waitFor(
+        () =>
+          expect(sideMessages).toContainEqual({
+            type: "paseo.web.lifecycle.state",
+            v: 1,
+            workerArmed: true,
+          }),
+        SLOW,
+      );
+    }
+    async function suspend() {
+      const before = sideMessages.length;
+      lateral.port1.postMessage({
+        type: "paseo.web.suspend",
+        v: 1,
+        generation,
+        reason: "channel_lost",
+      });
+      return vi.waitFor(() => {
+        const reply = sideMessages
+          .slice(before)
+          .find((item) => item.type === "paseo.web.suspended");
+        if (reply === undefined) throw new Error("waiting for the suspended report");
+        return reply;
+      }, SLOW);
+    }
+    async function resume() {
+      const previous = generation++;
+      lateral.port1.postMessage(
+        { type: "paseo.web.resume", v: 1, previous, generation, limits: DEFAULT_BRIDGE_LIMITS },
+        [openPort()],
+      );
+      await vi.waitFor(
+        () =>
+          expect(requests).toContainEqual({
+            type: "paseo.web.resumed",
+            v: 1,
+            previous,
+            generation,
+            documentKept: false,
+          }),
+        SLOW,
+      );
+    }
+    return {
+      requests,
+      sideMessages,
+      command,
+      workerMessage,
+      request,
+      head,
+      complete,
+      ready,
+      confirm,
+      suspend,
+      resume,
+      close: () => {
+        for (const port of ports) port.close();
+        frame.remove();
+      },
+    };
+  }
+
+  it("sends the correlated ready only for an accepted offer, never for an accept after its deadline", async () => {
+    const good = mount({ index: "app", bootstrapPath: scriptedPath });
+    await vi.waitFor(
+      () =>
+        expect(messagesOf(CONTENT_A, "fixture.scripted")).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              event: "side",
+              data: expect.objectContaining({
+                type: "paseo.web.lifecycle.ready",
+                v: 1,
+                generation: 1,
+              }),
+            }),
+          ]),
+        ),
+      SLOW,
+    );
+    good.broker.dispose();
+    received = [];
+    const late = mount({
+      index: "app",
+      bootstrapPath: `${scriptedPath}?acceptOn=signal`,
+      handshakeTimeoutMs: 1500,
+    });
+    await vi.waitFor(
+      () =>
+        expect(late.broker.getState()).toMatchObject({
+          status: "granted",
+          lifecycle: "unavailable",
+        }),
+      SLOW,
+    );
+    currentFrame(late.broker).contentWindow?.postMessage(
+      { type: "fixture.scripted.accept" },
+      CONTENT_A,
+    );
+    await vi.waitFor(
+      () =>
+        expect(messagesOf(CONTENT_A, "fixture.scripted")).toEqual(
+          expect.arrayContaining([expect.objectContaining({ event: "accepted" })]),
+        ),
+      SLOW,
+    );
+    expect(
+      messagesOf(CONTENT_A, "fixture.scripted").some(
+        (item) => (item as { data?: Message }).data?.type === "paseo.web.lifecycle.ready",
+      ),
+    ).toBe(false);
+    expect(late.broker.getState()).toMatchObject({ lifecycle: "unavailable" });
+  }, 30_000);
+
+  it("waits for matching ready even without a close event, ignores wrong and duplicate ready", async () => {
+    const shell = await realShell();
+    try {
+      expect(reports("arm")).toHaveLength(0);
+      shell.ready({ generation: 2 });
+      shell.ready({ offer: "BBBBBBBBBBBBBBBBBBBBBB" });
+      const requestId = await shell.request("unconfirmed");
+      shell.command("drop", "unconfirmed");
+      await vi.waitFor(
+        () =>
+          expect(shell.requests).toContainEqual({
+            type: "paseo.web.cancel",
+            v: 1,
+            generation: 1,
+            requestId,
+          }),
+        SLOW,
+      );
+      expect(reports("arm")).toHaveLength(0);
+      expect(shell.sideMessages).toHaveLength(1); // only accept; no state/dropped before ready
+      await shell.confirm();
+      shell.ready();
+      shell.ready({ generation: 2 });
+      await shell.complete("barrier");
+      expect(reports("arm")).toHaveLength(1);
+    } finally {
+      shell.close();
+    }
+  });
+
+  it("releases a dropped request when the real shell has no lateral port", async () => {
+    const shell = await realShell(false);
+    try {
+      const requestId = await shell.request("no-side");
+      shell.command("drop", "no-side");
+      await vi.waitFor(
+        () =>
+          expect(shell.requests).toContainEqual({
+            type: "paseo.web.cancel",
+            v: 1,
+            generation: 1,
+            requestId,
+          }),
+        SLOW,
+      );
+      expect(shell.sideMessages).toEqual([]);
+      expect(reports("arm")).toHaveLength(0);
+    } finally {
+      shell.close();
+    }
+  });
+
+  it("disables the lifecycle on delivered lateral close and ignores an outstanding ARM reply", async () => {
+    const shell = await realShell(true, true);
+    try {
+      shell.ready();
+      await vi.waitFor(() => expect(reports("arm")).toHaveLength(1), SLOW);
+      shell.command("lateral-close");
+      await vi.waitFor(() => expect(reports("lateral-closed")).toHaveLength(1), SLOW);
+      shell.command("arm-reply");
+      await vi.waitFor(() => expect(reports("arm-replied")).toHaveLength(1), SLOW);
+      await shell.complete("after-close");
+      expect(reports("sent")).toHaveLength(0);
+      expect(reports("arm")).toHaveLength(1);
+    } finally {
+      shell.close();
+    }
+  });
+
+  for (const ending of ["cancel", "close", "suspend"] as const) {
+    it(`marks a body navigation failed on ${ending} so a later complete document becomes the reference`, async () => {
+      const shell = await realShell();
+      try {
+        await shell.confirm();
+        await shell.complete("initial");
+        const requestId = await shell.request("interrupted");
+        await shell.head("interrupted", requestId);
+        if (ending === "suspend") {
+          expect(await shell.suspend()).toMatchObject({ documentKept: false });
+          await shell.workerMessage("interrupted", "paseo.web.response.error");
+          await shell.resume();
+        } else {
+          shell.command(ending, "interrupted");
+          await vi.waitFor(
+            () =>
+              expect(shell.requests).toContainEqual({
+                type: "paseo.web.cancel",
+                v: 1,
+                generation: 1,
+                requestId,
+              }),
+            SLOW,
+          );
+        }
+        await shell.complete("replacement");
+        expect(await shell.suspend()).toMatchObject({ documentKept: true });
+      } finally {
+        shell.close();
+      }
+    });
+  }
+
+  it("does not mark the worker's expected cancel after a bodyless 204 as a failed navigation", async () => {
+    const shell = await realShell();
+    try {
+      await shell.confirm();
+      await shell.complete("initial");
+      const requestId = await shell.request("empty");
+      await shell.head("empty", requestId, 204);
+      shell.command("cancel", "empty");
+      await vi.waitFor(
+        () =>
+          expect(shell.requests).toContainEqual({
+            type: "paseo.web.cancel",
+            v: 1,
+            generation: 1,
+            requestId,
+          }),
+        SLOW,
+      );
+      expect(await shell.suspend()).toMatchObject({ documentKept: true });
+    } finally {
+      shell.close();
+    }
+  });
 });
