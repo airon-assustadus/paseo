@@ -170,6 +170,11 @@ describe("web proxy broker and shell", () => {
     // The app re-sent hello from the bootstrap's realm and its own: one grant only.
     expect(grantedGenerations(states)).toEqual([1]);
     expect(broker.getState()).toMatchObject({ status: "granted", generation: 1 });
+    // The shell accepted the lifecycle and armed its worker on the side port.
+    await vi.waitFor(
+      () => expect(broker.getState()).toMatchObject({ lifecycle: "ready", workerArmed: true }),
+      SLOW,
+    );
 
     // Subresources race each other through the worker; the set is what the app asked for.
     const paths = transport.requests.map((request) => new URL(request.url).pathname);
@@ -386,4 +391,263 @@ describe("web proxy broker and shell", () => {
     const last = transport.requests.at(-1);
     expect(last?.initiator.generation).toBe(2);
   }, 45_000);
+});
+
+describe("web proxy broker lifecycle", () => {
+  const SCRIPTED = `${HARNESS.shellPathPrefix}scripted.html`;
+  const DEADLINE_MS = 2000;
+
+  interface ScriptedReport {
+    type: "fixture.scripted";
+    event: string;
+    port?: string;
+    data?: Record<string, unknown>;
+  }
+
+  function scripted(query: Record<string, string> = {}) {
+    const params = new URLSearchParams(query).toString();
+    const view = mount({
+      index: "app",
+      bootstrapPath: params === "" ? SCRIPTED : `${SCRIPTED}?${params}`,
+      handshakeTimeoutMs: DEADLINE_MS,
+    });
+    return { ...view, candidate: createFixtureTransport({ index: "app" }) };
+  }
+
+  function reports(): ScriptedReport[] {
+    return messagesOf(CONTENT_A, "fixture.scripted").filter(
+      (data): data is ScriptedReport => typeof data === "object" && data !== null,
+    );
+  }
+
+  function sideMessages(): Record<string, unknown>[] {
+    return reports().flatMap((report) =>
+      report.event === "side" && report.data !== undefined ? [report.data] : [],
+    );
+  }
+
+  async function ready(broker: WebProxyBroker): Promise<void> {
+    await vi.waitFor(() => expect(broker.getState()).toMatchObject({ lifecycle: "ready" }), SLOW);
+  }
+
+  async function suspended(broker: WebProxyBroker): Promise<void> {
+    await ready(broker);
+    expect(broker.suspend("channel_lost")).toBe(true);
+  }
+
+  function signalAck(broker: WebProxyBroker): void {
+    currentFrame(broker).contentWindow?.postMessage({ type: "fixture.scripted.ack" }, CONTENT_A);
+  }
+
+  it("fences synchronously, keeps the frame without input and tells the shell", async () => {
+    const { broker, transport } = scripted();
+    await suspended(broker);
+    expect(broker.getState()).toMatchObject({
+      status: "suspended",
+      generation: 1,
+      reason: "channel_lost",
+      lastResumeFailure: null,
+    });
+    const frame = currentFrame(broker);
+    expect(frame.isConnected).toBe(true);
+    expect(frame.inert).toBe(true);
+    await vi.waitFor(() => expect(broker.getState()).toMatchObject({ documentKept: true }), SLOW);
+    expect(sideMessages()).toEqual([
+      { type: "paseo.web.suspend", v: 1, generation: 1, reason: "channel_lost" },
+    ]);
+    expect(broker.suspend("expired")).toBe(false);
+    expect(transport.requests).toEqual([]);
+  }, 30_000);
+
+  it("marks the lifecycle unavailable when the shell ignores the offer, and suspend refuses", async () => {
+    const { broker } = scripted({ lifecycle: "ignore" });
+    await vi.waitFor(
+      () =>
+        expect(broker.getState()).toMatchObject({ status: "granted", lifecycle: "unavailable" }),
+      SLOW,
+    );
+    expect(broker.suspend("channel_lost")).toBe(false);
+    broker.revoke("transport_closed");
+    expect(broker.getState()).toEqual({
+      status: "revoked",
+      generation: 1,
+      reason: "transport_closed",
+    });
+    expect(broker.getFrame()).toBeNull();
+  }, 30_000);
+
+  it("resumes on the candidate transport, which only serves after the acknowledgement", async () => {
+    const { broker, transport, candidate, states } = scripted({ afterAck: "request" });
+    await suspended(broker);
+    expect(await broker.resume({ transport: candidate })).toEqual({
+      kind: "resumed",
+      previous: 1,
+      generation: 2,
+      documentPreserved: true,
+    });
+    expect(broker.getState()).toMatchObject({ status: "granted", generation: 2 });
+    expect(currentFrame(broker).inert).toBe(false);
+    expect(states.some((state) => state.status === "resuming")).toBe(true);
+    await vi.waitFor(() => expect(candidate.requests).toHaveLength(1), SLOW);
+    expect(candidate.requests[0]?.initiator.generation).toBe(2);
+    expect(transport.requests).toEqual([]);
+    expect(sideMessages().at(-1)).toMatchObject({
+      type: "paseo.web.resume",
+      previous: 1,
+      generation: 2,
+    });
+
+    // A loss after the success point is a new suspension, not a failed resume.
+    expect(broker.suspend("channel_lost")).toBe(true);
+    expect(broker.getState()).toMatchObject({
+      status: "suspended",
+      generation: 2,
+      lastResumeFailure: null,
+    });
+  }, 30_000);
+
+  it("ends suspended on the new generation when the candidate is lost before the acknowledgement", async () => {
+    const { broker, candidate, states } = scripted({ ackOn: "signal", afterAck: "request" });
+    await suspended(broker);
+    const result = broker.resume({ transport: candidate });
+    expect(broker.getState()).toMatchObject({ status: "resuming", previous: 1, generation: 2 });
+    expect(broker.suspend("expired")).toBe(true);
+    expect(broker.getState()).toMatchObject({ status: "resuming" });
+    signalAck(broker);
+
+    expect(await result).toEqual({ kind: "failed", reason: "transport_lost" });
+    expect(broker.getState()).toMatchObject({
+      status: "suspended",
+      generation: 2,
+      reason: "expired",
+      lastResumeFailure: "transport_lost",
+    });
+    expect(grantedGenerations(states)).toEqual([1]);
+    expect(currentFrame(broker).inert).toBe(true);
+    await vi.waitFor(
+      () =>
+        expect(reports()).toContainEqual({
+          type: "fixture.scripted",
+          event: "received",
+          port: "resumed",
+          data: expect.objectContaining({ type: "paseo.web.response.head", status: 204 }),
+        }),
+      SLOW,
+    );
+    expect(candidate.requests).toEqual([]);
+    expect(sideMessages().at(-1)).toEqual({
+      type: "paseo.web.suspend",
+      v: 1,
+      generation: 2,
+      reason: "expired",
+    });
+  }, 30_000);
+
+  it.each([
+    { ack: "request-first", cause: "ack_invalid", reason: "protocol_error" },
+    { ack: "wrong-generation", cause: "ack_invalid", reason: "protocol_error" },
+    { ack: "wrong-previous", cause: "ack_invalid", reason: "protocol_error" },
+    { ack: "silent", cause: "ack_timeout", reason: "protocol_error" },
+  ] as const)(
+    "ends the view on an acknowledgement that is $ack",
+    async ({ ack, cause, reason }) => {
+      const { broker, candidate } = scripted({ ack });
+      await suspended(broker);
+      expect(await broker.resume({ transport: candidate })).toEqual({
+        kind: "failed",
+        reason: cause,
+      });
+      expect(broker.getState()).toEqual({ status: "revoked", generation: 1, reason, cause });
+      expect(broker.getFrame()).toBeNull();
+      expect(candidate.requests).toEqual([]);
+    },
+    30_000,
+  );
+
+  // Measured on Playwright's Chromium headless shell 1208: a port closed by the shell does not
+  // dispatch "close" on the broker's end, so the deadline ends the view instead.
+  it("ends the view when the shell closes the new port instead of acknowledging", async () => {
+    const { broker, candidate } = scripted({ ack: "close" });
+    await suspended(broker);
+    const result = await broker.resume({ transport: candidate });
+    if (result.kind !== "failed") throw new Error("a closed port must not resume");
+    const wireReason = result.reason === "ack_port_closed" ? "port_closed" : "protocol_error";
+    expect(["ack_port_closed", "ack_timeout"]).toContain(result.reason);
+    expect(broker.getState()).toEqual({
+      status: "revoked",
+      generation: 1,
+      reason: wireReason,
+      cause: result.reason,
+    });
+    expect(candidate.requests).toEqual([]);
+  }, 30_000);
+
+  it("ends the view on a second acknowledgement and on one sent on the old port", async () => {
+    const duplicate = scripted({ ack: "duplicate" });
+    await suspended(duplicate.broker);
+    expect(await duplicate.broker.resume({ transport: duplicate.candidate })).toMatchObject({
+      kind: "resumed",
+    });
+    await vi.waitFor(
+      () =>
+        expect(duplicate.broker.getState()).toEqual({
+          status: "revoked",
+          generation: 2,
+          reason: "protocol_error",
+        }),
+      SLOW,
+    );
+
+    const oldPort = scripted({ ack: "old-port" });
+    await suspended(oldPort.broker);
+    expect(await oldPort.broker.resume({ transport: oldPort.candidate })).toEqual({
+      kind: "failed",
+      reason: "terminal",
+    });
+    expect(oldPort.broker.getState()).toEqual({
+      status: "revoked",
+      generation: 1,
+      reason: "protocol_error",
+    });
+  }, 30_000);
+
+  it("settles a pending resume as terminal on revoke and on dispose", async () => {
+    const revoked = scripted({ ackOn: "signal" });
+    await suspended(revoked.broker);
+    const result = revoked.broker.resume({ transport: revoked.candidate });
+    revoked.broker.revoke("disposed");
+    expect(await result).toEqual({ kind: "failed", reason: "terminal" });
+    expect(revoked.broker.getState()).toEqual({
+      status: "revoked",
+      generation: 1,
+      reason: "disposed",
+    });
+    expect(revoked.broker.getFrame()).toBeNull();
+
+    const disposed = scripted({ ackOn: "signal" });
+    await suspended(disposed.broker);
+    const pending = disposed.broker.resume({ transport: disposed.candidate });
+    disposed.broker.dispose();
+    expect(await pending).toEqual({ kind: "failed", reason: "terminal" });
+    expect(disposed.candidate.requests).toEqual([]);
+  }, 30_000);
+
+  it("refuses to resume outside suspended and revokes a suspended view at once", async () => {
+    const { broker, candidate } = scripted();
+    await ready(broker);
+    expect(await broker.resume({ transport: candidate })).toEqual({
+      kind: "failed",
+      reason: "not_suspended",
+    });
+    expect(broker.suspend("channel_lost")).toBe(true);
+    broker.reopen();
+    expect(broker.getState()).toMatchObject({ status: "suspended" });
+    broker.revoke("transport_closed");
+    expect(broker.getState()).toEqual({
+      status: "revoked",
+      generation: 1,
+      reason: "transport_closed",
+    });
+    expect(container.querySelector("iframe")).toBeNull();
+  }, 30_000);
 });

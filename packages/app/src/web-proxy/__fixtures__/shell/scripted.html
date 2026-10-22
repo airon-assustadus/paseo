@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Scripted lifecycle shell</title>
+  </head>
+  <body>
+    <p>Speaks the bridge the way the query string asks, to drive the broker's lifecycle edges.</p>
+    <script>
+      // lifecycle: accept | ignore. ack: valid | request-first | duplicate | wrong-generation |
+      // wrong-previous | old-port | close | silent. ackOn: resume | signal. afterAck: none | request.
+      const params = new URLSearchParams(location.search);
+      const lifecycle = params.get("lifecycle") ?? "accept";
+      const ack = params.get("ack") ?? "valid";
+      const ackOn = params.get("ackOn") ?? "resume";
+      const afterAck = params.get("afterAck") ?? "none";
+      let granted = false;
+      let requestPort = null;
+      let sidePort = null;
+      let pendingResume = null;
+      // The signal crosses the window and the resume crosses the side port: either may come first.
+      let ackSignalled = false;
+      let nextRequestId = 1;
+
+      function report(event, detail) {
+        parent.postMessage({ type: "fixture.scripted", event, ...detail }, "*");
+      }
+
+      function request(port, generation) {
+        port.postMessage({
+          type: "paseo.web.request",
+          v: 1,
+          generation,
+          requestId: nextRequestId++,
+          method: "GET",
+          path: "/",
+          headers: [],
+          body: null,
+          mode: "navigate",
+        });
+      }
+
+      function listen(port, label) {
+        port.onmessage = (event) => {
+          if (event.data.type === "paseo.web.lifecycle.offer") {
+            onOffer(event);
+            return;
+          }
+          report("received", { port: label, data: event.data });
+        };
+      }
+
+      function onOffer(event) {
+        report("offer", { generation: event.data.generation });
+        if (lifecycle !== "accept") return;
+        sidePort = event.ports[0];
+        sidePort.onmessage = onSide;
+        sidePort.postMessage({
+          type: "paseo.web.lifecycle.accept",
+          v: 1,
+          generation: event.data.generation,
+          offer: event.data.offer,
+        });
+      }
+
+      function onSide(event) {
+        const data = event.data;
+        report("side", { data });
+        if (data.type === "paseo.web.suspend") {
+          sidePort.postMessage({
+            type: "paseo.web.suspended",
+            v: 1,
+            generation: data.generation,
+            documentKept: true,
+          });
+        } else if (data.type === "paseo.web.resume") {
+          pendingResume = { data, port: event.ports[0] };
+          maybeAcknowledge();
+        }
+      }
+
+      function maybeAcknowledge() {
+        if (pendingResume !== null && (ackOn === "resume" || ackSignalled)) acknowledge();
+      }
+
+      function acknowledge() {
+        const { data, port } = pendingResume;
+        const resumed = {
+          type: "paseo.web.resumed",
+          v: 1,
+          previous: data.previous,
+          generation: data.generation,
+          documentKept: true,
+        };
+        listen(port, "resumed");
+        if (ack === "valid") port.postMessage(resumed);
+        if (ack === "request-first") request(port, data.generation);
+        if (ack === "duplicate") {
+          port.postMessage(resumed);
+          port.postMessage(resumed);
+        }
+        if (ack === "wrong-generation") {
+          port.postMessage({ ...resumed, generation: data.generation + 1 });
+        }
+        if (ack === "wrong-previous") {
+          port.postMessage({
+            ...resumed,
+            previous: data.previous + 1,
+            generation: data.generation + 1,
+          });
+        }
+        if (ack === "old-port") requestPort.postMessage(resumed);
+        if (ack === "close") port.close();
+        if (afterAck === "request") request(port, data.generation);
+        report("acknowledged", { ack });
+      }
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== parent || typeof event.data !== "object" || event.data === null)
+          return;
+        if (event.data.type === "paseo.web.port" && !granted) {
+          granted = true;
+          requestPort = event.ports[0];
+          listen(requestPort, "granted");
+          report("granted", { generation: event.data.generation });
+        } else if (event.data.type === "fixture.scripted.ack") {
+          ackSignalled = true;
+          maybeAcknowledge();
+        }
+      });
+
+      // The broker accepts a hello only after the frame's load event: repeat until the grant.
+      const hello = setInterval(() => {
+        if (granted) {
+          clearInterval(hello);
+          return;
+        }
+        parent.postMessage({ type: "paseo.web.hello", v: 1 }, "*");
+      }, 50);
+    </script>
+  </body>
+</html>
