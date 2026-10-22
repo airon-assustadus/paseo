@@ -235,7 +235,8 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     const current = session;
     session = null;
     current?.revoke(reason);
-    const generation = state.generation;
+    // A generation being adopted never held authority: the view ends on the one that did.
+    const generation = state.status === "resuming" ? state.previous : state.generation;
     terminate(
       cause === undefined
         ? { status: "revoked", generation, reason }
