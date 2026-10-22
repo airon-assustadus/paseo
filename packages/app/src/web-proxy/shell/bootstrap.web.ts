@@ -6,6 +6,7 @@ import {
   parseLifecycleOffer,
   parseLifecycleToShell,
   parsePortGrant,
+  PURGE_WORKER_BUDGET_MS,
   suspendedReply,
   type BridgeLimits,
   type BridgeRequestMode,
@@ -14,12 +15,15 @@ import {
   type ControlMessage,
   type HelloMessage,
   type LifecycleToBrokerMessage,
+  type PurgeMessage,
+  type PurgeQueryMessage,
   type ResumeMessage,
   type SuspendMessage,
 } from "../bridge-messages";
 import {
   isResync,
   parseLifecycleArmed,
+  parseShellPurged,
   parseShellRequestMessage,
   parseWorkerToBootstrapMessage,
   readShellFetchFields,
@@ -27,6 +31,8 @@ import {
   type ShellCancelMessage,
   type ShellDropCause,
   type ShellLifecycleArmMessage,
+  type ShellPurgeMessage,
+  type ShellPurgeResult,
   type ShellResyncReplyMessage,
   type ShellSessionCloseMessage,
   type ShellSessionOpenMessage,
@@ -176,6 +182,9 @@ function startRelay(input: {
   let isSessionReady = false;
   let workerArmed = false;
   let armAttempt = 0;
+  // Authoritative purge (lifecycle contract §5.9): answered once per shell instance.
+  let isPurgeQueryAnswered = false;
+  let purgeOp: string | null = null;
   // Preservation reference (lifecycle contract §5.8), kept outside `pending` so it survives the
   // end of a request.
   let reference: Document | null = null;
@@ -241,6 +250,8 @@ function startRelay(input: {
 
   function toControl(message: LifecycleToBrokerMessage): void {
     if (message.type !== "paseo.web.lifecycle.accept" && !lifecycleConfirmed) return;
+    // A purging shell says nothing else: its only remaining message is the purged report.
+    if (purgeOp !== null && message.type !== "paseo.web.purged") return;
     side?.postMessage(message, []);
   }
 
@@ -603,9 +614,8 @@ function startRelay(input: {
     onControlMessage(ctx, message);
   }
 
-  function suspend(message: SuspendMessage): void {
-    const ctx = current;
-    if (ctx.state !== "live" || message.generation !== ctx.generation) return;
+  // From here on every request is answered locally with the v1 primitives, never forwarded.
+  function answerPendingLocally(ctx: GenerationContext): void {
     ctx.state = "suspended";
     for (const [requestId, entry] of ctx.pending) {
       const isNavigationHead = entry.mode === "navigate" && !entry.headForwarded;
@@ -617,6 +627,12 @@ function startRelay(input: {
       toWorker(entry.workerPort, suspendedReply(mode, requestId, ctx.generation));
     }
     ctx.pending.clear();
+  }
+
+  function suspend(message: SuspendMessage): void {
+    const ctx = current;
+    if (ctx.state !== "live" || message.generation !== ctx.generation) return;
+    answerPendingLocally(ctx);
     const documentKept = computeDocumentKept();
     toControl({ type: "paseo.web.suspended", v: 1, generation: ctx.generation, documentKept });
     showStatus(doc, "suspended");
@@ -646,6 +662,74 @@ function startRelay(input: {
     showStatus(doc, "ready");
   }
 
+  function answerPurgeQuery(message: PurgeQueryMessage, ports: ReadonlyArray<MessagePort>): void {
+    if (isPurgeQueryAnswered || ports.length !== 0) return;
+    isPurgeQueryAnswered = true;
+    toControl({ type: "paseo.web.purge.capable", v: 1, nonce: message.nonce });
+  }
+
+  // Asks the worker of the binding, on a port of its own, and waits until the budget counted from
+  // the purge's receipt. No binding, no answer in time or a wrong answer: nothing is confirmed.
+  function askWorkerToPurge(op: string, deadline: number): Promise<ShellPurgeResult> {
+    const worker = binding;
+    const notConfirmed: ShellPurgeResult = { caches: false, indexedDB: false, unregistered: false };
+    if (worker === null) return Promise.resolve(notConfirmed);
+    const channel = new MessageChannel();
+    const reply = new Promise<ShellPurgeResult>((resolve) => {
+      channel.port1.addEventListener(
+        "message",
+        (event) => {
+          const purged = parseShellPurged(event.data);
+          if (purged === null || purged.op !== op) {
+            resolve(notConfirmed);
+            return;
+          }
+          const { caches, indexedDB, unregistered } = purged;
+          resolve({ caches, indexedDB, unregistered });
+        },
+        { once: true },
+      );
+    });
+    const budget: { timer: ReturnType<typeof setTimeout> | null } = { timer: null };
+    const expired = new Promise<ShellPurgeResult>((resolve) => {
+      budget.timer = setTimeout(
+        () => resolve(notConfirmed),
+        Math.max(0, deadline - performance.now()),
+      );
+    });
+    channel.port1.start();
+    const message: ShellPurgeMessage = { type: "paseo.shell.purge", v: 1, op };
+    worker.postMessage(message, [channel.port2]);
+    return Promise.race([reply, expired]).finally(() => {
+      if (budget.timer !== null) clearTimeout(budget.timer);
+      channel.port1.close();
+    });
+  }
+
+  function clearStorage(storage: () => Storage): boolean {
+    try {
+      storage().clear();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // The page goes first, so it cannot write after the clear. No port is closed: a close could
+  // reach the control before the report and turn the operation into an interruption.
+  async function purge(message: PurgeMessage, ports: ReadonlyArray<MessagePort>): Promise<void> {
+    if (purgeOp !== null || ports.length !== 0) return;
+    const deadline = performance.now() + PURGE_WORKER_BUDGET_MS;
+    const { op } = message;
+    purgeOp = op;
+    answerPendingLocally(current);
+    appFrame.remove();
+    const localStorage = clearStorage(() => options.window.localStorage);
+    const sessionStorage = clearStorage(() => options.window.sessionStorage);
+    const worker = await askWorkerToPurge(op, deadline);
+    toControl({ type: "paseo.web.purged", v: 1, op, localStorage, sessionStorage, ...worker });
+  }
+
   function onSideMessage(event: MessageEvent): void {
     if (revokedReason !== null) return;
     const message = parseLifecycleToShell(event.data);
@@ -659,6 +743,16 @@ function startRelay(input: {
       return;
     }
     if (!lifecycleConfirmed) return;
+    if (message.type === "paseo.web.purge.query") {
+      answerPurgeQuery(message, event.ports);
+      return;
+    }
+    if (message.type === "paseo.web.purge") {
+      void purge(message, event.ports);
+      return;
+    }
+    // A purging shell stays inert until the control removes its frame.
+    if (purgeOp !== null) return;
     if (message.type === "paseo.web.suspend") suspend(message);
     else resume(message, event.ports);
   }
