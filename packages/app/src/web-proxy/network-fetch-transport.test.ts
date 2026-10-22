@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NetworkFetchOpenFailedError,
   openNetworkFetchTransport,
@@ -10,7 +10,8 @@ import {
   type NetworkFetchTransport,
   type NetworkFetchTransportClosedReason,
 } from "./network-fetch-transport";
-import type { BridgeErrorReason } from "./bridge-messages";
+import { DEFAULT_BRIDGE_LIMITS, type BridgeErrorReason } from "./bridge-messages";
+import { startPortSession, type PortSession } from "./port-session.web";
 import type { WebProxyCapability } from "./request-policy";
 import {
   WebProxyTransportError,
@@ -894,5 +895,72 @@ describe("end of session", () => {
     await response;
     session.channel.deliver(headFrame(1));
     expect(session.closedReasons).toEqual(["protocol_error"]);
+  });
+
+  it("lets a port session fence itself inside onClosed, before any rejection reaches it", async () => {
+    const channel = createFakeChannel();
+    const fenced: { session: PortSession | null } = { session: null };
+    const opening = openNetworkFetchTransport({
+      channel,
+      capability: CAPABILITY,
+      ttlMs: 60_000,
+      limits: { initialWindowBytes: 8, maxChunkBytes: 4 },
+      onClosed: () => fenced.session?.quiesce(),
+    });
+    channel.deliver({ type: "session.opened", limits: LIMITS });
+    const transport = await opening;
+    openTransports.push(transport);
+    const ports = new MessageChannel();
+    const received: unknown[] = [];
+    ports.port2.addEventListener("message", (event) => received.push(event.data));
+    ports.port2.start();
+    fenced.session = startPortSession({
+      port: ports.port1,
+      generation: 1,
+      capability: CAPABILITY,
+      limits: DEFAULT_BRIDGE_LIMITS,
+      transport,
+      onRevoked: () => {},
+      onRedirectBlocked: () => {},
+    });
+    const request = {
+      type: "paseo.web.request",
+      v: 1,
+      generation: 1,
+      method: "GET",
+      path: "/app/page",
+      headers: [],
+      body: null,
+    };
+    ports.port2.postMessage({ ...request, requestId: 1, mode: "navigate" });
+    ports.port2.postMessage({ ...request, requestId: 2, mode: "subresource" });
+    await vi.waitFor(() => expect(framesOfType(channel, "request")).toHaveLength(2));
+    channel.deliver(headFrame(2));
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+
+    channel.lose();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(received.slice(1)).toEqual([
+      {
+        type: "paseo.web.response.head",
+        v: 1,
+        generation: 1,
+        requestId: 1,
+        status: 204,
+        statusText: "",
+        headers: [],
+      },
+      {
+        type: "paseo.web.response.error",
+        v: 1,
+        generation: 1,
+        requestId: 2,
+        code: "transport_error",
+        reason: "transport_closed",
+      },
+    ]);
+    fenced.session.discard();
+    ports.port2.close();
   });
 });
