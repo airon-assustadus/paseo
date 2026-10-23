@@ -2,6 +2,46 @@ import { describe, expect, it, vi } from "vitest";
 import { createWebProxyProductRegistry } from "./product-registry.web";
 
 describe("product cross-context invalidation", () => {
+  it("R0 receives through a failed callback without retransmitting the hint", async () => {
+    const name = crypto.randomUUID();
+    const sender = new BroadcastChannel(name);
+    const receiver = new BroadcastChannel(name);
+    const rebroadcast = vi.spyOn(receiver, "postMessage");
+    const registry = createWebProxyProductRegistry({ channel: receiver });
+    const event = {
+      version: 1,
+      serverId: "host",
+      destinationId: "destination",
+      reason: "cleanup_pending",
+    } as const;
+    registry.register({
+      view: { serverId: "host", workspaceId: "workspace", browserId: "first" },
+      destinationId: "destination",
+      invalidate() {
+        throw new Error("callback failure");
+      },
+    });
+    const visited = new Promise<void>((resolve) => {
+      registry.register({
+        view: { serverId: "host", workspaceId: "workspace", browserId: "second" },
+        destinationId: "destination",
+        invalidate() {
+          expect(registry.isFenced(event)).toBe(true);
+          resolve();
+        },
+      });
+    });
+    try {
+      const publish = sender.postMessage.bind(sender);
+      publish(event);
+      await visited;
+      expect(rebroadcast).not.toHaveBeenCalled();
+    } finally {
+      registry.dispose();
+      sender.close();
+    }
+  });
+
   it("propagates a cleanup fence without accepting authority or a clean acknowledgement", async () => {
     const name = crypto.randomUUID();
     const sender = new BroadcastChannel(name);
