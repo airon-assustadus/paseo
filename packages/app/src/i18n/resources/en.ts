@@ -1,4 +1,21 @@
 export const en = {
+  webProxy: {
+    useDom: "Use local browser (experimental)",
+    useImage: "Use image browser",
+    unavailable: "Local browsing is unavailable. Update or configure this host to use it.",
+    preferenceFailed: "Couldn't load or save the browser preference. Try again.",
+    navigationUnavailable: "This host connection does not support page navigation yet.",
+    actionFailed: "Couldn't complete this browser action. Check the host connection and access.",
+    offline: "Connect to this host to open the page.",
+    opening: "Opening the page...",
+    suspended: "The page is suspended. Resume to reconnect.",
+    cleanupLocal: "Cleanup is pending on this device and has not been confirmed by the host.",
+    cleanupPending: "Cleanup is pending. The page data has not been confirmed erased.",
+    cleanupPartial: "Cleanup is incomplete. The page remains blocked.",
+    requestCleanup: "Request cleanup for all views of this destination",
+    stop: "Stop",
+    resume: "Resume",
+  },
   browserRouting: {
     sectionTitle: "Browser",
     permissionDenied:

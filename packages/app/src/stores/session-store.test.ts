@@ -7,6 +7,7 @@ import {
   normalizeWorkspaceDescriptor,
   selectAgentTurnPresentation,
   selectAgentTimelineState,
+  toDaemonServerInfo,
   useSessionStore,
   type Agent,
   type WorkspaceDescriptor,
@@ -83,11 +84,99 @@ function createWorkspace(
 
 afterEach(() => {
   useSessionStore.getState().clearSession("test-server");
+  useSessionStore.getState().clearSession("second-proxy-host");
 });
 
-function initializeTestSession(): void {
-  useSessionStore.getState().initializeSession("test-server", null as unknown as DaemonClient);
+function initializeTestSession(serverId = "test-server"): void {
+  useSessionStore.getState().initializeSession(serverId, null as unknown as DaemonClient);
 }
+
+describe("web proxy server configuration", () => {
+  const configuration = {
+    dedicatedContentDomain: "content.example",
+    assetVersion: "test-assets",
+    bootstrapPath: "/bootstrap.html",
+    pathPrefix: "/",
+    ttlMs: 1000,
+    handshakeTimeoutMs: 500,
+  };
+
+  it("projects authenticated configuration and notifies on removal without changing feature flags", () => {
+    initializeTestSession();
+    const info = toDaemonServerInfo({
+      status: "server_info",
+      serverId: "test-server",
+      hostname: null,
+      version: null,
+      features: { networkFetch: true },
+      networkFetchConfiguration: configuration,
+    });
+    expect(info.networkFetchConfiguration).toEqual(configuration);
+    useSessionStore.getState().updateSessionServerInfo("test-server", info);
+    const configured = useSessionStore.getState().sessions["test-server"];
+    useSessionStore.getState().updateSessionServerInfo(
+      "test-server",
+      toDaemonServerInfo({
+        status: "server_info",
+        serverId: "test-server",
+        features: { networkFetch: true },
+        hostname: null,
+        version: null,
+      }),
+    );
+    const removed = useSessionStore.getState().sessions["test-server"];
+    expect(removed).not.toBe(configured);
+    expect(removed?.serverInfo?.networkFetchConfiguration).toBeUndefined();
+  });
+
+  it("keeps host configuration separate and publishes an asset version change", () => {
+    initializeTestSession();
+    initializeTestSession("second-proxy-host");
+    useSessionStore.getState().updateSessionServerInfo(
+      "test-server",
+      toDaemonServerInfo({
+        status: "server_info",
+        serverId: "test-server",
+        networkFetchConfiguration: configuration,
+        hostname: null,
+        version: null,
+      }),
+    );
+    useSessionStore.getState().updateSessionServerInfo(
+      "second-proxy-host",
+      toDaemonServerInfo({
+        status: "server_info",
+        serverId: "second-proxy-host",
+        hostname: null,
+        version: null,
+      }),
+    );
+    expect(
+      useSessionStore.getState().sessions["second-proxy-host"]?.serverInfo
+        ?.networkFetchConfiguration,
+    ).toBeUndefined();
+    const first = useSessionStore.getState().sessions["test-server"];
+    const changed = { ...configuration, assetVersion: "next-assets" };
+    useSessionStore.getState().updateSessionServerInfo(
+      "test-server",
+      toDaemonServerInfo({
+        status: "server_info",
+        serverId: "test-server",
+        networkFetchConfiguration: changed,
+        hostname: null,
+        version: null,
+      }),
+    );
+    expect(useSessionStore.getState().sessions["test-server"]).not.toBe(first);
+    expect(
+      useSessionStore.getState().sessions["test-server"]?.serverInfo?.networkFetchConfiguration,
+    ).toEqual(changed);
+    expect(
+      useSessionStore.getState().sessions["second-proxy-host"]?.serverInfo
+        ?.networkFetchConfiguration,
+    ).toBeUndefined();
+  });
+});
 
 function getTestSessionReferences() {
   const state = useSessionStore.getState();

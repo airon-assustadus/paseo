@@ -2,6 +2,7 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const zhCN: TranslationResources = {
+  webProxy: en.webProxy,
   browserRouting: {
     sectionTitle: "浏览器",
     permissionDenied: "此连接无权使用主机网络。请联系主机所有者以允许网络访问。",
