@@ -51,7 +51,7 @@ describe("network fetch owned registry", () => {
     (opcode) => {
       const { registry, handle } = setup();
       const observed: number[] = [];
-      handle.onFrame((frame) => observed.push(frame.opcode));
+      const unsubscribe = handle.onFrame((frame) => observed.push(frame.opcode));
       handle.send({ opcode: NetworkFetchOpcode.Request, fetchId: 1, request });
       handle.send({ opcode: NetworkFetchOpcode.Cancel, fetchId: 1 });
       const terminal =
@@ -64,6 +64,11 @@ describe("network fetch owned registry", () => {
             };
       expect(registry.receive(terminal)).toBe(true);
       expect(observed).toEqual([opcode]);
+      unsubscribe();
+      expect(
+        registry.receive({ ...identity, opcode: NetworkFetchOpcode.Cancelled, dnsPending: false }),
+      ).toBe(true);
+      handle.onFrame((frame) => observed.push(frame.opcode));
       handle.send({ opcode: NetworkFetchOpcode.Request, fetchId: 2, request });
       expect(
         registry.receive({ ...identity, opcode: NetworkFetchOpcode.Cancelled, dnsPending: false }),

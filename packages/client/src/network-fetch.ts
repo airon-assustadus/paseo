@@ -198,9 +198,9 @@ class FetchHandle implements NetworkFetch {
   }
   receive(frame: NetworkFetchServerFrame): boolean {
     if (this.ended) return true;
-    if (!this.frameListeners.size || this.pendingFrames.length >= 256) return false;
     const exchange = this.exchanges.get(frame.fetchId);
     if (!exchange) return frame.fetchId <= this.lastFetchId;
+    if (!this.frameListeners.size || this.pendingFrames.length >= 256) return false;
     if (
       exchange.cancelling &&
       frame.opcode !== NetworkFetchOpcode.Cancelled &&
