@@ -164,10 +164,16 @@ function requireCondition(condition: boolean): void {
 }
 
 function validateSeries(series: SeriesPlan, schedule: ReturnType<typeof finiteSchedule>): void {
-  requireCondition(new Set(series.cycles).size === series.cycles.length);
-  requireCondition(
-    series.cycles.every((cycle) => (series.phase === "cold" ? cycle === 0 : cycle >= 1)),
-  );
+  const memory = ["phone_pss_bytes", "host_rss_bytes"].includes(series.metric);
+  let requiredCycles = Array.from({ length: 20 }, (_, index) => index + 1);
+  if (memory) requiredCycles = [5, ...requiredCycles.slice(9)];
+  if (series.phase === "cold") requiredCycles = [0];
+  requireCondition(evidenceHash(series.cycles) === evidenceHash(requiredCycles));
+  const unitary = ["event_handler_ms", "display_latency_ms", "data_ready_ms", "content_load_ms"];
+  if (memory || series.phase === "cold" || unitary.includes(series.metric)) {
+    requireCondition(series.expectedPerCycle === 1);
+  }
+  if (memory) requireCondition(series.phase === "warm" && series.action === "memory");
   requireCondition(new Set(series.bindings.map((binding) => binding.runId)).size === 18);
   for (const binding of series.bindings) {
     requireCondition(schedule.some((slot) => slot.id === binding.runId));
@@ -281,6 +287,9 @@ export const coverageSchema = z.strictObject({
 export type EvidenceCoverage = z.infer<typeof coverageSchema>;
 export const bundleSchema = z.strictObject({
   version: z.literal(1),
+  captureId: z.uuid(),
+  revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  closure: z.enum(["open", "finished", "invalidated"]),
   manifestSha256: hash,
   samples: z.array(sampleSchema).max(100_000),
   coverage: z.array(coverageSchema).max(11_520),
@@ -303,6 +312,20 @@ export const bundleSchema = z.strictObject({
     .max(6),
 });
 export type EvidenceBundle = z.infer<typeof bundleSchema>;
+
+export interface EvidenceRevision {
+  revision: number;
+  closure: EvidenceBundle["closure"];
+  bundleSha256: string;
+}
+
+export function evidenceRevision(bundle: EvidenceBundle): EvidenceRevision {
+  return {
+    revision: bundle.revision,
+    closure: bundle.closure,
+    bundleSha256: evidenceHash(bundle),
+  };
+}
 
 export function sampleKey(sample: Pick<EvidenceSample, "runId" | "seriesId" | "cycle">): string {
   return `${sample.runId}/${sample.seriesId}/${sample.cycle}`;

@@ -1,10 +1,13 @@
+import { randomUUID } from "node:crypto";
 import {
   coverageSchema,
+  evidenceRevision,
   parseEvidence,
   parseManifest,
   sampleKey,
   type EvidenceBundle,
   type EvidenceManifest,
+  type EvidenceRevision,
 } from "./contract";
 
 export interface EvidenceClock {
@@ -20,6 +23,9 @@ export function createEvidenceRecorder(input: EvidenceManifest, clock: EvidenceC
   const covered = new Set<string>();
   const bundle: EvidenceBundle = {
     version: 1,
+    captureId: randomUUID(),
+    revision: 0,
+    closure: "open",
     manifestSha256: manifest.sha256,
     samples: [],
     coverage: [],
@@ -32,7 +38,13 @@ export function createEvidenceRecorder(input: EvidenceManifest, clock: EvidenceC
   };
 
   function invalidate(reason: EvidenceBundle["reasons"][number]): void {
+    bundle.closure = "invalidated";
     if (!bundle.reasons.includes(reason)) bundle.reasons.push(reason);
+  }
+
+  function advance(): void {
+    if (bundle.revision === Number.MAX_SAFE_INTEGER) throw new Error("Evidence revision overflow");
+    bundle.revision += 1;
   }
 
   function withinDeadline(): boolean {
@@ -50,6 +62,7 @@ export function createEvidenceRecorder(input: EvidenceManifest, clock: EvidenceC
   }
 
   function record(inputSample: unknown): boolean {
+    advance();
     bundle.attempted += 1;
     if (bundle.finished) {
       bundle.rejected += 1;
@@ -81,6 +94,7 @@ export function createEvidenceRecorder(input: EvidenceManifest, clock: EvidenceC
   }
 
   function declareCoverage(inputCoverage: unknown): boolean {
+    advance();
     if (bundle.finished) {
       invalidate("late_record");
       return false;
@@ -108,10 +122,27 @@ export function createEvidenceRecorder(input: EvidenceManifest, clock: EvidenceC
   }
 
   function finish(): EvidenceBundle {
-    if (!bundle.finished) withinDeadline();
+    if (!bundle.finished) {
+      advance();
+      withinDeadline();
+      if (bundle.closure === "open") bundle.closure = "finished";
+    }
     bundle.finished = true;
-    return bundle;
+    return structuredClone(bundle);
   }
 
-  return { record, declareCoverage, finish };
+  function matchesRevision(expected: EvidenceRevision): boolean {
+    const current = evidenceRevision(bundle);
+    return (
+      bundle.finished &&
+      current.closure === "finished" &&
+      current.revision === expected.revision &&
+      current.bundleSha256 === expected.bundleSha256 &&
+      expected.closure === "finished"
+    );
+  }
+
+  return { record, declareCoverage, finish, matchesRevision };
 }
+
+export type EvidenceRecorder = ReturnType<typeof createEvidenceRecorder>;

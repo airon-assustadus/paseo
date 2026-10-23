@@ -1,6 +1,7 @@
 import {
   bundleSchema,
   evidenceHash,
+  evidenceRevision,
   parseEvidence,
   parseManifest,
   sampleKey,
@@ -9,7 +10,67 @@ import {
   type EvidenceSample,
   type EvidenceCoverage,
   type SeriesPlan,
+  type EvidenceRevision,
 } from "./contract";
+import type { EvidenceRecorder } from "./recorder";
+
+interface AnalysisRegistration {
+  evidence: EvidenceRevision;
+  resultSha256: string;
+  integrity: "complete" | "INC";
+}
+
+const analyses = new WeakMap<object, AnalysisRegistration>();
+
+function provisional<Result extends { status: "complete" | "INC" }>(
+  bundleInput: unknown,
+  analyze: (bundle: unknown) => Result,
+) {
+  const parsed = bundleSchema.safeParse(bundleInput);
+  const evidence = parsed.success ? evidenceRevision(parsed.data) : null;
+  const result = analyze(parsed.success ? parsed.data : null);
+  const { status: integrity, ...values } = result;
+  const output = { ...values, status: "provisional" as const, integrity, evidence };
+  if (evidence) {
+    analyses.set(output, { evidence, integrity, resultSha256: evidenceHash(output) });
+  }
+  return output;
+}
+
+export function isPerformanceAnalysisCurrent(recorder: EvidenceRecorder, result: unknown): boolean {
+  if (typeof result !== "object" || result === null) return false;
+  const registration = analyses.get(result);
+  if (!registration) return false;
+  try {
+    return (
+      recorder.matchesRevision(registration.evidence) &&
+      evidenceHash(result) === registration.resultSha256
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function consumePerformanceAnalysis(recorder: EvidenceRecorder, result: unknown) {
+  const incomplete = {
+    status: "INC" as const,
+    productVerdict: "not_evaluated" as const,
+    scope: "offline-integrity-as-of-revision" as const,
+    currentness: "revalidate-before-consumption" as const,
+    evidence: null,
+    analysis: null,
+  };
+  if (!isPerformanceAnalysisCurrent(recorder, result)) return incomplete;
+  const registration = analyses.get(result as object)!;
+  const output = {
+    ...incomplete,
+    status: registration.integrity,
+    evidence: structuredClone(registration.evidence),
+    analysis: structuredClone(result),
+  };
+  analyses.set(output, { ...registration, resultSha256: evidenceHash(output) });
+  return output;
+}
 
 export interface Distribution {
   count: number;
@@ -47,10 +108,19 @@ function distribution(values: readonly number[]): Distribution | null {
   };
 }
 
+function validateClosure(bundle: EvidenceBundle): void {
+  if (
+    (bundle.closure === "finished" && (!bundle.finished || bundle.reasons.length > 0)) ||
+    (bundle.closure === "open" && bundle.finished)
+  )
+    throw new Error("Performance closure mismatch");
+}
+
 function validateBundle(manifest: EvidenceManifest, input: unknown): EvidenceBundle {
   const parsed = bundleSchema.safeParse(input);
   if (!parsed.success) throw new Error("Invalid performance bundle");
   const bundle = parsed.data;
+  validateClosure(bundle);
   if (
     bundle.manifestSha256 !== manifest.sha256 ||
     bundle.accepted !== bundle.samples.length ||
@@ -110,7 +180,12 @@ function summarizeRun(
     (sample) => sample.runId === slot.id && sample.seriesId === series.id,
   );
   const reasons = new Set<string>(bundle.reasons);
-  if (!bundle.finished || bundle.rejected > 0 || bundle.dropped > 0)
+  if (
+    !bundle.finished ||
+    bundle.closure !== "finished" ||
+    bundle.rejected > 0 ||
+    bundle.dropped > 0
+  )
     reasons.add("capture_incomplete");
   let expected: number | null = 0;
   for (const cycle of series.cycles) {
@@ -145,7 +220,7 @@ function summarizeRun(
   };
 }
 
-export function summarizeSeries(manifestInput: unknown, bundleInput: unknown, seriesId: string) {
+function summarizeSeriesValue(manifestInput: unknown, bundleInput: unknown, seriesId: string) {
   try {
     const manifest = parseManifest(manifestInput);
     const bundle = validateBundle(manifest, bundleInput);
@@ -191,7 +266,7 @@ export function summarizeSeries(manifestInput: unknown, bundleInput: unknown, se
   }
 }
 
-export function analyzeMemoryPlateau(
+function analyzeMemoryPlateauValue(
   manifestInput: unknown,
   bundleInput: unknown,
   seriesId: string,
@@ -248,7 +323,7 @@ export function analyzeMemoryPlateau(
   }
 }
 
-export function compareWarmLoads(manifestInput: unknown, bundleInput: unknown, seriesId: string) {
+function compareWarmLoadsValue(manifestInput: unknown, bundleInput: unknown, seriesId: string) {
   const incomplete = {
     status: "INC" as const,
     productVerdict: "not_evaluated" as const,
@@ -260,7 +335,7 @@ export function compareWarmLoads(manifestInput: unknown, bundleInput: unknown, s
     const adjudication = manifest.warmComparison;
     if (series?.metric !== "content_load_ms" || series.phase !== "warm" || adjudication === null)
       return incomplete;
-    const summary = summarizeSeries(manifest, bundleInput, seriesId);
+    const summary = summarizeSeriesValue(manifest, bundleInput, seriesId);
     if (summary.status !== "complete") return incomplete;
     const median = (path: "D" | "J" | "P") =>
       distribution(
@@ -313,4 +388,27 @@ export function compareWarmLoads(manifestInput: unknown, bundleInput: unknown, s
   } catch {
     return incomplete;
   }
+}
+
+export function summarizeSeries(manifestInput: unknown, bundleInput: unknown, seriesId: string) {
+  return provisional(bundleInput, (bundle) =>
+    summarizeSeriesValue(manifestInput, bundle, seriesId),
+  );
+}
+
+export function analyzeMemoryPlateau(
+  manifestInput: unknown,
+  bundleInput: unknown,
+  seriesId: string,
+  runId: string,
+) {
+  return provisional(bundleInput, (bundle) =>
+    analyzeMemoryPlateauValue(manifestInput, bundle, seriesId, runId),
+  );
+}
+
+export function compareWarmLoads(manifestInput: unknown, bundleInput: unknown, seriesId: string) {
+  return provisional(bundleInput, (bundle) =>
+    compareWarmLoadsValue(manifestInput, bundle, seriesId),
+  );
 }

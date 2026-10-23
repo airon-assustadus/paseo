@@ -16,6 +16,8 @@ import { createEvidenceRecorder } from "../../e2e/support/web-proxy-performance/
 import {
   analyzeMemoryPlateau,
   compareWarmLoads,
+  consumePerformanceAnalysis,
+  isPerformanceAnalysisCurrent,
   summarizeSeries,
 } from "../../e2e/support/web-proxy-performance/analysis";
 import { createSyntheticFixture } from "../../e2e/support/web-proxy-performance/fixture";
@@ -25,6 +27,18 @@ const cycles = Array.from({ length: 20 }, (_, index) => index + 1);
 
 function manifestInput(metric: Metric = "event_handler_ms"): ManifestInput {
   const visual = metric === "content_load_ms" || metric === "display_latency_ms";
+  const actions = {
+    event_handler_ms: "typing",
+    display_latency_ms: "click",
+    content_load_ms: "load",
+    data_ready_ms: "load",
+    raf_gap_ms: "observer",
+    long_task_ms: "observer",
+    flow_bytes: "traffic",
+    cpu_percent: "cpu",
+    phone_pss_bytes: "memory",
+    host_rss_bytes: "memory",
+  } as const;
   return {
     version: 1,
     cellId: "synthetic-cell",
@@ -47,7 +61,7 @@ function manifestInput(metric: Metric = "event_handler_ms"): ManifestInput {
       {
         id: "observations",
         metric,
-        action: visual ? "load" : "typing",
+        action: actions[metric],
         phase: "warm",
         cycles,
         expectedPerCycle: 1,
@@ -271,21 +285,158 @@ describe("bounded capture", () => {
     expect(recorder.finish().reasons).toContain("deadline");
   });
 
-  it("late records invalidate the already returned bundle explicitly", () => {
+  it("late records invalidate consumption of the previously captured revision", () => {
     const manifest = createFiniteManifest(manifestInput());
     const { recorder, bundle } = completeCapture(manifest);
-    expect(summarizeSeries(manifest, bundle, "observations").status).toBe("complete");
+    const summary = summarizeSeries(manifest, bundle, "observations");
+    expect(summary).toMatchObject({ status: "provisional", integrity: "complete" });
+    expect(consumePerformanceAnalysis(recorder, summary).status).toBe("complete");
     recorder.record(sampleFor(manifest));
-    expect(bundle.reasons).toContain("late_record");
-    expect(bundle.attempted).toBe(bundle.accepted + bundle.rejected + bundle.dropped);
-    expect(summarizeSeries(manifest, bundle, "observations").status).toBe("INC");
+    const current = recorder.finish();
+    expect(current.reasons).toContain("late_record");
+    expect(current.attempted).toBe(current.accepted + current.rejected + current.dropped);
+    expect(current.revision).toBeGreaterThan(bundle.revision);
+    expect(consumePerformanceAnalysis(recorder, summary).status).toBe("INC");
+    expect(summarizeSeries(manifest, current, "observations").integrity).toBe("INC");
   });
 
   it("late coverage also invalidates completeness", () => {
     const manifest = createFiniteManifest(manifestInput());
-    const { recorder, bundle } = completeCapture(manifest);
+    const { recorder } = completeCapture(manifest);
     expect(recorder.declareCoverage({})).toBe(false);
-    expect(bundle.reasons).toContain("late_record");
+    expect(recorder.finish().reasons).toContain("late_record");
+  });
+});
+
+describe("CP2 normative workload barriers", () => {
+  it.each([1, 19])("rejects a warm workload with only %s cycles", (length) => {
+    const input = manifestInput();
+    input.series[0]!.cycles = cycles.slice(0, length);
+    expect(() => createFiniteManifest(input)).toThrow();
+  });
+
+  it("does not let a variable denominator legitimize one warm cycle", () => {
+    const input = manifestInput("raf_gap_ms");
+    input.series[0]!.action = "observer";
+    input.series[0]!.cycles = [1];
+    input.series[0]!.expectedPerCycle = null;
+    expect(() => createFiniteManifest(input)).toThrow();
+  });
+
+  it.each([null, 0, 2])("rejects a typing denominator of %s per cycle", (expectedPerCycle) => {
+    const input = manifestInput();
+    input.series[0]!.expectedPerCycle = expectedPerCycle;
+    expect(() => createFiniteManifest(input)).toThrow();
+  });
+
+  it("requires twelve memory points and a fixed single cold observation", () => {
+    const memory = manifestInput("phone_pss_bytes");
+    memory.series[0]!.cycles = [5, ...cycles.slice(10)];
+    expect(() => createFiniteManifest(memory)).toThrow();
+    const cold = manifestInput("content_load_ms");
+    cold.series[0]!.phase = "cold";
+    cold.series[0]!.cycles = [0];
+    cold.series[0]!.expectedPerCycle = null;
+    expect(() => createFiniteManifest(cold)).toThrow();
+  });
+
+  it("requires coverage of every warm cycle even for variable observer counts", () => {
+    const input = manifestInput("raf_gap_ms");
+    input.series[0]!.expectedPerCycle = null;
+    const manifest = createFiniteManifest(input);
+    const { bundle } = completeCapture(manifest);
+    bundle.coverage = bundle.coverage.filter((entry) => entry.cycle !== 20);
+    expect(summarizeSeries(manifest, bundle, "observations").integrity).toBe("INC");
+  });
+});
+
+describe("CP2 revision consumption barriers", () => {
+  it.each(["finished_without_end", "open_after_end", "finished_with_loss"])(
+    "rejects inconsistent closure %s",
+    (mutation) => {
+      const manifest = createFiniteManifest(manifestInput());
+      const { recorder, bundle } = completeCapture(manifest);
+      if (mutation === "finished_without_end") bundle.finished = false;
+      if (mutation === "open_after_end") bundle.closure = "open";
+      if (mutation === "finished_with_loss") bundle.reasons.push("late_record");
+      const result = summarizeSeries(manifest, bundle, "observations");
+      expect(result.integrity).toBe("INC");
+      expect(consumePerformanceAnalysis(recorder, result).status).toBe("INC");
+    },
+  );
+
+  it.each(["record", "coverage"])("rejects saved analyses and exports after late %s", (late) => {
+    const manifest = createFiniteManifest(manifestInput());
+    const { recorder, bundle } = completeCapture(manifest);
+    const summary = summarizeSeries(manifest, bundle, "observations");
+    const serializedSummary = JSON.stringify(summary);
+    expect(summary.status).toBe("provisional");
+    const exported = consumePerformanceAnalysis(recorder, summary);
+    const serializedExport = JSON.stringify(exported);
+    expect(exported).toMatchObject({
+      status: "complete",
+      scope: "offline-integrity-as-of-revision",
+      currentness: "revalidate-before-consumption",
+      productVerdict: "not_evaluated",
+    });
+    expect(isPerformanceAnalysisCurrent(recorder, exported)).toBe(true);
+    if (late === "record") recorder.record(sampleFor(manifest));
+    else recorder.declareCoverage({});
+    expect(recorder.finish().closure).toBe("invalidated");
+    expect(isPerformanceAnalysisCurrent(recorder, summary)).toBe(false);
+    expect(isPerformanceAnalysisCurrent(recorder, exported)).toBe(false);
+    expect(consumePerformanceAnalysis(recorder, summary).status).toBe("INC");
+    expect(consumePerformanceAnalysis(recorder, exported).status).toBe("INC");
+    expect(JSON.stringify(summary)).toBe(serializedSummary);
+    expect(JSON.stringify(exported)).toBe(serializedExport);
+    expect(JSON.parse(serializedSummary).status).toBe("provisional");
+    expect(isPerformanceAnalysisCurrent(recorder, JSON.parse(serializedExport))).toBe(false);
+  });
+
+  it("does not accept another recorder or a changed offline copy as live authority", () => {
+    const manifest = createFiniteManifest(manifestInput());
+    const first = completeCapture(manifest);
+    const second = completeCapture(manifest);
+    const summary = summarizeSeries(manifest, first.bundle, "observations");
+    expect(consumePerformanceAnalysis(second.recorder, summary).status).toBe("INC");
+    const copied = structuredClone(first.bundle);
+    copied.samples[0]!.value = 99;
+    copied.samples[0]!.end.timeMs = 99;
+    const altered = summarizeSeries(manifest, copied, "observations");
+    expect(altered.integrity).toBe("complete");
+    expect(consumePerformanceAnalysis(first.recorder, altered).status).toBe("INC");
+  });
+
+  it("rejects unfinished revisions, detached summaries and mutated results", () => {
+    const manifest = createFiniteManifest(manifestInput());
+    const { recorder, bundle } = completeCapture(manifest);
+    const summary = summarizeSeries(manifest, bundle, "observations");
+    expect(consumePerformanceAnalysis(recorder, structuredClone(summary)).status).toBe("INC");
+    summary.runs[0]!.distribution!.p95 = 0;
+    expect(consumePerformanceAnalysis(recorder, summary).status).toBe("INC");
+    bundle.finished = false;
+    bundle.closure = "open";
+    const unfinished = summarizeSeries(manifest, bundle, "observations");
+    expect(unfinished.integrity).toBe("INC");
+    expect(consumePerformanceAnalysis(recorder, unfinished).status).toBe("INC");
+  });
+
+  it.each(["memory", "comparison"])("applies the same live barrier to %s", (kind) => {
+    const input = manifestInput(kind === "memory" ? "phone_pss_bytes" : "content_load_ms");
+    if (kind === "memory") input.series[0]!.cycles = [5, ...cycles.slice(9)];
+    const manifest = createFiniteManifest(input);
+    const { recorder, bundle } = completeCapture(
+      manifest,
+      (_cycle, path) => ({ D: 100, J: 300, P: 250 })[path],
+    );
+    const analysis =
+      kind === "memory"
+        ? analyzeMemoryPlateau(manifest, bundle, "observations", "run-1-d")
+        : compareWarmLoads(manifest, bundle, "observations");
+    expect(analysis).toMatchObject({ status: "provisional", integrity: "complete" });
+    expect(consumePerformanceAnalysis(recorder, analysis).status).toBe("complete");
+    recorder.declareCoverage({});
+    expect(consumePerformanceAnalysis(recorder, analysis).status).toBe("INC");
   });
 });
 
@@ -295,7 +446,8 @@ describe("offline analysis", () => {
     const { bundle } = completeCapture(manifest, (cycle, _path, warmup) => (warmup ? 900 : cycle));
     const summary = summarizeSeries(manifest, bundle, "observations");
     expect(summary).toMatchObject({
-      status: "complete",
+      status: "provisional",
+      integrity: "complete",
       productVerdict: "not_evaluated",
       plannedRuns: 15,
       observedWarmups: 3,
@@ -313,7 +465,7 @@ describe("offline analysis", () => {
     const manifest = createFiniteManifest(manifestInput());
     const recorder = createEvidenceRecorder(manifest, { now: () => 0 });
     const summary = summarizeSeries(manifest, recorder.finish(), "observations");
-    expect(summary.status).toBe("INC");
+    expect(summary.integrity).toBe("INC");
     expect(
       summary.runs.every((run) => run.distribution === null && run.singleObservation === null),
     ).toBe(true);
@@ -354,7 +506,7 @@ describe("offline analysis", () => {
       bundle.attempted += 1;
     }
     const summary = summarizeSeries(manifest, bundle, "observations");
-    expect(summary.status).toBe("INC");
+    expect(summary.integrity).toBe("INC");
     if (mutation === "failed")
       expect(summary.runs[0]).toMatchObject({ observed: 20, failed: 1, distribution: null });
   });
@@ -364,7 +516,7 @@ describe("offline analysis", () => {
     input.series[0]!.expectedPerCycle = null;
     const manifest = createFiniteManifest(input);
     const bundle = structuredClone(completeCapture(manifest).bundle);
-    expect(summarizeSeries(manifest, bundle, "observations").status).toBe("complete");
+    expect(summarizeSeries(manifest, bundle, "observations").integrity).toBe("complete");
     bundle.coverage = [];
     expect(summarizeSeries(manifest, bundle, "observations").runs[0]!.expected).toBeNull();
   });
@@ -376,7 +528,7 @@ describe("offline analysis", () => {
     bundle.accepted = bundle.samples.length;
     bundle.attempted = bundle.samples.length;
     const result = summarizeSeries(manifest, bundle, "observations");
-    expect(result.status).toBe("INC");
+    expect(result.integrity).toBe("INC");
     expect(result.runs.every((run) => run.status === "complete")).toBe(true);
     expect(result.warmups.every((run) => run.status === "INC")).toBe(true);
   });
@@ -391,7 +543,7 @@ describe("offline analysis", () => {
       completeCapture(manifest, () => 42).bundle,
       "observations",
     );
-    expect(summary.status).toBe("complete");
+    expect(summary.integrity).toBe("complete");
     expect(summary.runs.filter((run) => run.path === "D")).toHaveLength(5);
     expect(
       summary.runs.every((run) => run.singleObservation === 42 && run.distribution === null),
@@ -404,8 +556,9 @@ describe("offline analysis", () => {
     input.series[0]!.action = "memory";
     const manifest = createFiniteManifest(input);
     const bundle = completeCapture(manifest, (cycle) => 1000 + 2 * cycle).bundle;
-    expect(analyzeMemoryPlateau(manifest, bundle, "observations", "run-1-d")).toEqual({
-      status: "complete",
+    expect(analyzeMemoryPlateau(manifest, bundle, "observations", "run-1-d")).toMatchObject({
+      status: "provisional",
+      integrity: "complete",
       productVerdict: "not_evaluated",
       slopeBytesPerCycle: 2,
       finalToBaseline: 1040 / 1010,
@@ -425,7 +578,7 @@ describe("offline analysis", () => {
     }
     if (mutation === "zero_baseline") bundle.samples[index]!.value = 0;
     if (mutation === "mixed_source") bundle.samples[index]!.source.id = "another-process-tree";
-    expect(analyzeMemoryPlateau(manifest, bundle, "observations", "run-1-d").status).toBe("INC");
+    expect(analyzeMemoryPlateau(manifest, bundle, "observations", "run-1-d").integrity).toBe("INC");
   });
 
   it("publishes both warm comparisons without choosing the more favorable one", () => {
@@ -435,7 +588,8 @@ describe("offline analysis", () => {
       (_cycle, path) => ({ D: 100, J: 300, P: 250 })[path],
     ).bundle;
     expect(compareWarmLoads(manifest, bundle, "observations")).toMatchObject({
-      status: "complete",
+      status: "provisional",
+      integrity: "complete",
       productVerdict: "not_evaluated",
       comparison: {
         directMs: 100,
@@ -454,14 +608,14 @@ describe("offline analysis", () => {
     input.warmComparison = null;
     const manifest = createFiniteManifest(input);
     expect(
-      compareWarmLoads(manifest, completeCapture(manifest).bundle, "observations").status,
+      compareWarmLoads(manifest, completeCapture(manifest).bundle, "observations").integrity,
     ).toBe("INC");
     const valid = createFiniteManifest(manifestInput("content_load_ms"));
     const bundle = structuredClone(completeCapture(valid).bundle);
     bundle.samples = bundle.samples.filter((sample) => sample.runId !== "run-5-p");
     bundle.accepted = bundle.samples.length;
     bundle.attempted = bundle.samples.length;
-    expect(compareWarmLoads(valid, bundle, "observations").status).toBe("INC");
+    expect(compareWarmLoads(valid, bundle, "observations").integrity).toBe("INC");
   });
 
   it("retains both numeric comparisons but marks unresolved precision INC", () => {
@@ -473,7 +627,8 @@ describe("offline analysis", () => {
       sample.uncertaintyMs = 100;
     });
     expect(compareWarmLoads(manifest, bundle, "observations")).toMatchObject({
-      status: "INC",
+      status: "provisional",
+      integrity: "INC",
       comparison: { domMinusJpegMs: -50, domMinusDirectRttMarginMs: 30 },
     });
   });
