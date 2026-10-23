@@ -51,17 +51,35 @@ async function main() {
     { builtinPlugins: new BuiltinPluginLoader(undefined, []) },
   );
   let stopping = false;
-  async function stop() {
+  async function stop(requestId?: string) {
     if (stopping) return;
     stopping = true;
     try {
       await daemon.stop();
+      if (requestId && process.connected)
+        await new Promise<void>((resolve, reject) => {
+          process.send?.({ type: "stopped", requestId, ok: true }, (error: Error | null) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
     } finally {
       process.disconnect?.();
     }
   }
   process.on("message", (message) => {
-    if (message === "stop") void stop();
+    if (!message || typeof message !== "object" || Array.isArray(message)) return;
+    const command = message as Record<string, unknown>;
+    if (
+      Object.keys(command).length !== 2 ||
+      command.type !== "stop" ||
+      typeof command.requestId !== "string" ||
+      !/^[a-zA-Z0-9-]{1,128}$/u.test(command.requestId)
+    )
+      return;
+    void stop(command.requestId).catch(() => {
+      process.exitCode = 1;
+    });
   });
   process.once("disconnect", () => void stop());
   process.once("SIGTERM", () => void stop());

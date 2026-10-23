@@ -64,6 +64,7 @@ const child = spawn(
     "--output",
     output,
     "--retries=0",
+    ...(["E6", "E7"].includes(filter) ? ["--max-failures=1"] : []),
   ],
   { cwd: repoRoot, env: environment, stdio: "inherit" },
 );

@@ -11,6 +11,7 @@ import {
 import { createServer as createHttpsServer } from "node:https";
 import { connect, type Socket } from "node:net";
 import path from "node:path";
+import { setTimeout, clearTimeout } from "node:timers";
 import type { ProductShellAssets } from "../../../src/web-proxy/shell/product-assets";
 
 export const CONTROL = "https://control.ticket04-control.test";
@@ -20,6 +21,297 @@ const CONTROL_HOST = new URL(CONTROL).host;
 export interface RequestEvidence {
   method: string;
   path: string;
+}
+
+function controlEvents() {
+  const events: Array<{ at: number; type: string; id: string; bytes?: number }> = [];
+  let failure: string | null = null;
+  return {
+    events,
+    fail(reason: string) {
+      failure ??= reason;
+    },
+    failure: () => failure,
+    record(type: string, id: string, bytes?: number) {
+      if (events.length >= 256) failure ??= "control_evidence_overflow";
+      else events.push({ at: performance.now(), type, id, bytes });
+    },
+  };
+}
+
+// These controls manipulate only this gateway's loopback TCP pairs. No daemon RPC is added.
+function createDaemonLinks() {
+  const evidence = controlEvents();
+  interface Link {
+    id: string;
+    upstream: Socket;
+    downstream: Socket;
+    closed: Promise<void>;
+    upstreamClosed: boolean;
+    downstreamClosed: boolean;
+    held: Buffer[] | null;
+    queuedBytes: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }
+  const links = new Map<string, Link>();
+  let serial = 0;
+  let blocked = false;
+  let heldId: string | null = null;
+  const destroy = (link: Link) => {
+    clearTimeout(link.timer);
+    link.held = null;
+    link.queuedBytes = 0;
+    if (heldId === link.id) heldId = null;
+    link.upstream.destroy();
+    link.downstream.destroy();
+  };
+  const forward = (link: Link, chunk: Buffer) => {
+    if (link.held !== null) {
+      if (chunk.byteLength > 65_536 - link.queuedBytes) {
+        evidence.fail("downstream_hold_overflow");
+        evidence.record("hold_overflow", link.id);
+        link.upstream.pause();
+        destroy(link);
+        return;
+      }
+      link.held.push(Buffer.from(chunk));
+      link.queuedBytes += chunk.byteLength;
+      evidence.record("held", link.id, chunk.byteLength);
+    } else if (!link.downstream.write(chunk)) link.upstream.pause();
+  };
+  const attach = (upstream: Socket, downstream: Socket) => {
+    const id = `daemon-link-${++serial}`;
+    let completed!: () => void;
+    const link: Link = {
+      id,
+      upstream,
+      downstream,
+      closed: new Promise<void>((resolve) => {
+        completed = resolve;
+      }),
+      upstreamClosed: false,
+      downstreamClosed: false,
+      held: null,
+      queuedBytes: 0,
+    };
+    links.set(id, link);
+    evidence.record("created", id);
+    const closed = (side: "upstreamClosed" | "downstreamClosed") => {
+      link[side] = true;
+      evidence.record(side, id);
+      destroy(link);
+      if (link.upstreamClosed && link.downstreamClosed) completed();
+    };
+    upstream.once("close", () => closed("upstreamClosed"));
+    downstream.once("close", () => closed("downstreamClosed"));
+    downstream.on("drain", () => {
+      if (link.held === null) upstream.resume();
+    });
+    upstream.on("data", (chunk: Buffer) => forward(link, chunk));
+  };
+  const closePairs = async (requireLive: boolean) => {
+    blocked = true;
+    const live = [...links.values()].filter(
+      (link) => !link.upstreamClosed || !link.downstreamClosed,
+    );
+    if (requireLive && live.length === 0) throw new Error("No live daemon pair to cut");
+    for (const link of live) destroy(link);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.all(live.map((link) => link.closed)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Daemon pair close unobserved")), 5_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    evidence.record("cut_complete", "gateway", live.length);
+  };
+  return {
+    accept() {
+      if (blocked || serial >= 32) {
+        if (serial >= 32) evidence.fail("daemon_link_limit");
+        evidence.record("upgrade_refused", "gateway");
+        return false;
+      }
+      return true;
+    },
+    attach,
+    snapshot: () =>
+      [...links.values()].map((link) => ({
+        id: link.id,
+        upstreamClosed: link.upstreamClosed,
+        downstreamClosed: link.downstreamClosed,
+        queuedBytes: link.queuedBytes,
+        held: link.held !== null,
+      })),
+    evidence: () => ({ events: evidence.events, failure: evidence.failure(), blocked }),
+    cutAndBlock: () => closePairs(true),
+    close: () => closePairs(false),
+    unblock() {
+      blocked = false;
+      evidence.record("unblock", "gateway");
+    },
+    holdDownstream(id: string) {
+      const link = links.get(id);
+      if (!link || heldId !== null || blocked || link.upstreamClosed || link.downstreamClosed)
+        throw new Error("Ambiguous or unavailable downstream hold");
+      heldId = id;
+      link.held = [];
+      evidence.record("hold_begin", id);
+      link.timer = setTimeout(() => {
+        evidence.fail("downstream_hold_deadline");
+        destroy(link);
+      }, 45_000);
+      let finished = false;
+      return {
+        queuedBytes: () => link.queuedBytes,
+        release() {
+          if (finished) return;
+          finished = true;
+          clearTimeout(link.timer);
+          const chunks = link.held;
+          if (!chunks || link.downstream.destroyed)
+            throw new Error("Held downstream closed before delivery");
+          link.held = null;
+          heldId = null;
+          evidence.record("hold_release", id, link.queuedBytes);
+          link.queuedBytes = 0;
+          // Writes remain ordered on the original socket; receipt is proved separately.
+          for (const chunk of chunks) if (!link.downstream.write(chunk)) link.upstream.pause();
+        },
+        discard() {
+          if (!finished) {
+            finished = true;
+            evidence.record("hold_discard", id);
+            destroy(link);
+          }
+        },
+      };
+    },
+  };
+}
+
+function createFixtureHolds(proof: string) {
+  const evidence = controlEvents();
+  interface Held {
+    method: "GET" | "POST";
+    maxBodyBytes: number;
+    received: boolean;
+    bodyComplete: boolean;
+    bytes: number;
+    released: boolean;
+    closed: boolean;
+    expired: boolean;
+    response?: ServerResponse;
+    timer: ReturnType<typeof setTimeout>;
+  }
+  const holds = new Map<string, Held>();
+  const close = () => {
+    for (const held of holds.values()) {
+      clearTimeout(held.timer);
+      held.response?.destroy();
+    }
+  };
+  const handle = (req: IncomingMessage, res: ServerResponse, url: URL) => {
+    if (!["/app/hold", "/app/slow-page"].includes(url.pathname)) return false;
+    const key = url.searchParams.get("key") ?? "";
+    const held = holds.get(key);
+    if (
+      url.searchParams.get("proof") !== proof ||
+      !held ||
+      held.expired ||
+      held.received ||
+      req.method !== held.method
+    ) {
+      res.writeHead(409).end();
+      evidence.fail("unexpected_held_request");
+      return true;
+    }
+    held.received = true;
+    held.response = res;
+    evidence.record("request", key);
+    req.on("data", (chunk: Buffer) => {
+      if (chunk.byteLength > held.maxBodyBytes - held.bytes) {
+        evidence.fail("fixture_body_overflow");
+        req.destroy();
+        res.destroy();
+        return;
+      }
+      held.bytes += chunk.byteLength;
+    });
+    req.once("end", () => {
+      held.bodyComplete = true;
+      evidence.record("body_complete", key, held.bytes);
+    });
+    req.once("aborted", () => evidence.record("aborted", key));
+    res.once("close", () => {
+      clearTimeout(held.timer);
+      held.closed = true;
+      evidence.record("close", key);
+    });
+    return true;
+  };
+  return {
+    handle,
+    close,
+    hold(key: string, options: { method: "GET" | "POST"; maxBodyBytes: number }) {
+      if (
+        !/^[a-zA-Z0-9_-]{1,64}$/u.test(key) ||
+        holds.has(key) ||
+        holds.size >= 4 ||
+        !Number.isInteger(options.maxBodyBytes) ||
+        options.maxBodyBytes < 0 ||
+        options.maxBodyBytes > 1024
+      )
+        throw new Error("Invalid fixture hold");
+      const timer = setTimeout(() => {
+        evidence.fail("fixture_hold_deadline");
+        const expired = holds.get(key);
+        if (expired) {
+          expired.expired = true;
+          expired.response?.destroy();
+        }
+      }, 45_000);
+      holds.set(key, {
+        ...options,
+        received: false,
+        bodyComplete: false,
+        bytes: 0,
+        released: false,
+        closed: false,
+        expired: false,
+        timer,
+      });
+    },
+    release(key: string) {
+      const held = holds.get(key);
+      if (!held) throw new Error("Unknown fixture hold");
+      if (held.released) return;
+      held.released = true;
+      clearTimeout(held.timer);
+      if (held.closed) {
+        evidence.record("release_already_closed", key);
+        return;
+      }
+      if (!held.bodyComplete || !held.response) throw new Error("Fixture request not complete");
+      evidence.record("release_write", key);
+      held.response.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+      held.response.end("held-response", () => evidence.record("response_finish", key));
+    },
+    snapshot: () =>
+      [...holds].map(([key, held]) => ({
+        key,
+        received: held.received,
+        bodyComplete: held.bodyComplete,
+        bytes: held.bytes,
+        released: held.released,
+        closed: held.closed,
+      })),
+    evidence: () => ({ events: evidence.events, failure: evidence.failure() }),
+  };
 }
 
 function isContentHost(host: string) {
@@ -69,9 +361,11 @@ export function trackConnections(server: Server) {
 
 export async function startHostFixture(proof: string, scenario?: "history" | "boundary") {
   const requests: RequestEvidence[] = [];
+  const controls = createFixtureHolds(proof);
   const server = createHttpServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://fixture.invalid");
     requests.push({ method: req.method ?? "", path: req.url ?? "" });
+    if (controls.handle(req, res, url)) return;
     if (
       scenario === "boundary" &&
       req.method === "GET" &&
@@ -108,9 +402,13 @@ document.getElementById('product-title-long').addEventListener('click',()=>{docu
       `<!doctype html><html><head><title>Product ${second ? "second" : "first"} ${proof}</title></head><body><h1 id="product-proof">${proof}</h1><p id="product-path">${url.pathname}${url.search}</p><a id="product-next" href="/app/second?proof=${proof}">Second document</a><a id="product-hash" href="#section">Same document</a>${historyControls}${boundaryControls}<p id="section">Section</p></body></html>`,
     );
   });
-  const close = trackConnections(server);
+  const closeConnections = trackConnections(server);
+  const close = async () => {
+    controls.close();
+    await closeConnections();
+  };
   const port = await listenPrivate(server);
-  return { origin: `http://127.0.0.1:${port}`, requests, close };
+  return { origin: `http://127.0.0.1:${port}`, requests, controls, close };
 }
 
 async function createCertificate(root: string) {
@@ -168,8 +466,15 @@ function proxyHttp(req: IncomingMessage, res: ServerResponse, port: number) {
   req.pipe(upstream);
 }
 
-function proxyUpgrade(req: IncomingMessage, downstream: Socket, head: Buffer, port: number) {
+function proxyUpgrade(
+  req: IncomingMessage,
+  downstream: Socket,
+  head: Buffer,
+  port: number,
+  controlled?: ReturnType<typeof createDaemonLinks>,
+) {
   const upstream = connect(port, "127.0.0.1");
+  controlled?.attach(upstream, downstream);
   const close = () => {
     upstream.destroy();
     downstream.destroy();
@@ -185,7 +490,8 @@ function proxyUpgrade(req: IncomingMessage, downstream: Socket, head: Buffer, po
     );
     upstream.write(`${req.method} ${req.url} HTTP/1.1\r\n${headers.join("\r\n")}\r\n\r\n`);
     if (head.length) upstream.write(head);
-    downstream.pipe(upstream).pipe(downstream);
+    downstream.pipe(upstream);
+    if (!controlled) upstream.pipe(downstream);
   });
 }
 
@@ -196,6 +502,7 @@ export async function startProductGateway(input: {
   shell: ProductShellAssets;
 }) {
   const certificate = await createCertificate(input.root);
+  const daemonLinks = createDaemonLinks();
   const served: Array<{ path: string; sha256: string }> = [];
   const assets = new Map(input.shell.assets.map((asset) => [asset.path, asset]));
   for (const asset of input.shell.assets) {
@@ -238,18 +545,29 @@ export async function startProductGateway(input: {
     }
     const url = new URL(req.url ?? "/", CONTROL);
     let port: number | null = null;
-    if (url.pathname === "/ws") port = input.daemonPort;
-    else if (["/hot", "/message", "/inspector/device"].includes(url.pathname))
+    if (url.pathname === "/ws") {
+      if (!daemonLinks.accept()) {
+        socket.destroy();
+        return;
+      }
+      port = input.daemonPort;
+    } else if (["/hot", "/message", "/inspector/device"].includes(url.pathname))
       port = input.metroPort;
     if (port === null) {
       socket.destroy();
       return;
     }
-    proxyUpgrade(req, socket as Socket, head, port);
+    proxyUpgrade(
+      req,
+      socket as Socket,
+      head,
+      port,
+      url.pathname === "/ws" ? daemonLinks : undefined,
+    );
   });
   const close = trackConnections(server);
   const port = await listenPrivate(server);
-  return { port, certificatePin: certificate.pin, served, close };
+  return { port, certificatePin: certificate.pin, served, daemonLinks, close };
 }
 
 // Restrict browser egress, including IP literals and Service Worker fetches.
