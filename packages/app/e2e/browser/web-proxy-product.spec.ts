@@ -8,9 +8,11 @@ import {
   type NavigationState,
 } from "../../src/web-proxy/navigation-messages";
 import { CONTROL } from "../support/web-proxy-product/network";
-import { NetworkFetchOpcode } from "@getpaseo/protocol/binary-frames/network-fetch";
 import type { NetworkFetchDescriptor } from "@getpaseo/protocol/network-fetch/rpc-schemas";
-import type { FetchObservation } from "../support/web-proxy-product/observation";
+import {
+  loadProductFetchProtocol,
+  type FetchObservation,
+} from "../support/web-proxy-product/observation";
 
 test("E1 opens a host URL through the actual workspace browser panel", async ({
   browserName,
@@ -453,6 +455,7 @@ test("E6 expires an H owner through the real SDK without a C transport timer", a
 }, testInfo) => {
   expect(browserName).toBe("chromium");
   test.setTimeout(120_000);
+  const { NetworkFetchOpcode } = await loadProductFetchProtocol();
   const harness = await startProductHarness(testInfo.outputPath("product-assets"), {
     observeChannels: true,
   });
@@ -599,6 +602,7 @@ test("E7 fences two local views and rejects real old response bytes delivered af
 }, testInfo) => {
   expect(browserName).toBe("chromium");
   test.setTimeout(120_000);
+  const { NetworkFetchOpcode } = await loadProductFetchProtocol();
   const harness = await startProductHarness(testInfo.outputPath("product-assets"), {
     observeChannels: true,
   });

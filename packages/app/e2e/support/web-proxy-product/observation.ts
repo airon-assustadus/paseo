@@ -1,5 +1,16 @@
 import type { Page } from "@playwright/test";
-import { decodeNetworkFetchFrame } from "@getpaseo/protocol/binary-frames/network-fetch";
+import type * as NetworkFetchProtocol from "@getpaseo/protocol/binary-frames/network-fetch";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+// Keep protocol runtime in the same ESM loader as the SDK. Playwright transforms
+// static imports in this CommonJS test package and otherwise mixes the graphs.
+export async function loadProductFetchProtocol(): Promise<typeof NetworkFetchProtocol> {
+  const moduleUrl = pathToFileURL(
+    path.resolve(__dirname, "../../../../../packages/protocol/dist/binary-frames/network-fetch.js"),
+  ).href;
+  return import(moduleUrl) as Promise<typeof NetworkFetchProtocol>;
+}
 
 export interface FetchObservation {
   at: number;
@@ -70,6 +81,7 @@ export interface PortObservation {
 
 // Test-only observation. These records never supply authority or a product response.
 export async function observeProductChannels(page: Page, traceReceipts = false) {
+  const { decodeNetworkFetchFrame } = await loadProductFetchProtocol();
   const messages: PortObservation[] = [];
   const rpcTypes: string[] = [];
   const fetchEvents: FetchObservation[] = [];
