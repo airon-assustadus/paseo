@@ -67,11 +67,22 @@ export function trackConnections(server: Server) {
   };
 }
 
-export async function startHostFixture(proof: string) {
+export async function startHostFixture(proof: string, scenario?: "history" | "boundary") {
   const requests: RequestEvidence[] = [];
   const server = createHttpServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://fixture.invalid");
     requests.push({ method: req.method ?? "", path: req.url ?? "" });
+    if (
+      scenario === "boundary" &&
+      req.method === "GET" &&
+      url.pathname === "/app/redirect" &&
+      url.searchParams.get("proof") === proof
+    ) {
+      res
+        .writeHead(302, { Location: `/outside?proof=${proof}`, "Cache-Control": "no-store" })
+        .end();
+      return;
+    }
     if (
       req.method !== "GET" ||
       !["/app/start", "/app/second"].includes(url.pathname) ||
@@ -81,9 +92,20 @@ export async function startHostFixture(proof: string) {
       return;
     }
     const second = url.pathname.endsWith("second");
+    const historyControls =
+      scenario === "history"
+        ? `<button id="product-push" onclick="history.pushState({proof:'${proof}'},'',location.pathname+location.search+'#pushed')">Push state</button><button id="product-replace" onclick="history.replaceState({proof:'${proof}'},'',location.pathname+location.search+'#replaced')">Replace state</button>`
+        : "";
+    const boundaryControls =
+      scenario === "boundary"
+        ? `<button id="product-title-html">Literal title</button><button id="product-title-long">Long title</button><script>
+document.getElementById('product-title-html').addEventListener('click',()=>{document.title='<img src=x onerror="globalThis.__titleExecuted=true">';});
+document.getElementById('product-title-long').addEventListener('click',()=>{document.title='é'.repeat(800);});
+</script>`
+        : "";
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
     res.end(
-      `<!doctype html><html><head><title>Product ${second ? "second" : "first"} ${proof}</title></head><body><h1 id="product-proof">${proof}</h1><p id="product-path">${url.pathname}${url.search}</p><a id="product-next" href="/app/second?proof=${proof}">Second document</a><a id="product-hash" href="#section">Same document</a><p id="section">Section</p></body></html>`,
+      `<!doctype html><html><head><title>Product ${second ? "second" : "first"} ${proof}</title></head><body><h1 id="product-proof">${proof}</h1><p id="product-path">${url.pathname}${url.search}</p><a id="product-next" href="/app/second?proof=${proof}">Second document</a><a id="product-hash" href="#section">Same document</a>${historyControls}${boundaryControls}<p id="section">Section</p></body></html>`,
     );
   });
   const close = trackConnections(server);

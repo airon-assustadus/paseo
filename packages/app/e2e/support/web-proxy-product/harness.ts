@@ -10,6 +10,7 @@ import { loadDaemonClientConstructor } from "../helpers/daemon-client-loader";
 import { createNodeWebSocketFactory } from "../helpers/node-ws-factory";
 import { buildSeededHost } from "../helpers/daemon-registry";
 import { spawnTsx, killProcessTree } from "../helpers/spawn-node";
+import { observeProductChannels } from "./observation";
 import {
   CONTENT_DOMAIN,
   CONTROL,
@@ -82,7 +83,7 @@ async function readMetroBinding(metroPort: number) {
   return binding;
 }
 
-async function seedControl(page: Page, serverId: string, password: string) {
+async function seedControl(page: Page, serverId: string, password: string, domOptIn: boolean) {
   const host = {
     ...buildSeededHost({
       serverId,
@@ -95,7 +96,7 @@ async function seedControl(page: Page, serverId: string, password: string) {
   const connection = host.connections[0];
   const seeded = { ...host, connections: [{ ...connection, useTls: true }] };
   await page.addInitScript(
-    ({ origin, daemon }) => {
+    ({ origin, daemon, optIn }) => {
       if (location.origin !== origin) return;
       if (localStorage.getItem("@paseo:product-proof-seeded")) return;
       localStorage.setItem("@paseo:e2e", "1");
@@ -103,15 +104,44 @@ async function seedControl(page: Page, serverId: string, password: string) {
       // E1 starts with a persisted per-host user opt-in; E8 owns the opt-in UI proof.
       localStorage.setItem(
         "workspace-web-proxy-preferences",
-        JSON.stringify({ state: { domByHost: { [daemon.serverId]: true } } }),
+        JSON.stringify({ state: { domByHost: { [daemon.serverId]: optIn } } }),
       );
       localStorage.setItem("@paseo:product-proof-seeded", "1");
     },
-    { origin: CONTROL, daemon: seeded },
+    { origin: CONTROL, daemon: seeded, optIn: domOptIn },
   );
 }
 
-export async function startProductHarness(artifactDirectory: string) {
+export interface ProductHarnessOptions {
+  scenario?: "history" | "boundary";
+  observeChannels?: boolean;
+  networkMode?: "enabled" | "disabled" | "absent";
+  domOptIn?: boolean;
+  mixedAssets?: boolean;
+  imageUnavailable?: boolean;
+  observeReceipts?: boolean;
+}
+
+function privateHostEnvironment(root: string, options: ProductHarnessOptions) {
+  return options.imageUnavailable
+    ? { ...process.env, PASEO_REMOTE_BROWSER_EXECUTABLE: path.join(root, "unavailable-renderer") }
+    : process.env;
+}
+
+function assertImageUnavailable(client: DaemonClient, options: ProductHarnessOptions) {
+  if (
+    options.imageUnavailable &&
+    client.getLastServerInfoMessage()?.features?.remoteBrowser !== false
+  ) {
+    throw new Error("Private host did not disable the unavailable image renderer");
+  }
+}
+
+export async function startProductHarness(
+  artifactDirectory: string,
+  options: ProductHarnessOptions = {},
+) {
+  const runtimeOptions = { domOptIn: true, observeReceipts: false, ...options };
   const metroPort = Number(process.env.E2E_METRO_PORT);
   if (!Number.isInteger(metroPort) || metroPort < 1)
     throw new Error("Existing Metro globalSetup is required");
@@ -138,12 +168,12 @@ export async function startProductHarness(artifactDirectory: string) {
   try {
     const proof = randomBytes(12).toString("hex");
     const password = randomBytes(24).toString("hex");
-    const fixture = await startHostFixture(proof);
+    const fixture = await startHostFixture(proof, options.scenario);
     cleanup.push(fixture.close);
     const shell = await buildProductShellAssets({
       appRoot,
       controlOrigin: CONTROL,
-      assetVersion,
+      assetVersion: options.mixedAssets ? `${assetVersion}-mixed` : assetVersion,
       sessionReplyTimeoutMs: 10_000,
       worker: {
         headTimeoutMs: 10_000,
@@ -168,29 +198,33 @@ export async function startProductHarness(artifactDirectory: string) {
       JSON.stringify({
         root,
         password,
-        networkFetch: {
-          enabled: true,
-          dedicatedContentDomain: CONTENT_DOMAIN,
-          controlOrigin: CONTROL,
-          assetVersion: shell.manifest.assetVersion,
-          bootstrapPath: shell.manifest.bootstrapPath,
-          pathPrefix: "/app/",
-          ttlMs: 120_000,
-          handshakeTimeoutMs: 20_000,
-          allowlists: [
-            {
-              id: "product-proof",
-              revision: 1,
-              targets: [{ origin: fixture.origin, pathPrefix: "/app/" }],
-            },
-          ],
-        },
+        controlOrigin: CONTROL,
+        networkFetch:
+          options.networkMode === "absent"
+            ? undefined
+            : {
+                enabled: options.networkMode !== "disabled",
+                dedicatedContentDomain: CONTENT_DOMAIN,
+                controlOrigin: CONTROL,
+                assetVersion,
+                bootstrapPath: shell.manifest.bootstrapPath,
+                pathPrefix: "/app/",
+                ttlMs: 120_000,
+                handshakeTimeoutMs: 20_000,
+                allowlists: [
+                  {
+                    id: "product-proof",
+                    revision: 1,
+                    targets: [{ origin: fixture.origin, pathPrefix: "/app/" }],
+                  },
+                ],
+              },
       }),
       { mode: 0o600 },
     );
     const child = spawnTsx(path.join(__dirname, "host.ts"), [hostInput], {
       cwd: path.resolve(appRoot, "../server"),
-      env: process.env,
+      env: privateHostEnvironment(root, options),
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
     child.stderr?.on("data", (data: Buffer) => {
@@ -216,6 +250,7 @@ export async function startProductHarness(artifactDirectory: string) {
     cleanup.push(() => client.close());
     await client.connect();
     await client.fetchAgents();
+    assertImageUnavailable(client, options);
     const workspacePath = path.join(root, "workspace");
     await mkdir(workspacePath);
     const created = await client.createWorkspace({
@@ -267,9 +302,12 @@ export async function startProductHarness(artifactDirectory: string) {
       unexpectedRequests.push(request.url());
     });
     const page = await context.newPage();
+    const observation = options.observeChannels
+      ? await observeProductChannels(page, runtimeOptions.observeReceipts)
+      : null;
     page.setDefaultTimeout(15_000);
     page.setDefaultNavigationTimeout(30_000);
-    await seedControl(page, host.serverId, password);
+    await seedControl(page, host.serverId, password, runtimeOptions.domOptIn);
     return {
       page,
       close,
@@ -280,15 +318,27 @@ export async function startProductHarness(artifactDirectory: string) {
       targetUrl: `${fixture.origin}/app/start?proof=${proof}`,
       unexpectedRequests,
       requests: fixture.requests,
+      observation,
       evidence: () => ({
         metroBinding,
         chromiumArgv: argv,
         manifest: shell.manifest,
         manifestSha256: shell.manifestSha256,
+        scenario: options,
+        hostNetworkFetch: {
+          supported: client.isNetworkFetchSupported(),
+          configured: client.getLastServerInfoMessage()?.networkFetchConfiguration !== undefined,
+        },
+        imageRendererSupported: client.getLastServerInfoMessage()?.features?.remoteBrowser === true,
         served: gateway.served,
         denied: egress.denied,
         unexpectedRequests,
         requests: fixture.requests,
+        ...(observation && {
+          portObservations: observation.messages,
+          rpcTypes: observation.rpcTypes,
+          observationOverflow: observation.overflow(),
+        }),
       }),
     };
   } catch (error) {

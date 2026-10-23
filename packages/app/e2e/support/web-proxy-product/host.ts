@@ -17,7 +17,8 @@ async function main() {
   const input = JSON.parse(await readFile(process.argv[2], "utf8")) as {
     root: string;
     password: string;
-    networkFetch: NonNullable<PaseoDaemonConfig["networkFetch"]>;
+    controlOrigin: string;
+    networkFetch?: PaseoDaemonConfig["networkFetch"];
   };
   const paseoHome = path.join(input.root, "daemon");
   const staticDir = path.join(input.root, "static");
@@ -28,7 +29,7 @@ async function main() {
       listen: "127.0.0.1:0",
       paseoHome,
       staticDir,
-      corsAllowedOrigins: [input.networkFetch.controlOrigin!],
+      corsAllowedOrigins: [input.controlOrigin],
       hostnames: true,
       mcpEnabled: false,
       mcpDebug: false,

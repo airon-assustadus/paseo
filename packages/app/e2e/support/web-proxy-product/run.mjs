@@ -10,7 +10,11 @@ const appRoot = path.join(repoRoot, "packages/app");
 const filter = process.argv[2] ?? "E1";
 const output = process.argv[3];
 const assetVersion = process.argv[4];
+const caseTitle = process.argv[5];
 if (!/^(?:E[1-8]|U[12])$/u.test(filter)) throw new Error("Select one E1..E8 or U1..U2 scenario");
+if (caseTitle !== undefined && (!caseTitle.startsWith(`${filter} `) || caseTitle.length > 256))
+  throw new Error("Case title must belong to the selected scenario");
+const grep = caseTitle ? `${caseTitle.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}$` : filter;
 if (!output || !path.isAbsolute(output) || existsSync(output))
   throw new Error("Provide a new absolute evidence directory");
 if (!assetVersion || !/^ticket04-product-nav-v[1-9]\d*$/u.test(assetVersion))
@@ -56,7 +60,7 @@ const child = spawn(
     "--",
     "e2e/browser/web-proxy-product.spec.ts",
     "--grep",
-    filter,
+    grep,
     "--output",
     output,
     "--retries=0",
