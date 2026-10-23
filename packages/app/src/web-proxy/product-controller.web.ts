@@ -153,11 +153,16 @@ export function createWebProxyProductController(
     const sameSiteSuffix =
       content.hostname.split(".").slice(-2).join(".") ===
       control.hostname.split(".").slice(-2).join(".");
+    const overlappingDomain =
+      content.hostname.endsWith(`.${control.hostname}`) ||
+      control.hostname === configuration.dedicatedContentDomain ||
+      control.hostname.endsWith(`.${configuration.dedicatedContentDomain}`);
     const invalidContent =
       content.origin !== expectedOrigin ||
       candidate.contentOrigin !== content.origin ||
       content.origin === control.origin ||
       sameSiteSuffix ||
+      overlappingDomain ||
       candidate.assetVersion !== configuration.assetVersion;
     if (invalidContent) throw new ProductError("invalid_configuration");
     if (new URL(configuration.bootstrapPath, content.origin).origin !== content.origin) {
@@ -202,6 +207,16 @@ export function createWebProxyProductController(
 
   function report(error: unknown): void {
     const code = errorCode(error);
+    if (
+      code === "cleanup_pending" &&
+      descriptor !== null &&
+      !registry.isFenced({
+        serverId: options.view.serverId,
+        destinationId: descriptor.destinationId,
+      })
+    ) {
+      fence(descriptor);
+    }
     if (code === "persistence_unavailable") {
       persistenceFailed = true;
       if (
@@ -448,6 +463,7 @@ export function createWebProxyProductController(
       const opened = await openTransport(reconciled, ticket);
       if (opened === null || ticket !== generation) return;
       transport = opened;
+      requireConfiguration();
       const version = ++brokerVersion;
       broker = attachWebProxyBroker({
         capability: validateDescriptor(reconciled, configuration),

@@ -8,6 +8,7 @@ import { NetworkFetchRegistry } from "../../../client/src/network-fetch";
 import type { WebProxyBroker, WebProxyBrokerOptions, WebProxyBrokerState } from "./broker.web";
 import {
   createWebProxyProductController,
+  type WebProxyProductClient,
   type WebProxyProductConfiguration,
 } from "./product-controller.web";
 import {
@@ -118,7 +119,7 @@ function setup() {
     isNetworkFetchSupported: vi.fn(() => true),
     getConnectionState: vi.fn(() => ({ status: "connected" }) as const),
     getLastServerInfoMessage: vi.fn(
-      () =>
+      (): ReturnType<WebProxyProductClient["getLastServerInfoMessage"]> =>
         ({
           status: "server_info",
           serverId: "host",
@@ -128,11 +129,13 @@ function setup() {
         }) as const,
     ),
     resolveNetworkFetchDestination: vi.fn(async () => descriptor),
-    reconcileNetworkFetchDestination: vi.fn(async () => ({
-      descriptor,
-      state: "active" as const,
-      cleanupRequiredEpoch: null,
-    })),
+    reconcileNetworkFetchDestination: vi.fn(
+      async (): ReturnType<WebProxyProductClient["reconcileNetworkFetchDestination"]> => ({
+        descriptor,
+        state: "active" as const,
+        cleanupRequiredEpoch: null,
+      }),
+    ),
     requestNetworkFetchCleanup: vi.fn(async () => ({
       destinationId,
       authorityEpoch: "6",
@@ -175,6 +178,173 @@ function setup() {
 }
 
 describe("product controller", () => {
+  it("refuses missing or stale authenticated configuration and another selected host", async () => {
+    const context = setup();
+    const missing = createWebProxyProductController({ ...context.options, configuration: null });
+    await missing.open("https://upstream.example/");
+    const wrongHost = createWebProxyProductController({
+      ...context.options,
+      view: { ...context.options.view, serverId: "other-host" },
+    });
+    await wrongHost.open("https://upstream.example/");
+    context.client.getLastServerInfoMessage.mockReturnValue({
+      status: "server_info",
+      serverId: "host",
+      hostname: null,
+      version: null,
+    });
+    await context.controller.open("https://upstream.example/");
+    expect(missing.getSnapshot().error).toEqual({ code: "invalid_configuration" });
+    expect(wrongHost.getSnapshot().error).toEqual({ code: "invalid_configuration" });
+    expect(context.controller.getSnapshot().error).toEqual({ code: "invalid_configuration" });
+    expect(context.client.resolveNetworkFetchDestination).not.toHaveBeenCalled();
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("does not call the SDK when the host capability is absent", async () => {
+    const context = setup();
+    context.client.isNetworkFetchSupported.mockReturnValue(false);
+    await context.controller.open("https://upstream.example/");
+    expect(context.controller.getSnapshot().error).toEqual({ code: "unsupported_capability" });
+    expect(context.client.resolveNetworkFetchDestination).not.toHaveBeenCalled();
+  });
+
+  it("rejects a content origin or asset version inconsistent with the authenticated configuration", async () => {
+    const context = setup();
+    context.client.resolveNetworkFetchDestination.mockResolvedValue({
+      ...descriptor,
+      contentOrigin: location.origin,
+    });
+    await context.controller.open("https://upstream.example/");
+    expect(context.controller.getSnapshot().error).toEqual({ code: "invalid_configuration" });
+    context.client.resolveNetworkFetchDestination.mockResolvedValue({
+      ...descriptor,
+      assetVersion: "other-assets",
+    });
+    await context.controller.open("https://upstream.example/");
+    expect(context.controller.getSnapshot().error).toEqual({ code: "invalid_configuration" });
+    expect(context.client.openNetworkFetch).not.toHaveBeenCalled();
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("rejects content under the control hostname", async () => {
+    const context = setup();
+    const overlapping = { ...configuration, dedicatedContentDomain: location.hostname };
+    context.client.getLastServerInfoMessage.mockReturnValue({
+      status: "server_info",
+      serverId: "host",
+      hostname: null,
+      version: null,
+      networkFetchConfiguration: overlapping,
+    });
+    context.client.resolveNetworkFetchDestination.mockResolvedValue({
+      ...descriptor,
+      contentOrigin: `https://${destinationId}.${location.hostname}`,
+    });
+    const controller = createWebProxyProductController({
+      ...context.options,
+      configuration: overlapping,
+    });
+    await controller.open("https://upstream.example/");
+    expect(controller.getSnapshot().error).toEqual({ code: "invalid_configuration" });
+    expect(context.client.openNetworkFetch).not.toHaveBeenCalled();
+  });
+
+  it.each([Infinity, NaN, 0, 2147483648])(
+    "rejects nonfinite or out-of-range TTL %s",
+    async (ttlMs) => {
+      const context = setup();
+      const controller = createWebProxyProductController({
+        ...context.options,
+        configuration: { ...configuration, ttlMs },
+      });
+      await controller.open("https://upstream.example/");
+      expect(controller.getSnapshot().error).toEqual({ code: "invalid_configuration" });
+      expect(context.client.resolveNetworkFetchDestination).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not mount when host configuration changes during admission", async () => {
+    const context = setup();
+    const originalOpen = context.client.openNetworkFetch.getMockImplementation();
+    if (originalOpen === undefined) throw new Error("Missing test implementation");
+    context.client.openNetworkFetch.mockImplementation(async () => {
+      const handle = await originalOpen();
+      context.client.getLastServerInfoMessage.mockReturnValue({
+        status: "server_info",
+        serverId: "host",
+        hostname: null,
+        version: null,
+      });
+      return handle;
+    });
+    await context.controller.open("https://upstream.example/");
+    expect(context.controller.getSnapshot().error).toEqual({ code: "invalid_configuration" });
+    expect(context.handles[0].ended).toBe("closed");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("persists a cleanup fence when the host refuses open after a successful reconciliation", async () => {
+    const context = setup();
+    context.client.openNetworkFetch.mockRejectedValue(
+      new NetworkFetchRpcError("open", "cleanup_pending"),
+    );
+    await context.controller.open("https://upstream.example/");
+    expect(context.controller.getSnapshot()).toMatchObject({
+      phase: "cleanup_pending",
+      cleanup: { status: "pending_local" },
+    });
+    expect(await context.persistence.read({ serverId: "host", destinationId })).toMatchObject({
+      status: "cleanup_pending",
+    });
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("persists revocation delivered in the same turn as open", async () => {
+    const context = setup();
+    const originalOpen = context.client.openNetworkFetch.getMockImplementation();
+    if (originalOpen === undefined) throw new Error("Missing test implementation");
+    context.client.openNetworkFetch.mockImplementation(async () => {
+      const handle = await originalOpen();
+      context.wire.closed(handle.subscriptionId, "revoked");
+      return handle;
+    });
+    await context.controller.open("https://upstream.example/");
+    expect(context.controller.getSnapshot().phase).toBe("cleanup_pending");
+    expect(await context.persistence.read({ serverId: "host", destinationId })).toMatchObject({
+      status: "cleanup_pending",
+    });
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a conflicting cleanup epoch without silently issuing a new request", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    context.client.requestNetworkFetchCleanup.mockRejectedValue(
+      new NetworkFetchRpcError("request_cleanup", "epoch_conflict"),
+    );
+    context.client.reconcileNetworkFetchDestination.mockResolvedValue({
+      descriptor: { ...descriptor, authorityEpoch: "7", cleanupRequiredEpoch: "7" },
+      state: "revoked",
+      cleanupRequiredEpoch: "7",
+    });
+    await context.controller.requestClear();
+    expect(context.client.requestNetworkFetchCleanup).toHaveBeenCalledExactlyOnceWith({
+      destinationId,
+      expectedAuthorityEpoch: "5",
+    });
+    expect(context.client.reconcileNetworkFetchDestination).toHaveBeenCalledTimes(2);
+    expect(context.controller.getSnapshot()).toMatchObject({
+      phase: "cleanup_pending",
+      cleanup: { status: "pending_host", requiredEpoch: "7" },
+    });
+    expect(await context.persistence.read({ serverId: "host", destinationId })).toMatchObject({
+      authorityEpoch: "7",
+      cleanupRequestBaseEpoch: "5",
+      status: "cleanup_pending",
+    });
+  });
+
   it("is disabled by default and sends no RPC", async () => {
     const context = setup();
     const { enabled: _enabled, ...options } = context.options;

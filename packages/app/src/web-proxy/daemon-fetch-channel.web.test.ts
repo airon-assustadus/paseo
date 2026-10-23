@@ -138,6 +138,7 @@ describe("daemon fetch channel", () => {
     context.wire.closed("owner", "revoked");
     await context.open();
     expect(context.frame.mock.calls).toEqual([[{ type: "closed", reason: "revoked" }]]);
+    expect(context.onError).toHaveBeenCalledExactlyOnceWith("cleanup_pending");
     expect(context.send).not.toHaveBeenCalled();
   });
 

@@ -25,6 +25,7 @@ export function createDaemonFetchChannel(options: DaemonFetchChannelOptions): Ne
   let handlers: NetworkFetchChannelHandlers | null = null;
   let handle: NetworkFetch | null = null;
   let opening = false;
+  let admitted = false;
   let closed = false;
   let unsubscribeFrame = () => {};
   let unsubscribeEnd = () => {};
@@ -55,6 +56,12 @@ export function createDaemonFetchChannel(options: DaemonFetchChannelOptions): Ne
 
   function onEnd(reason: NetworkFetchEnd): void {
     if (closed) return;
+    if (!admitted) {
+      let code: WebProxyProductErrorCode = "channel_lost";
+      if (reason === "revoked" || reason === "allowlist_changed") code = "cleanup_pending";
+      else if (reason === "expired" || reason === "protocol_error") code = reason;
+      options.onError(code);
+    }
     closed = true;
     unsubscribeFrame();
     unsubscribeEnd();
@@ -125,7 +132,10 @@ export function createDaemonFetchChannel(options: DaemonFetchChannelOptions): Ne
       if (!matchesDescriptor) throw new NetworkFetchRpcError("open", "protocol_error");
       unsubscribeFrame = opened.onFrame(onFrame);
       unsubscribeEnd = opened.onEnd(onEnd);
-      if (!closed) handlers?.frame({ type: "session.opened", limits: opened.limits });
+      if (!closed) {
+        admitted = true;
+        handlers?.frame({ type: "session.opened", limits: opened.limits });
+      }
     } catch (error) {
       fail(error);
     }
