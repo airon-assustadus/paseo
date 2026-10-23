@@ -2,6 +2,7 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ar: TranslationResources = {
+  webProxy: en.webProxy,
   browserRouting: {
     sectionTitle: "المتصفح",
     permissionDenied:

@@ -2,6 +2,24 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ptBR: TranslationResources = {
+  webProxy: {
+    useDom: "Usar navegador local (experimental)",
+    useImage: "Usar navegador por imagem",
+    unavailable: "Navegação local indisponível. Atualize ou configure este host para usá-la.",
+    preferenceFailed:
+      "Não foi possível carregar ou salvar a preferência do navegador. Tente novamente.",
+    navigationUnavailable: "Esta conexão com o host ainda não oferece navegação de páginas.",
+    actionFailed: "Não foi possível concluir esta ação. Verifique a conexão e o acesso ao host.",
+    offline: "Conecte-se a este host para abrir a página.",
+    opening: "Abrindo a página...",
+    suspended: "A página está suspensa. Retome para reconectar.",
+    cleanupLocal: "A limpeza está pendente neste dispositivo e ainda não foi confirmada pelo host.",
+    cleanupPending: "A limpeza está pendente. O apagamento dos dados da página não foi confirmado.",
+    cleanupPartial: "A limpeza está incompleta. A página permanece bloqueada.",
+    requestCleanup: "Solicitar limpeza de todas as visões deste destino",
+    stop: "Parar",
+    resume: "Retomar",
+  },
   browserRouting: {
     sectionTitle: "Navegador",
     permissionDenied:

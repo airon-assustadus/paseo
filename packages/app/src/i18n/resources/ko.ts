@@ -2,6 +2,7 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ko: TranslationResources = {
+  webProxy: en.webProxy,
   browserRouting: {
     sectionTitle: "브라우저",
     permissionDenied:
