@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
@@ -9,6 +9,7 @@ import {
   selectAgentTimelineState,
   toDaemonServerInfo,
   useSessionStore,
+  subscribeWorkspaceRemoval,
   type Agent,
   type WorkspaceDescriptor,
 } from "./session-store";
@@ -90,6 +91,68 @@ afterEach(() => {
 function initializeTestSession(serverId = "test-server"): void {
   useSessionStore.getState().initializeSession(serverId, null as unknown as DaemonClient);
 }
+
+describe("workspace removal presentation notification", () => {
+  it("preserves canonical removal when an observer throws", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    const workspace = createWorkspace({ id: "workspace-error" });
+    store.setWorkspaces("test-server", new Map([[workspace.id, workspace]]));
+    const deferredErrors: Array<() => void> = [];
+    const microtasks = vi
+      .spyOn(globalThis, "queueMicrotask")
+      .mockImplementation((callback) => deferredErrors.push(callback));
+    const removeFault = subscribeWorkspaceRemoval(() => {
+      throw new Error("observer failure");
+    });
+    const observed = vi.fn();
+    const removeObserver = subscribeWorkspaceRemoval(observed);
+    try {
+      store.removeWorkspace("test-server", workspace.id);
+      expect(observed).toHaveBeenCalledOnce();
+      expect(useSessionStore.getState().sessions["test-server"].workspaces.has(workspace.id)).toBe(
+        false,
+      );
+      expect(deferredErrors).toHaveLength(1);
+      expect(deferredErrors[0]).toThrow("observer failure");
+    } finally {
+      removeFault();
+      removeObserver();
+      microtasks.mockRestore();
+    }
+  });
+  it("notifies semantic deletion before publication without treating reset as removal", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    const workspace = createWorkspace({ id: "workspace-resident" });
+    store.setWorkspaces("test-server", new Map([[workspace.id, workspace]]));
+    const observations: Array<{ id: string; stillPresent: boolean }> = [];
+    const unsubscribe = subscribeWorkspaceRemoval((removal) =>
+      observations.push({
+        id: removal.workspaceId,
+        stillPresent:
+          useSessionStore.getState().sessions[removal.serverId]?.workspaces.has(workspace.id) ===
+          true,
+      }),
+    );
+    try {
+      store.removeWorkspace("test-server", "  workspace-resident  ");
+      expect(observations).toEqual([{ id: workspace.id, stillPresent: true }]);
+      expect(useSessionStore.getState().sessions["test-server"].workspaces.has(workspace.id)).toBe(
+        false,
+      );
+      store.setWorkspaces("test-server", new Map([[workspace.id, workspace]]));
+      store.setWorkspaces("test-server", new Map());
+      expect(observations).toHaveLength(1);
+      unsubscribe();
+      store.setWorkspaces("test-server", new Map([[workspace.id, workspace]]));
+      store.removeWorkspace("test-server", workspace.id);
+      expect(observations).toHaveLength(1);
+    } finally {
+      unsubscribe();
+    }
+  });
+});
 
 describe("web proxy server configuration", () => {
   const configuration = {

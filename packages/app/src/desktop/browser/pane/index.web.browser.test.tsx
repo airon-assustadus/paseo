@@ -9,14 +9,19 @@ import { i18n } from "@/i18n/i18next";
 import { useBrowserStore } from "../store";
 import { webProxySettings } from "../web-proxy-settings";
 import { BrowserPane } from "./index.web";
+import { createResidentRegistry, type ResidentRegistry } from "../resident-dom-proxy/registry.web";
 
 // These tests exercise the real panel and controls. The controller seam is substituted;
 // they do not prove host transport, navigation, storage removal, or an end-to-end proxy.
 const runtime = vi.hoisted(() => ({
   supported: true,
-  client: {},
+  client: { subscribeRawMessages: () => () => {} },
   configuration: null as NetworkFetchConfiguration | null,
   create: vi.fn(),
+}));
+const resident = vi.hoisted(() => ({ registry: null as ResidentRegistry | null }));
+vi.mock("../resident-dom-proxy/provider.web", () => ({
+  useResidentDomProxy: () => resident.registry,
 }));
 
 vi.mock("@/runtime/host-features", () => ({ useHostFeature: () => runtime.supported }));
@@ -99,6 +104,7 @@ let root: Root | null = null;
 let container: HTMLDivElement;
 let browserId: string;
 let controls: ReturnType<typeof fakeController>[];
+let residentHost: HTMLDivElement;
 
 beforeEach(() => {
   vi.stubGlobal("React", React);
@@ -117,17 +123,38 @@ beforeEach(() => {
     .createBrowser({ initialUrl: "https://before.example.test/" });
   container = document.createElement("div");
   document.body.appendChild(container);
+  residentHost = document.createElement("div");
+  document.body.append(residentHost);
+  resident.registry = createResidentRegistry({
+    root: residentHost,
+    isBindingValid: (binding) =>
+      runtime.supported &&
+      webProxySettings.getState().domByHost[binding.view.serverId] === true &&
+      JSON.stringify(binding.configuration) === JSON.stringify(runtime.configuration),
+    isPresentationBlocked: () => false,
+    onSnapshot: (view, snapshot) => {
+      if (snapshot.url === null) return;
+      useBrowserStore.getState().updateBrowser(view.browserId, {
+        url: snapshot.url,
+        ...(snapshot.title === null ? {} : { title: snapshot.title }),
+      });
+    },
+  });
   root = createRoot(container);
 });
 
 afterEach(() => {
   act(() => root?.unmount());
   root = null;
+  resident.registry?.dispose();
+  resident.registry = null;
+  residentHost.remove();
   container.remove();
   useBrowserStore.getState().removeBrowser(browserId);
 });
 
 function renderPane(serverId = "host-a", isInteractive = true) {
+  act(() => resident.registry?.reconcile());
   act(() =>
     root?.render(
       <BrowserPane
@@ -165,7 +192,7 @@ describe("workspace web proxy panel contract", () => {
     await waitFor(() => expect(view.getByTestId("image-pane")).toBeTruthy());
   });
 
-  it("closes views on configuration removal, asset replacement, host change and unmount", () => {
+  it("closes invalid bindings but preserves a view when its presentation unmounts", () => {
     optIn();
     renderPane();
     expect(controls).toHaveLength(1);
@@ -185,6 +212,8 @@ describe("workspace web proxy panel contract", () => {
     expect(runtime.create.mock.lastCall?.[0].view.serverId).toBe("host-b");
     act(() => root?.unmount());
     root = null;
+    expect(controls.at(-1)?.controller.closeView).not.toHaveBeenCalled();
+    resident.registry?.dispose();
     expect(controls.at(-1)?.controller.closeView).toHaveBeenCalledOnce();
   });
 
@@ -241,7 +270,10 @@ describe("workspace web proxy panel contract", () => {
     renderPane();
     act(() => controls[0].emit({ phase: "active", canResume: true, canRequestClear: true }));
     const view = renderPane("host-a", false);
-    expect(view.getByTestId("dom-proxy-surface").inert).toBe(true);
+    const residentWindow = residentHost.querySelector<HTMLElement>(
+      '[data-testid="dom-proxy-resident-window"]',
+    );
+    expect(residentWindow?.inert).toBe(true);
     expect(
       view.getByRole("button", { name: i18n.t("webProxy.stop") }).getAttribute("aria-disabled"),
     ).toBe("true");
