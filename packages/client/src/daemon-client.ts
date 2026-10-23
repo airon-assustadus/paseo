@@ -150,7 +150,6 @@ import {
   decodeTunnelFrame,
   decodeNetworkFetchFrame,
   NetworkFetchOpcode,
-  type NetworkFetchServerFrame,
   decodeRemoteBrowserFrame,
   FileTransferOpcode,
   RemoteBrowserOpcode,
@@ -6473,10 +6472,9 @@ export class DaemonClient {
     return handle;
   }
 
-  private unwrapNetworkFetch<Payload extends { ok: true } | { ok: false; error: NetworkFetchRpcFailure }>(
-    operation: NetworkFetchOperation,
-    payload: Payload,
-  ): Extract<Payload, { ok: true }> {
+  private unwrapNetworkFetch<
+    Payload extends { ok: true } | { ok: false; error: NetworkFetchRpcFailure },
+  >(operation: NetworkFetchOperation, payload: Payload): Extract<Payload, { ok: true }> {
     if (!payload.ok) throw new NetworkFetchRpcError(operation, payload.error.code);
     return payload as Extract<Payload, { ok: true }>;
   }
@@ -6504,7 +6502,10 @@ export class DaemonClient {
         this.connectionState.status !== "connected"
       )
         throw new NetworkFetchRpcError(operation, "channel_lost");
-      if (error instanceof DaemonRpcError && error.code === "permission_denied")
+      if (
+        error instanceof DaemonRpcError &&
+        (error.code === "permission_denied" || error.code === "access_denied")
+      )
         throw new NetworkFetchRpcError(operation, "permission_denied");
       throw new NetworkFetchRpcError(operation, "protocol_error");
     }
@@ -6932,6 +6933,7 @@ export class DaemonClient {
   }
 
   private tryHandleBinaryFrame(rawBytes: Uint8Array): boolean {
+    if (this.tryHandleNetworkFetchFrame(rawBytes)) return true;
     const fileFrame = decodeFileTransferFrame(rawBytes);
     if (fileFrame) {
       this.traceInstant("paseo.ws.message.inbound", {
@@ -6946,20 +6948,6 @@ export class DaemonClient {
     }
 
     const opcode = rawBytes[0];
-    if (opcode >= NetworkFetchOpcode.Request && opcode <= NetworkFetchOpcode.Cancelled) {
-      const frame = decodeNetworkFetchFrame(rawBytes, "host_to_client");
-      if (!frame || !this.networkFetches.receive(frame as NetworkFetchServerFrame)) {
-        this.disposeTransport(CLIENT_CLOSE_PROTOCOL_ERROR, "Invalid network fetch frame");
-        this.scheduleReconnect({
-          reason: "Invalid network fetch frame",
-          reasonCode: "protocol_error",
-        });
-      } else {
-        this.consecutiveLivenessFailures = 0;
-        this.runtimeMetrics?.recordBinaryFrame("other", rawBytes.byteLength, 0);
-      }
-      return true;
-    }
     if (opcode >= TunnelOpcode.Data && opcode <= 0x2f) {
       // A malformed frame or unknown subscription drops the transport and reconnects: ownership
       // cannot be trusted, so the bad frame cannot be isolated (late frames for recently closed
@@ -7029,6 +7017,41 @@ export class DaemonClient {
       event: "NETWORK_TUNNEL_PROTOCOL_ERROR",
       reasonCode: "protocol_error",
     });
+  }
+
+  private tryHandleNetworkFetchFrame(rawBytes: Uint8Array): boolean {
+    const opcode = rawBytes[0];
+    if (!(opcode >= NetworkFetchOpcode.Request && opcode <= NetworkFetchOpcode.Cancelled))
+      return false;
+    const frame = decodeNetworkFetchFrame(rawBytes, "host_to_client");
+    if (!frame || !this.networkFetches.receive(frame)) {
+      this.disposeTransport(CLIENT_CLOSE_PROTOCOL_ERROR, "Invalid network fetch frame");
+      this.scheduleReconnect({
+        reason: "Invalid network fetch frame",
+        reasonCode: "protocol_error",
+      });
+    } else {
+      this.consecutiveLivenessFailures = 0;
+      this.runtimeMetrics?.recordBinaryFrame("other", rawBytes.byteLength, 0);
+    }
+    return true;
+  }
+
+  private receiveNetworkFetchClosed(message: SessionOutboundMessage): void {
+    if (message.type !== "network.fetch.closed.update") return;
+    if (!this.networkFetches.closed(message.payload.subscriptionId, message.payload.reason)) {
+      this.disposeTransport(CLIENT_CLOSE_PROTOCOL_ERROR, "Unknown network fetch owner");
+      this.scheduleReconnect({
+        reason: "Unknown network fetch owner",
+        reasonCode: "protocol_error",
+      });
+    }
+  }
+
+  private updateNetworkFetchSupport(serverInfo: ServerInfoStatusPayload): void {
+    this.networkFetchSupported =
+      serverInfo.features?.networkFetch === true &&
+      serverInfo.features?.ownedSubscriptions === true;
   }
 
   private handleFileTransferFrame(frame: FileTransferFrame): void {
@@ -7316,28 +7339,13 @@ export class DaemonClient {
       );
     }
 
-    if (consumerMessage.type === "network.fetch.closed.update") {
-      if (
-        !this.networkFetches.closed(
-          consumerMessage.payload.subscriptionId,
-          consumerMessage.payload.reason,
-        )
-      ) {
-        this.disposeTransport(CLIENT_CLOSE_PROTOCOL_ERROR, "Unknown network fetch owner");
-        this.scheduleReconnect({
-          reason: "Unknown network fetch owner",
-          reasonCode: "protocol_error",
-        });
-      }
-    }
+    this.receiveNetworkFetchClosed(consumerMessage);
 
     if (consumerMessage.type === "status") {
       const serverInfo = parseServerInfoStatusPayload(consumerMessage.payload);
       if (serverInfo) {
         this.lastServerInfoMessage = serverInfo;
-        this.networkFetchSupported =
-          serverInfo.features?.networkFetch === true &&
-          serverInfo.features?.ownedSubscriptions === true;
+        this.updateNetworkFetchSupport(serverInfo);
         if (this.connectionState.status === "connecting") {
           this.resetConnectTimeout();
           this.reconnectAttempt = 0;
