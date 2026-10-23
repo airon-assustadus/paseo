@@ -327,6 +327,15 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     const created = options.container.ownerDocument.createElement("iframe");
     created.setAttribute("sandbox", FRAME_SANDBOX);
     created.referrerPolicy = "no-referrer";
+    Object.assign(created.style, {
+      display: "block",
+      width: "100%",
+      height: "100%",
+      flex: "1 1 0%",
+      minWidth: "0",
+      minHeight: "0",
+      border: "0",
+    });
     let awaitingBootstrap = true;
     created.addEventListener("load", () => {
       if (created !== frame || isTerminal(state)) return;
