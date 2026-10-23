@@ -38,6 +38,8 @@ export type WebProxyProductClient = Pick<
   | "isNetworkFetchSupported"
   | "getConnectionState"
   | "getLastServerInfoMessage"
+  | "subscribeRawMessages"
+  | "subscribeConnectionStatus"
   | "resolveNetworkFetchDestination"
   | "reconcileNetworkFetchDestination"
   | "requestNetworkFetchCleanup"
@@ -106,6 +108,7 @@ export function createWebProxyProductController(
   const persistence = options.persistence ?? getWebProxyProductResources().persistence;
   const registry = options.registry ?? getWebProxyProductResources().registry;
   const listeners = new Set<() => void>();
+  const suppliedConfiguration = NetworkFetchConfigurationSchema.safeParse(options.configuration);
   let snapshot = initialSnapshot();
   let generation = 0;
   let brokerVersion = 0;
@@ -116,6 +119,9 @@ export function createWebProxyProductController(
   let releaseView = () => {};
   let clearing: Promise<void> | null = null;
   let persistenceFailed = false;
+  let observingAuthority = false;
+  let releaseServerInfo = () => {};
+  let releaseConnection = () => {};
 
   function publish(change: Partial<WebProxyProductSnapshot>): void {
     snapshot = { ...snapshot, ...change };
@@ -128,7 +134,7 @@ export function createWebProxyProductController(
     if (!client.isNetworkFetchSupported()) throw new ProductError("unsupported_capability");
     const info = client.getLastServerInfoMessage();
     if (info?.serverId !== options.view.serverId) throw new ProductError("invalid_configuration");
-    const supplied = NetworkFetchConfigurationSchema.safeParse(options.configuration);
+    const supplied = suppliedConfiguration;
     const current = NetworkFetchConfigurationSchema.safeParse(info.networkFetchConfiguration);
     if (!supplied.success || !current.success) throw new ProductError("invalid_configuration");
     if (JSON.stringify(supplied.data) !== JSON.stringify(current.data)) {
@@ -201,8 +207,46 @@ export function createWebProxyProductController(
     const previousBroker = broker;
     transport = null;
     broker = null;
+    const frame = previousBroker?.getFrame();
+    if (frame) frame.inert = true;
     previousTransport?.close();
     previousBroker?.dispose();
+  }
+
+  function stopObservingAuthority(): void {
+    observingAuthority = false;
+    releaseServerInfo();
+    releaseConnection();
+    releaseServerInfo = () => {};
+    releaseConnection = () => {};
+  }
+
+  function invalidateAuthority(error: unknown): void {
+    generation += 1;
+    detach();
+    report(error);
+  }
+
+  function observeAuthority(): void {
+    if (!observingAuthority) return;
+    try {
+      requireConfiguration();
+    } catch (error) {
+      if (errorCode(error) === "channel_lost") {
+        if (snapshot.phase === "opening" || snapshot.phase === "active") suspend("channel_lost");
+      } else invalidateAuthority(error);
+    }
+  }
+
+  function startObservingAuthority(): void {
+    if (observingAuthority) return;
+    observingAuthority = true;
+    releaseServerInfo = client.subscribeRawMessages((message) => {
+      if (message.type === "status") observeAuthority();
+    });
+    const unsubscribe = client.subscribeConnectionStatus(observeAuthority);
+    if (observingAuthority) releaseConnection = unsubscribe;
+    else unsubscribe();
   }
 
   function report(error: unknown): void {
@@ -418,6 +462,13 @@ export function createWebProxyProductController(
   function onBrokerState(state: WebProxyBrokerState, version: number): void {
     if (version !== brokerVersion) return;
     if (state.status === "granted") {
+      try {
+        requireConfiguration();
+      } catch (error) {
+        if (errorCode(error) === "channel_lost") suspend("channel_lost");
+        else invalidateAuthority(error);
+        return;
+      }
       publish({ phase: "active", error: { code: "navigation_unavailable" }, canResume: false });
     } else if (state.status === "failed" || state.status === "revoked") {
       generation += 1;
@@ -426,14 +477,44 @@ export function createWebProxyProductController(
     }
   }
 
+  function mountBroker(
+    current: NetworkFetchDescriptor,
+    configuration: NetworkFetchConfiguration,
+    opened: NetworkFetchTransport,
+    ticket: number,
+  ): void {
+    requireConfiguration();
+    const version = ++brokerVersion;
+    const attached = attachWebProxyBroker({
+      capability: validateDescriptor(current, configuration),
+      transport: opened,
+      container: options.container,
+      bootstrapPath: configuration.bootstrapPath,
+      handshakeTimeoutMs: configuration.handshakeTimeoutMs,
+      onStateChange: (state) => onBrokerState(state, version),
+    });
+    if (ticket !== generation || version !== brokerVersion) {
+      const frame = attached.getFrame();
+      if (frame) frame.inert = true;
+      attached.dispose();
+      return;
+    }
+    broker = attached;
+    requireConfiguration();
+  }
+
   async function open(url: string): Promise<void> {
     generation += 1;
     const ticket = generation;
+    stopObservingAuthority();
     detach();
     releaseView();
     publish({ phase: "opening", error: null, canResume: false });
     try {
+      if (ticket !== generation) return;
       const configuration = requireConfiguration();
+      startObservingAuthority();
+      if (ticket !== generation) return;
       if (persistenceFailed) throw new ProductError("persistence_unavailable");
       if (url.length > 8192 || !URL.canParse(url)) throw new ProductError("invalid_url");
       const target = new URL(url);
@@ -463,19 +544,11 @@ export function createWebProxyProductController(
       const opened = await openTransport(reconciled, ticket);
       if (opened === null || ticket !== generation) return;
       transport = opened;
-      requireConfiguration();
-      const version = ++brokerVersion;
-      broker = attachWebProxyBroker({
-        capability: validateDescriptor(reconciled, configuration),
-        transport: opened,
-        container: options.container,
-        bootstrapPath: configuration.bootstrapPath,
-        handshakeTimeoutMs: configuration.handshakeTimeoutMs,
-        onStateChange: (state) => onBrokerState(state, version),
-      });
+      mountBroker(reconciled, configuration, opened, ticket);
     } catch (error) {
       if (ticket !== generation) return;
       generation += 1;
+      stopObservingAuthority();
       detach();
       report(error);
     }
@@ -502,14 +575,28 @@ export function createWebProxyProductController(
       const opened = await openTransport(reconciled, ticket);
       if (opened === null || ticket !== generation) return;
       transport = opened;
+      requireConfiguration();
       const result = await retained.resume({ transport: opened });
       if (ticket !== generation) return;
+      requireConfiguration();
       if (result.kind !== "resumed") throw new ProductError("resume_failed");
       const frame = retained.getFrame();
       if (frame) frame.inert = false;
       publish({ phase: "active", error: { code: "navigation_unavailable" }, canResume: false });
     } catch (error) {
       if (ticket !== generation) return;
+      if (errorCode(error) === "channel_lost") {
+        suspend("channel_lost");
+        return;
+      }
+      if (
+        errorCode(error) === "invalid_configuration" ||
+        errorCode(error) === "unsupported_capability" ||
+        errorCode(error) === "disabled"
+      ) {
+        invalidateAuthority(error);
+        return;
+      }
       generation += 1;
       const previous = transport;
       transport = null;
@@ -525,6 +612,7 @@ export function createWebProxyProductController(
       return;
     }
     generation += 1;
+    stopObservingAuthority();
     detach();
     fence(current);
     publish({
@@ -591,6 +679,7 @@ export function createWebProxyProductController(
 
   function closeView(): void {
     generation += 1;
+    stopObservingAuthority();
     detach();
     releaseView();
     publish({ phase: "closed", canResume: false });
