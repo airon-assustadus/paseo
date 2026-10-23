@@ -21,14 +21,20 @@ export interface WebProxyProductRegistration {
 
 export interface WebProxyProductRegistry {
   register(registration: WebProxyProductRegistration): () => void;
-  invalidate(event: WebProxyProductInvalidation): void;
+  invalidate(event: WebProxyProductInvalidation): WebProxyProductFenceOutcome;
   isFenced(key: WebProxyProductDestinationKey): boolean;
   dispose(): void;
 }
 
+export interface WebProxyProductFenceOutcome {
+  matchingViews: number;
+  failedViews: number;
+  broadcast: "sent" | "unavailable" | "failed";
+}
+
 export class WebProxyProductRegistryError extends Error {
-  constructor() {
-    super("Web proxy view already registered or registry closed");
+  constructor(readonly reason: "closed" | "duplicate_view" | "cleanup_pending") {
+    super(`Web proxy registry: ${reason}`);
     this.name = "WebProxyProductRegistryError";
   }
 }
@@ -53,16 +59,28 @@ export function createWebProxyProductRegistry(
   const fences = new Set<string>();
   let disposed = false;
 
-  function notify(event: WebProxyProductInvalidation): void {
-    if (disposed) return;
+  function notify(event: WebProxyProductInvalidation): WebProxyProductFenceOutcome {
+    const outcome: WebProxyProductFenceOutcome = {
+      matchingViews: 0,
+      failedViews: 0,
+      broadcast: "unavailable",
+    };
+    if (disposed) return outcome;
     if (event.reason === "cleanup_pending") fences.add(destinationKey(event));
     const registrations = [...views.values()];
     for (const registration of registrations) {
       const matches =
         registration.view.serverId === event.serverId &&
         registration.destinationId === event.destinationId;
-      if (matches) registration.invalidate(event);
+      if (!matches) continue;
+      outcome.matchingViews += 1;
+      try {
+        registration.invalidate(event);
+      } catch {
+        outcome.failedViews += 1;
+      }
     }
+    return outcome;
   }
 
   function receive(event: MessageEvent<unknown>): void {
@@ -75,7 +93,17 @@ export function createWebProxyProductRegistry(
   return {
     register(registration) {
       const key = JSON.stringify([registration.view.serverId, registration.view.browserId]);
-      if (disposed || views.has(key)) throw new WebProxyProductRegistryError();
+      if (disposed) throw new WebProxyProductRegistryError("closed");
+      if (
+        fences.has(
+          destinationKey({
+            serverId: registration.view.serverId,
+            destinationId: registration.destinationId,
+          }),
+        )
+      )
+        throw new WebProxyProductRegistryError("cleanup_pending");
+      if (views.has(key)) throw new WebProxyProductRegistryError("duplicate_view");
       views.set(key, registration);
       return () => {
         if (views.get(key) === registration) views.delete(key);
@@ -83,8 +111,17 @@ export function createWebProxyProductRegistry(
     },
     invalidate(event) {
       const parsed = invalidationSchema.parse(event);
-      notify(parsed);
-      if (!disposed) broadcast?.(parsed);
+      const wasOpen = !disposed;
+      const outcome = notify(parsed);
+      if (wasOpen && broadcast !== null) {
+        try {
+          broadcast(parsed);
+          outcome.broadcast = "sent";
+        } catch {
+          outcome.broadcast = "failed";
+        }
+      }
+      return outcome;
     },
     isFenced: (key) => fences.has(destinationKey(key)),
     dispose() {

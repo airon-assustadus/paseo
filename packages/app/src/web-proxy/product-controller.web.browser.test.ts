@@ -22,6 +22,7 @@ import {
   WebProxyProductPersistenceError,
 } from "./product-persistence.web";
 import { createWebProxyProductRegistry } from "./product-registry.web";
+import type { NetworkFetchTransport } from "./network-fetch-transport";
 
 const attach = vi.hoisted(() => vi.fn());
 vi.mock("./broker.web", () => ({ attachWebProxyBroker: attach }));
@@ -61,7 +62,15 @@ function granted(generation: number): WebProxyBrokerState {
   };
 }
 
+function hasTransportClose(
+  transport: WebProxyBrokerOptions["transport"],
+): transport is WebProxyBrokerOptions["transport"] & Pick<NetworkFetchTransport, "close"> {
+  return "close" in transport && typeof transport.close === "function";
+}
+
 function makeBroker(options: WebProxyBrokerOptions) {
+  const transport = options.transport;
+  if (!hasTransportClose(transport)) throw new Error("Expected closable product transport");
   let state: WebProxyBrokerState = granted(1);
   const frame = document.createElement("iframe");
   const dispose = vi.fn(() => frame.remove());
@@ -159,6 +168,7 @@ function makeBroker(options: WebProxyBrokerOptions) {
   };
   return {
     instance,
+    transport,
     dispose,
     purge,
     frame,
@@ -346,6 +356,278 @@ function restoreAuthority(context: ReturnType<typeof setup>): void {
 }
 
 describe("product controller", () => {
+  it("R1 observes the container owner Document rather than another window", async () => {
+    const context = setup();
+    const ownerFrame = document.createElement("iframe");
+    document.body.appendChild(ownerFrame);
+    const owner = ownerFrame.contentDocument!;
+    const container = owner.createElement("div");
+    owner.body.appendChild(container);
+    const controller = createWebProxyProductController({ ...context.options, container });
+    try {
+      await controller.open("https://upstream.example/");
+      window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+      expect(controller.getSnapshot().phase).toBe("active");
+      owner.defaultView!.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+      expect(controller.getSnapshot().phase).toBe("suspended");
+      controller.closeView();
+      owner.defaultView!.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+      expect(controller.getSnapshot().phase).toBe("closed");
+    } finally {
+      controller.closeView();
+      ownerFrame.remove();
+    }
+  });
+
+  it("R1 closes a late transport admission without attaching after pagehide", async () => {
+    const context = setup();
+    const opened = context.client.openNetworkFetch.getMockImplementation()!;
+    const started = deferred<void>();
+    const continueAdmission = deferred<void>();
+    context.client.openNetworkFetch.mockImplementationOnce(async () => {
+      started.resolve();
+      await continueAdmission.promise;
+      return opened();
+    });
+    const opening = context.controller.open("https://upstream.example/");
+    await started.promise;
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    continueAdmission.resolve();
+    await opening;
+    expect(attach).not.toHaveBeenCalled();
+    expect(context.handles[0].ended).toBe("closed");
+    expect(context.client.openNetworkFetch).toHaveBeenCalledTimes(1);
+    expect(context.controller.getSnapshot().phase).toBe("suspended");
+  });
+
+  it("R1 rejects an ACK and grant arriving after pagehide during resume", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    const ack = deferred<Awaited<ReturnType<WebProxyBroker["resume"]>>>();
+    const started = deferred<void>();
+    retained.instance.resume = vi.fn(() => {
+      started.resolve();
+      return ack.promise;
+    });
+    const resuming = context.controller.resume();
+    await started.promise;
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    retained.frame.inert = false;
+    retained.activate();
+    ack.resolve({ kind: "resumed", previous: 1, generation: 2, documentPreserved: true });
+    await resuming;
+    expect(context.handles[1].ended).toBe("closed");
+    expect(retained.frame.inert).toBe(true);
+    expect(context.controller.getSnapshot().phase).toBe("suspended");
+    expect(retained.navigate).toHaveBeenCalledTimes(1);
+    expect(context.client.requestNetworkFetchCleanup).not.toHaveBeenCalled();
+  });
+
+  it("R1 prevents a late initial handshake from releasing the frame", async () => {
+    const context = setup();
+    automaticNavigation = false;
+    const opening = context.controller.open("https://upstream.example/");
+    const retained = await brokerAttached.promise;
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    retained.frame.inert = false;
+    retained.activate();
+    retained.ready();
+    await opening;
+    expect(retained.frame.inert).toBe(true);
+    expect(context.controller.getSnapshot().phase).toBe("suspended");
+    expect(retained.navigate).not.toHaveBeenCalled();
+  });
+
+  it("R1 preserves logical close reentered from the broker suspension callback", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    retained.instance.suspend = vi.fn(() => {
+      context.controller.closeView();
+      return true;
+    });
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    expect(context.controller.getSnapshot()).toMatchObject({ phase: "closed", canResume: false });
+    expect(retained.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("R1 blocks explicit resume when persistence is unavailable after return", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    vi.spyOn(context.persistence, "read").mockRejectedValueOnce(
+      new WebProxyProductPersistenceError(),
+    );
+    await context.controller.resume();
+    expect(context.controller.getSnapshot()).toMatchObject({
+      phase: "cleanup_pending",
+      error: { code: "persistence_unavailable" },
+    });
+    expect(context.client.openNetworkFetch).toHaveBeenCalledTimes(1);
+    expect(context.client.requestNetworkFetchCleanup).not.toHaveBeenCalled();
+  });
+
+  it("R0 persists intent and calls cleanup despite teardown and UI callback failures", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    const visits = vi.fn();
+    context.registry.register({
+      view: { serverId: "host", workspaceId: "workspace", browserId: "other" },
+      destinationId,
+      invalidate: visits,
+    });
+    const close = vi.spyOn(retained.transport, "close").mockImplementationOnce(() => {
+      expect(context.registry.isFenced({ serverId: "host", destinationId })).toBe(true);
+      throw new Error("transport teardown");
+    });
+    retained.dispose.mockImplementationOnce(() => {
+      throw new Error("broker teardown");
+    });
+    const unsubscribe = context.controller.subscribe(() => {
+      throw new Error("view callback");
+    });
+    const secondListener = vi.fn();
+    context.controller.subscribe(secondListener);
+    const order: string[] = [];
+    const merge = context.persistence.merge.bind(context.persistence);
+    vi.spyOn(context.persistence, "merge").mockImplementation(async (input) => {
+      const stored = await merge(input);
+      if (stored.cleanupRequestBaseEpoch !== null) order.push("persisted");
+      return stored;
+    });
+    context.client.requestNetworkFetchCleanup.mockImplementation(async () => {
+      expect(order[0]).toBe("persisted");
+      order.push("rpc");
+      return {
+        destinationId,
+        authorityEpoch: "6",
+        cleanupRequiredEpoch: "6",
+        status: "cleanup_pending",
+      };
+    });
+    await context.controller.requestClear();
+    unsubscribe();
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(retained.dispose).toHaveBeenCalledTimes(1);
+    expect(visits).toHaveBeenCalledTimes(1);
+    expect(secondListener).toHaveBeenCalled();
+    expect(order).toContain("rpc");
+    expect(context.controller.getSnapshot()).toMatchObject({
+      phase: "cleanup_pending",
+      cleanup: { status: "pending_host", requiredEpoch: "6" },
+      error: { code: "protocol_error" },
+    });
+    expect(retained.purge).not.toHaveBeenCalled();
+  });
+
+  it("R0 closeView independently attempts dispose and retains the teardown error", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    vi.spyOn(retained.transport, "close").mockImplementationOnce(() => {
+      throw new Error("close");
+    });
+    context.controller.closeView();
+    expect(retained.dispose).toHaveBeenCalledTimes(1);
+    retained.activate();
+    expect(context.controller.getSnapshot()).toMatchObject({
+      phase: "closed",
+      error: { code: "protocol_error" },
+    });
+    expect(context.client.requestNetworkFetchCleanup).not.toHaveBeenCalled();
+  });
+
+  it("R1 only owner Document lifecycle suspends, with explicit reconciled resume and no replay", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    window.dispatchEvent(new Event("resize"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    context.options.container.hidden = true;
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: false }));
+    expect(context.controller.getSnapshot().phase).toBe("active");
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    expect(context.handles[0].ended).toBe("closed");
+    expect(context.controller.getSnapshot()).toMatchObject({ phase: "suspended", canResume: true });
+    retained.activate();
+    expect(context.controller.getSnapshot().phase).toBe("suspended");
+    retained.instance.suspend("channel_lost");
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    expect(context.client.openNetworkFetch).toHaveBeenCalledTimes(1);
+    expect(retained.navigate).toHaveBeenCalledTimes(1);
+    await context.controller.resume();
+    expect(context.client.reconcileNetworkFetchDestination).toHaveBeenCalledTimes(2);
+    expect(context.client.openNetworkFetch).toHaveBeenCalledTimes(2);
+    expect(context.controller.getSnapshot().phase).toBe("active");
+    expect(retained.navigate).toHaveBeenCalledTimes(1);
+    expect(retained.purge).not.toHaveBeenCalled();
+    context.controller.closeView();
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    expect(context.controller.getSnapshot().phase).toBe("closed");
+  });
+
+  it("R1 invalidates resolve admission before mount and rearms after logical close", async () => {
+    const context = setup();
+    const result = deferred<NetworkFetchDescriptor>();
+    context.client.resolveNetworkFetchDestination.mockReturnValueOnce(result.promise);
+    const opening = context.controller.open("https://upstream.example/");
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    result.resolve(descriptor);
+    await opening;
+    expect(attach).not.toHaveBeenCalled();
+    expect(context.controller.getSnapshot().phase).toBe("suspended");
+    context.controller.closeView();
+    await context.controller.open("https://upstream.example/");
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    expect(context.controller.getSnapshot().phase).toBe("suspended");
+  });
+
+  it("R1 does not overwrite a reentrant logical close during suspension", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    const close = retained.transport.close.bind(retained.transport);
+    vi.spyOn(retained.transport, "close").mockImplementationOnce(() => {
+      context.controller.closeView();
+      close();
+    });
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    expect(context.controller.getSnapshot()).toMatchObject({ phase: "closed", canResume: false });
+    expect(retained.dispose).toHaveBeenCalledTimes(1);
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    expect(context.controller.getSnapshot().phase).toBe("closed");
+  });
+
+  it("R1 preserves pending debt and reconciles host revocation on explicit resume", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    context.client.reconcileNetworkFetchDestination.mockResolvedValue({
+      descriptor: { ...descriptor, authorityEpoch: "6", cleanupRequiredEpoch: "6" },
+      state: "revoked",
+      cleanupRequiredEpoch: "6",
+    });
+    await context.controller.resume();
+    expect(context.controller.getSnapshot().phase).toBe("cleanup_pending");
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    expect(context.controller.getSnapshot()).toMatchObject({
+      phase: "cleanup_pending",
+      canResume: false,
+      cleanup: { status: "pending_host" },
+    });
+    expect(context.client.openNetworkFetch).toHaveBeenCalledTimes(1);
+    expect(retained.purge).not.toHaveBeenCalled();
+  });
+
   it("waits for navigation readiness and the initial command outcome rather than lifecycle grant", async () => {
     const context = setup();
     automaticNavigation = false;

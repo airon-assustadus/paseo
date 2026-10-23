@@ -32,6 +32,7 @@ import {
 } from "./product-persistence.web";
 import {
   createWebProxyProductRegistry,
+  WebProxyProductRegistryError,
   type WebProxyProductRegistry,
 } from "./product-registry.web";
 import { createCapability, resolveDestinationUrl, type WebProxyCapability } from "./request-policy";
@@ -93,6 +94,8 @@ class ProductError extends Error {
 function errorCode(error: unknown): WebProxyProductErrorCode {
   if (error instanceof ProductError || error instanceof NetworkFetchRpcError) return error.code;
   if (error instanceof WebProxyProductPersistenceError) return "persistence_unavailable";
+  if (error instanceof WebProxyProductRegistryError && error.reason === "cleanup_pending")
+    return "cleanup_pending";
   return "protocol_error";
 }
 
@@ -168,6 +171,26 @@ export function createWebProxyProductController(
   let initialNavigation = false;
   let navigationOperation: object | null = null;
   let finishWaitingForNavigation: ((ready: boolean) => void) | null = null;
+  const ownerWindow = options.container.ownerDocument.defaultView;
+  let containmentFailed = false;
+  let authorityPaused = false;
+  let documentInactive = false;
+
+  function attemptLocal(operation: () => void): boolean {
+    try {
+      operation();
+      return true;
+    } catch {
+      containmentFailed = true;
+      return false;
+    }
+  }
+
+  function retainContainmentError(): void {
+    if (containmentFailed && snapshot.error?.code !== "persistence_unavailable") {
+      snapshot = { ...snapshot, error: { code: "protocol_error" } };
+    }
+  }
 
   function publish(change: Partial<WebProxyProductSnapshot>): void {
     snapshot = { ...snapshot, ...change };
@@ -180,11 +203,17 @@ export function createWebProxyProductController(
         canGoForward: false,
       };
     }
-    for (const listener of listeners) listener();
+    retainContainmentError();
+    const subscribers = [...listeners];
+    for (const listener of subscribers) {
+      attemptLocal(listener);
+      retainContainmentError();
+    }
   }
 
   function requireConfiguration(): NetworkFetchConfiguration {
     if (options.enabled !== true) throw new ProductError("disabled");
+    if (documentInactive) throw new ProductError("channel_lost");
     if (client.getConnectionState().status !== "connected") throw new ProductError("channel_lost");
     if (!client.isNetworkFetchSupported()) throw new ProductError("unsupported_capability");
     const info = client.getLastServerInfoMessage();
@@ -256,25 +285,55 @@ export function createWebProxyProductController(
     publish({ cleanup: { status, requiredEpoch: stored.cleanupRequiredEpoch } });
   }
 
+  function pendingCleanup(): WebProxyProductSnapshot["cleanup"] {
+    return {
+      status: snapshot.cleanup.requiredEpoch === null ? "pending_local" : "pending_host",
+      requiredEpoch: snapshot.cleanup.requiredEpoch,
+    };
+  }
+
   function detach(): void {
     brokerVersion += 1;
-    resetNavigation();
+    authorityPaused = true;
     const previousTransport = transport;
     const previousBroker = broker;
     transport = null;
     broker = null;
-    const frame = previousBroker?.getFrame();
-    if (frame) frame.inert = true;
-    previousTransport?.close();
-    previousBroker?.dispose();
+    resetNavigation();
+    attemptLocal(() => {
+      const frame = previousBroker?.getFrame();
+      if (frame) frame.inert = true;
+    });
+    try {
+      attemptLocal(() => previousTransport?.close());
+    } finally {
+      attemptLocal(() => previousBroker?.dispose());
+    }
   }
 
   function stopObservingAuthority(): void {
     observingAuthority = false;
-    releaseServerInfo();
-    releaseConnection();
+    documentInactive = false;
+    ownerWindow?.removeEventListener("pagehide", onPageHide);
+    ownerWindow?.removeEventListener("pageshow", onPageShow);
+    const previousServerInfo = releaseServerInfo;
+    const previousConnection = releaseConnection;
     releaseServerInfo = () => {};
     releaseConnection = () => {};
+    attemptLocal(previousServerInfo);
+    attemptLocal(previousConnection);
+  }
+
+  function onPageHide(): void {
+    if (!observingAuthority) return;
+    documentInactive = true;
+    suspend("channel_lost");
+  }
+
+  function onPageShow(event: PageTransitionEvent): void {
+    if (!observingAuthority) return;
+    documentInactive = false;
+    if (event.persisted) suspend("channel_lost");
   }
 
   function invalidateAuthority(error: unknown): void {
@@ -297,6 +356,8 @@ export function createWebProxyProductController(
   function startObservingAuthority(): void {
     if (observingAuthority) return;
     observingAuthority = true;
+    ownerWindow?.addEventListener("pagehide", onPageHide);
+    ownerWindow?.addEventListener("pageshow", onPageShow);
     releaseServerInfo = client.subscribeRawMessages((message) => {
       if (message.type === "status") observeAuthority();
     });
@@ -307,6 +368,9 @@ export function createWebProxyProductController(
 
   function report(error: unknown): void {
     const code = errorCode(error);
+    if (code === "cleanup_pending") {
+      publish({ cleanup: pendingCleanup() });
+    }
     if (
       code === "cleanup_pending" &&
       descriptor !== null &&
@@ -359,7 +423,7 @@ export function createWebProxyProductController(
   }
 
   function bind(current: NetworkFetchDescriptor): void {
-    releaseView();
+    attemptLocal(releaseView);
     releaseView = registry.register({
       view: options.view,
       destinationId: current.destinationId,
@@ -371,7 +435,7 @@ export function createWebProxyProductController(
             phase: "cleanup_pending",
             canResume: false,
             error: { code: "cleanup_pending" },
-            cleanup: { status: "pending_local", requiredEpoch: snapshot.cleanup.requiredEpoch },
+            cleanup: pendingCleanup(),
           });
           persistFence(current);
         } else suspend("channel_lost");
@@ -380,24 +444,46 @@ export function createWebProxyProductController(
   }
 
   function fence(current: NetworkFetchDescriptor): void {
-    registry.invalidate({
+    const outcome = registry.invalidate({
       version: 1,
       serverId: options.view.serverId,
       destinationId: current.destinationId,
       reason: "cleanup_pending",
     });
+    if (outcome.failedViews > 0 || outcome.broadcast === "failed") containmentFailed = true;
   }
 
   function suspend(reason: "channel_lost" | "expired"): void {
     generation += 1;
+    const ticket = generation;
+    authorityPaused = true;
     resetNavigation();
     const previous = transport;
+    const retained = broker;
     transport = null;
-    previous?.close();
-    const suspended = broker?.suspend(reason) ?? false;
-    const frame = broker?.getFrame();
-    if (frame) frame.inert = true;
-    publish({ phase: "suspended", error: { code: reason }, canResume: suspended });
+    attemptLocal(() => {
+      const frame = retained?.getFrame();
+      if (frame) frame.inert = true;
+    });
+    let suspended = false;
+    try {
+      attemptLocal(() => previous?.close());
+    } finally {
+      if (ticket === generation && broker === retained) {
+        attemptLocal(() => {
+          suspended =
+            retained?.getState().status === "suspended" || (retained?.suspend(reason) ?? false);
+        });
+      }
+    }
+    if (ticket !== generation || broker !== retained) return;
+    const pending =
+      snapshot.cleanup.status === "pending_local" || snapshot.cleanup.status === "pending_host";
+    publish({
+      phase: pending ? "cleanup_pending" : "suspended",
+      error: { code: reason },
+      canResume: suspended && !pending && !containmentFailed,
+    });
   }
 
   function onTransportClosed(reason: NetworkFetchTransportClosedReason): void {
@@ -518,6 +604,13 @@ export function createWebProxyProductController(
 
   function onBrokerState(state: WebProxyBrokerState, version: number): void {
     if (version !== brokerVersion) return;
+    if (authorityPaused) {
+      attemptLocal(() => {
+        const frame = broker?.getFrame();
+        if (frame) frame.inert = true;
+      });
+      return;
+    }
     if (state.status === "granted") {
       try {
         requireConfiguration();
@@ -546,6 +639,7 @@ export function createWebProxyProductController(
     ticket: number,
   ): void {
     requireConfiguration();
+    authorityPaused = false;
     const version = ++brokerVersion;
     const attached = attachWebProxyBroker({
       capability: validateDescriptor(current, configuration),
@@ -636,7 +730,12 @@ export function createWebProxyProductController(
   }
 
   function onNavigationState(state: WebProxyNavigationSnapshot, version: number): void {
-    if (version !== brokerVersion || transport === null || broker?.getState().status !== "granted")
+    if (
+      authorityPaused ||
+      version !== brokerVersion ||
+      transport === null ||
+      broker?.getState().status !== "granted"
+    )
       return;
     try {
       requireConfiguration();
@@ -783,11 +882,12 @@ export function createWebProxyProductController(
     const ticket = generation;
     stopObservingAuthority();
     detach();
-    releaseView();
+    attemptLocal(releaseView);
     publish({ phase: "opening", error: null, canResume: false });
     try {
       if (ticket !== generation) return;
       const configuration = requireConfiguration();
+      if (containmentFailed) throw new ProductError("protocol_error");
       startObservingAuthority();
       if (ticket !== generation) return;
       if (persistenceFailed) throw new ProductError("persistence_unavailable");
@@ -839,6 +939,7 @@ export function createWebProxyProductController(
     publish({ phase: "opening", canResume: false, error: null });
     try {
       const configuration = requireConfiguration();
+      if (containmentFailed) throw new ProductError("protocol_error");
       const reconciled = await reconcile(previousDescriptor, configuration, ticket);
       if (reconciled === null || ticket !== generation) return;
       const compatible =
@@ -853,6 +954,7 @@ export function createWebProxyProductController(
       if (ticket !== generation) return;
       requireConfiguration();
       if (result.kind !== "resumed") throw new ProductError("resume_failed");
+      authorityPaused = false;
       const frame = retained.getFrame();
       if (frame) frame.inert = false;
       onBrokerState(retained.getState(), brokerVersion);
@@ -873,7 +975,7 @@ export function createWebProxyProductController(
       generation += 1;
       const previous = transport;
       transport = null;
-      previous?.close();
+      attemptLocal(() => previous?.close());
       report(error);
     }
   }
@@ -885,14 +987,24 @@ export function createWebProxyProductController(
       return;
     }
     generation += 1;
+    snapshot = {
+      ...snapshot,
+      phase: "cleanup_pending",
+      canResume: false,
+      canNavigate: false,
+      canReload: false,
+      canGoBack: false,
+      canGoForward: false,
+      cleanup: pendingCleanup(),
+    };
+    fence(current);
     stopObservingAuthority();
     detach();
-    fence(current);
     publish({
       phase: "cleanup_pending",
       canResume: false,
       error: null,
-      cleanup: { status: "pending_local", requiredEpoch: snapshot.cleanup.requiredEpoch },
+      cleanup: pendingCleanup(),
     });
     try {
       const stored = await persistence.merge({
@@ -954,7 +1066,7 @@ export function createWebProxyProductController(
     generation += 1;
     stopObservingAuthority();
     detach();
-    releaseView();
+    attemptLocal(releaseView);
     publish({ phase: "closed", canResume: false });
   }
 
