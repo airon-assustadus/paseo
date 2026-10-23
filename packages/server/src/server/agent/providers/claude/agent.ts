@@ -6313,6 +6313,7 @@ export function convertClaudeHistoryEntry(
     const userTaskNotificationItem = mapTaskNotificationUserContentToToolCall({
       content,
       messageId: userMessageId,
+      notificationId: typeof entry.notificationId === "string" ? entry.notificationId : undefined,
     });
     if (userTaskNotificationItem) {
       return [userTaskNotificationItem];
