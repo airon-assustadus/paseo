@@ -98,6 +98,36 @@ describe("DaemonConfigStore", () => {
     }
   });
 
+  test("network fetch reload fences before reporting restart", () => {
+    const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-fetch-config-"));
+    tempDirs.push(paseoHome);
+    const initial: PersistedConfig = { daemon: { networkFetch: { enabled: false } } };
+    const store = new DaemonConfigStore(paseoHome, reloadableConfig(initial), undefined, {
+      startupPersisted: initial,
+      reloadSource: {
+        resolve: (persisted) => ({
+          mutable: reloadableConfig(persisted),
+          overrideControlledPaths: [],
+        }),
+      },
+    });
+    let fenced = 0;
+    const unsubscribe = store.onNetworkFetchConfigurationChange(() => {
+      fenced += 1;
+    });
+    writeFileSync(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({ daemon: { networkFetch: { enabled: true } } }),
+    );
+    const result = store.reload();
+    expect(fenced).toBe(1);
+    expect(result.restartRequiredPaths).toContain("daemon.networkFetch.enabled");
+    expect(result.appliedPaths).not.toContain("daemon.networkFetch.enabled");
+    store.reload();
+    expect(fenced).toBe(1);
+    unsubscribe();
+  });
+
   test("patch persists relay state and emits its field change", () => {
     const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-daemon-config-store-"));
     tempDirs.push(paseoHome);

@@ -1,9 +1,10 @@
 import {
-  TUNNEL_CONNECT_TIMEOUT_MS,
-  TUNNEL_INITIAL_WINDOW_BYTES,
-  TUNNEL_MAX_DATA_BYTES,
-  TUNNEL_MAX_STREAMS,
-} from "@getpaseo/protocol/network-tunnel/rpc-schemas";
+  NETWORK_FETCH_LIMITS,
+  type NetworkFetchClosedReason,
+} from "@getpaseo/protocol/network-fetch/rpc-schemas";
+import type { NetworkFetchFailure } from "@getpaseo/protocol/binary-frames/network-fetch";
+export type { NetworkFetchClosedReason } from "@getpaseo/protocol/network-fetch/rpc-schemas";
+export type { NetworkFetchFailure } from "@getpaseo/protocol/binary-frames/network-fetch";
 import type { TunnelDial, TunnelLookup } from "../network-tunnel/dial-target.js";
 import {
   AllowlistEntryError,
@@ -14,12 +15,7 @@ import {
   type TrustedTarget,
   type TrustedTargetInput,
 } from "./allowlist.js";
-import {
-  NetworkFetchError,
-  NetworkFetchOpenError,
-  NetworkFetchProtocolError,
-  type NetworkFetchErrorCode,
-} from "./errors.js";
+import { NetworkFetchError, NetworkFetchOpenError, NetworkFetchProtocolError } from "./errors.js";
 import {
   FetchExchange,
   validateRequest,
@@ -38,27 +34,11 @@ import { hostInterfaceAddresses } from "./local-target.js";
  * power of two above the 50 MB validation case, and the redirect cap is the Fetch Standard's.
  */
 export const DEFAULT_NETWORK_FETCH_LIMITS: NetworkFetchLimits = {
-  initialWindowBytes: TUNNEL_INITIAL_WINDOW_BYTES,
-  maxChunkBytes: TUNNEL_MAX_DATA_BYTES,
-  maxConcurrentRequests: TUNNEL_MAX_STREAMS,
-  connectTimeoutMs: TUNNEL_CONNECT_TIMEOUT_MS,
-  maxRequestHeadBytes: 64 * 1024,
-  maxResponseHeadBytes: 64 * 1024,
-  responseHeadTimeoutMs: 30_000,
-  maxRequestBodyBytes: 64 * 1024 * 1024,
-  maxResponseBodyBytes: 64 * 1024 * 1024,
-  maxRedirects: 20,
+  ...NETWORK_FETCH_LIMITS,
 };
-
-export type NetworkFetchClosedReason = "closed" | "revoked" | "expired" | "allowlist_changed";
 
 /** See `ExchangeRelease`: `dnsPending` is the only residual a cancelled request can leave behind. */
 export type RequestRelease = ExchangeRelease;
-
-export interface NetworkFetchFailure {
-  code: NetworkFetchErrorCode;
-  message: string;
-}
 
 /** One-to-one with the response frames proposed for the protocol; nothing follows `closed`. */
 export interface NetworkFetchSink {
@@ -98,6 +78,7 @@ export interface OpenNetworkFetchSessionOptions {
   lookup?: TunnelLookup;
   dial?: TunnelDial;
   tlsCa?: readonly string[] | null;
+  acquireRequestSlot?: () => (() => void) | null;
   sink: NetworkFetchSink;
 }
 
@@ -247,6 +228,10 @@ export class NetworkFetchSession {
         throw new NetworkFetchError("stream_limit", "Too many concurrent requests");
       }
       const url = validateRequest(request, this.limits);
+      const releaseSlot = this.options.acquireRequestSlot?.();
+      if (releaseSlot === null) {
+        throw new NetworkFetchError("stream_limit", "Daemon request budget exhausted");
+      }
       const exchange: FetchExchange = new FetchExchange(
         request,
         url,
@@ -255,6 +240,7 @@ export class NetworkFetchSession {
       );
       this.exchanges.set(requestId, exchange);
       this.trackRelease(exchange);
+      if (releaseSlot) void exchange.released.then(releaseSlot);
       exchange.start();
     } catch (error) {
       if (!(error instanceof NetworkFetchError)) throw error;
@@ -349,10 +335,13 @@ export class NetworkFetchSession {
     if (this.state === "closed") return;
     this.state = "closed";
     clearTimeout(this.expiry);
-    this.options.sink.closed(reason);
     const exchanges = [...this.exchanges.values()];
     this.exchanges.clear();
-    for (const exchange of exchanges) exchange.cancel();
+    try {
+      this.options.sink.closed(reason);
+    } finally {
+      for (const exchange of exchanges) exchange.cancel();
+    }
   }
 
   private eventsFor(requestId: number, exchange: () => FetchExchange): ExchangeEvents {

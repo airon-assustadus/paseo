@@ -314,6 +314,7 @@ export class DaemonConfigStore {
   private readonly logger: LoggerLike | undefined;
   private readonly changeListeners = new Set<ConfigListener>();
   private readonly applyListeners = new Set<ConfigApplyListener>();
+  private readonly networkFetchConfigurationListeners = new Set<() => void>();
   private readonly fieldChangeHandlers = new Map<string, Set<FieldChangeHandler>>();
   private readonly relayEnabledMutable: boolean;
   private readonly reloadSource: DaemonConfigReloadSource | undefined;
@@ -344,6 +345,11 @@ export class DaemonConfigStore {
 
   public get(): MutableDaemonConfig {
     return this.current;
+  }
+
+  public onNetworkFetchConfigurationChange(listener: () => void): () => void {
+    this.networkFetchConfigurationListeners.add(listener);
+    return () => this.networkFetchConfigurationListeners.delete(listener);
   }
 
   public patch(partial: MutableDaemonConfigPatch): MutableDaemonConfig {
@@ -407,6 +413,11 @@ export class DaemonConfigStore {
     }
 
     const persisted = loadPersistedConfig(this.paseoHome, this.logger);
+    if (
+      !isEqualValue(this.lastKnownPersisted.daemon?.networkFetch, persisted.daemon?.networkFetch)
+    ) {
+      for (const listener of this.networkFetchConfigurationListeners) listener();
+    }
     const resolved = this.reloadSource.resolve(persisted);
     // Plugin source changes require the plugin lifecycle operation or a daemon
     // restart. The global switch is independently reloadable.

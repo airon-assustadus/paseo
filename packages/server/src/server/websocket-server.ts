@@ -99,6 +99,15 @@ import {
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { TunnelProtocolError } from "./network-tunnel/network-tunnel-session.js";
 import { RemoteBrowserManager } from "./remote-browser/remote-browser-manager.js";
+import { NetworkFetchManager } from "./network-fetch/network-fetch-manager.js";
+import {
+  FileNetworkFetchStateStorage,
+  NetworkFetchStateStore,
+} from "./network-fetch/network-fetch-state-store.js";
+import {
+  resolveNetworkFetchConfiguration,
+  type NetworkFetchConfig,
+} from "./network-fetch/configuration.js";
 
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
@@ -460,6 +469,7 @@ interface PluginSessionConnection extends SessionConnectionBase {
 type SessionConnection = ReconnectableSessionConnection | PluginSessionConnection;
 
 interface SocketSessionOptions {
+  principalId: string;
   clientId: string;
   appVersion: string | null;
   clientCapabilities: Record<string, unknown> | null;
@@ -591,6 +601,8 @@ export class VoiceAssistantWebSocketServer {
   private readonly browserToolsBroker: BrowserToolsBroker | null;
   /** Daemon-wide remote browsers; sessions own their browsers, this owns limits and shutdown. */
   private readonly remoteBrowsers: RemoteBrowserManager;
+  private readonly networkFetch: NetworkFetchManager | null;
+  private readonly unsubscribeNetworkFetchConfiguration: (() => void) | null;
   private readonly hubRelationships: HubRelationshipManagement | null;
   private connectionLifecycle: "starting" | "accepting" | "stopping" = "accepting";
   private readonly advertiseDaemonStatusRpc: boolean;
@@ -664,6 +676,7 @@ export class VoiceAssistantWebSocketServer {
     pluginRuntime?: SessionOptions["pluginRuntime"],
     orchestrationSkills?: SessionOptions["orchestrationSkills"],
     workspaceLabelService?: WorkspaceLabelService,
+    networkFetchConfig?: NetworkFetchConfig,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
@@ -679,6 +692,9 @@ export class VoiceAssistantWebSocketServer {
     this.daemonRuntimeConfig = daemonRuntimeConfig;
     this.browserToolsBroker = browserToolsBroker ?? null;
     this.remoteBrowsers = new RemoteBrowserManager({ logger: this.logger });
+    this.networkFetch = this.createNetworkFetch({ config: networkFetchConfig, paseoHome, server });
+    this.unsubscribeNetworkFetchConfiguration =
+      this.subscribeNetworkFetchConfiguration(daemonConfigStore);
     this.hubRelationships = hubRelationships ?? null;
     this.pluginRuntime = pluginRuntime;
     this.orchestrationSkills = orchestrationSkills;
@@ -816,6 +832,42 @@ export class VoiceAssistantWebSocketServer {
     this.getDaemonTcpHost = params.getDaemonTcpHost ?? null;
     this.serviceProxyPublicBaseUrl = params.serviceProxyPublicBaseUrl ?? null;
     this.resolveScriptHealth = params.resolveScriptHealth ?? null;
+  }
+
+  private subscribeNetworkFetchConfiguration(store: DaemonConfigStore): (() => void) | null {
+    const manager = this.networkFetch;
+    if (!manager) return null;
+    return store.onNetworkFetchConfigurationChange(() => manager.invalidateConfiguration());
+  }
+
+  private createNetworkFetch(options: {
+    config?: NetworkFetchConfig;
+    paseoHome: string;
+    server: HTTPServer;
+  }): NetworkFetchManager | null {
+    try {
+      const configuration = resolveNetworkFetchConfiguration(options.config);
+      if (!configuration) return null;
+      return new NetworkFetchManager({
+        configuration,
+        store: new NetworkFetchStateStore(
+          new FileNetworkFetchStateStorage(join(options.paseoHome, "network-fetch")),
+          this.serverId,
+        ),
+        reportTeardownFailure: () => this.logger.error("Network fetch close delivery failed"),
+        protectedLocalPorts: () => {
+          const ports = new Set<number>();
+          const address = options.server.address();
+          if (address && typeof address !== "string") ports.add(address.port);
+          const daemonPort = this.getDaemonTcpPort?.();
+          if (daemonPort) ports.add(daemonPort);
+          return ports;
+        },
+      });
+    } catch {
+      this.logger.error("Network fetch configuration or durable state is unavailable");
+      return null;
+    }
   }
 
   private createWebSocketServer(
@@ -1043,6 +1095,14 @@ export class VoiceAssistantWebSocketServer {
     principalId: string,
     permissions: readonly DaemonPermission[],
   ): void {
+    try {
+      this.networkFetch?.updatePrincipalPermissions(
+        principalId,
+        permissions.includes("network.proxy"),
+      );
+    } catch {
+      this.logger.error("Network fetch authority persistence failed; access remains fenced");
+    }
     for (const pending of this.pendingConnections.values()) {
       if (pending.admission?.principalId === principalId) {
         pending.admission = { ...pending.admission, permissions };
@@ -1138,6 +1198,14 @@ export class VoiceAssistantWebSocketServer {
     await Promise.all(cleanupPromises);
     // Sessions closed their browsers above; this also waits for opens still in progress.
     await this.remoteBrowsers.close();
+    this.unsubscribeNetworkFetchConfiguration?.();
+    if (this.networkFetch) {
+      try {
+        await this.networkFetch.close();
+      } catch {
+        this.logger.error("Network fetch clean shutdown could not be persisted");
+      }
+    }
     this.providerSnapshotManager.destroy();
     this.checkoutDiffManager.dispose();
     await this.workspaceGitService.dispose();
@@ -1388,6 +1456,7 @@ export class VoiceAssistantWebSocketServer {
     let connection: SessionConnection | null = null;
 
     const session = this.createSocketSession({
+      principalId: admission.principalId,
       clientId,
       appVersion,
       clientCapabilities,
@@ -1461,6 +1530,8 @@ export class VoiceAssistantWebSocketServer {
 
   private createSocketSession(options: SocketSessionOptions): Session {
     return new Session({
+      principalId: options.principalId,
+      networkFetch: this.networkFetch,
       browserToolsBroker: this.browserToolsBroker,
       remoteBrowsers: this.remoteBrowsers,
       clientId: options.clientId,
@@ -1794,6 +1865,10 @@ export class VoiceAssistantWebSocketServer {
       serverId: this.serverId,
       hostname: getHostName(),
       version: this.daemonVersion,
+      ...(this.networkFetch?.available &&
+      (ws ? session.permissionsForSource(ws) : session.getPermissions()).includes("network.proxy")
+        ? { networkFetchConfiguration: this.networkFetch.configuration }
+        : {}),
       // Source-less callers publish through the session, which projects permissions per socket.
       permissions: ws ? session.permissionsForSource(ws) : session.getPermissions(),
       // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.
@@ -1955,6 +2030,7 @@ export class VoiceAssistantWebSocketServer {
         agentConfigApply: true,
         // COMPAT(networkTunnel): added in v0.12.0, remove after 2027-10-08 once daemon floor >= v0.12.0.
         networkTunnel: true,
+        networkFetch: this.networkFetch?.available ?? false,
         // COMPAT(remoteBrowser): added in v0.11.5, remove after 2027-04-19 once daemon floor includes browser.remote.*.
         remoteBrowser: this.remoteBrowsers.available,
       },
