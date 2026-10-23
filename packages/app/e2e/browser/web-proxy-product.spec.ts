@@ -9,10 +9,138 @@ import {
 } from "../../src/web-proxy/navigation-messages";
 import { CONTROL } from "../support/web-proxy-product/network";
 import type { NetworkFetchDescriptor } from "@getpaseo/protocol/network-fetch/rpc-schemas";
+import type { WSOutboundMessage } from "@getpaseo/protocol/messages";
 import {
+  createProductRpcProjector,
   loadProductFetchProtocol,
   type FetchObservation,
 } from "../support/web-proxy-product/observation";
+
+test.describe("U observer projection", () => {
+  const expected = {
+    serverId: "host-observed",
+    webSocketUrl: "wss://control.ticket04-control.test/ws",
+  };
+  const canonical = {
+    type: "session",
+    message: {
+      type: "status",
+      payload: { status: "server_info", serverId: expected.serverId },
+    },
+  } satisfies WSOutboundMessage;
+  const withPayload = (payload: unknown) => ({
+    type: "session",
+    message: { type: "status", payload },
+  });
+
+  test("retains only expected server and locally assigned connection from received status", async () => {
+    const bind = await createProductRpcProjector(expected);
+    const socket = bind(expected.webSocketUrl);
+    const frame = withPayload({
+      ...canonical.message.payload,
+      password: "must-not-be-retained",
+      arbitrary: { secret: "must-not-be-retained" },
+      capabilities: {},
+      connectionId: "forged",
+    });
+    expect(socket.project(JSON.stringify(frame), "received")).toEqual({
+      type: "server_info",
+      fields: { serverId: expected.serverId, connectionId: socket.connectionId },
+    });
+  });
+
+  const rejected: Array<{
+    name: string;
+    frame: unknown;
+    direction?: FetchObservation["direction"];
+    socketUrl?: string;
+  }> = [
+    { name: "C to H canonical-looking status", frame: canonical, direction: "sent" },
+    {
+      name: "wrong payload status",
+      frame: withPayload({ status: "ready", serverId: expected.serverId }),
+    },
+    {
+      name: "wrong message type",
+      frame: { type: "session", message: { ...canonical.message, type: "server_info" } },
+    },
+    { name: "bare status without canonical session", frame: canonical.message },
+    { name: "double nested session", frame: { type: "session", message: canonical } },
+    { name: "wrong outer type", frame: { ...canonical, type: "status" } },
+    { name: "missing payload", frame: { type: "session", message: { type: "status" } } },
+    { name: "missing server identity", frame: withPayload({ status: "server_info" }) },
+    { name: "blank server identity", frame: withPayload({ status: "server_info", serverId: " " }) },
+    { name: "object server identity", frame: withPayload({ status: "server_info", serverId: {} }) },
+    {
+      name: "other server identity",
+      frame: withPayload({ status: "server_info", serverId: "other-host" }),
+    },
+    {
+      name: "other socket path",
+      frame: canonical,
+      socketUrl: "wss://control.ticket04-control.test/other",
+    },
+    {
+      name: "other socket host",
+      frame: canonical,
+      socketUrl: "wss://foreign.ticket04-control.test/ws",
+    },
+    {
+      name: "socket query",
+      frame: canonical,
+      socketUrl: `${expected.webSocketUrl}?token=not-retained`,
+    },
+    {
+      name: "unencrypted socket",
+      frame: canonical,
+      socketUrl: "ws://control.ticket04-control.test/ws",
+    },
+  ];
+  for (const input of rejected) {
+    test(`rejects ${input.name}`, async () => {
+      const bind = await createProductRpcProjector(expected);
+      const socket = bind(input.socketUrl ?? expected.webSocketUrl);
+      expect(socket.project(JSON.stringify(input.frame), input.direction ?? "received")).toBeNull();
+    });
+  }
+
+  test("rejects malformed JSON without retaining it", async () => {
+    const bind = await createProductRpcProjector(expected);
+    expect(bind(expected.webSocketUrl).project("{invalid", "received")).toBeNull();
+  });
+
+  test("hello never supplies received server status", async () => {
+    const bind = await createProductRpcProjector(expected);
+    const socket = bind(expected.webSocketUrl);
+    const hello = JSON.stringify({
+      type: "hello",
+      clientId: "client-observed",
+      password: "private",
+      status: "server_info",
+    });
+    expect(socket.project(hello, "received")).toBeNull();
+    expect(socket.project(hello, "sent")).toEqual({
+      type: "hello",
+      fields: { clientId: "client-observed", connectionId: socket.connectionId },
+    });
+  });
+
+  test("distinguishes new sockets without treating duplicate status as a new connection", async () => {
+    const bind = await createProductRpcProjector(expected);
+    const first = bind(expected.webSocketUrl);
+    const second = bind("wss://control.ticket04-control.test:443/ws");
+    const payload = JSON.stringify(
+      withPayload({ ...canonical.message.payload, connectionId: first.connectionId }),
+    );
+    const original = first.project(payload, "received");
+    expect(first.project(payload, "received")).toEqual(original);
+    expect(second.project(payload, "received")).toEqual({
+      type: "server_info",
+      fields: { serverId: expected.serverId, connectionId: second.connectionId },
+    });
+    expect(second.connectionId).not.toBe(first.connectionId);
+  });
+});
 
 test("E1 opens a host URL through the actual workspace browser panel", async ({
   browserName,
@@ -265,13 +393,20 @@ async function resumeWithoutReplay(
 }
 
 async function reconnectWithoutOpen(harness: ProductHarness) {
-  const info = fetchEvents(harness, "server_info").length;
+  const statuses = () =>
+    fetchEvents(harness, "server_info").filter(
+      (event) => event.fields.serverId === harness.serverId,
+    );
+  const previousConnections = new Set(statuses().map((event) => event.fields.connectionId));
+  expect(previousConnections.size).toBeGreaterThan(0);
   const opens = fetchEvents(harness, "network.fetch.open.request", "sent").length;
   const requestCount = harness.requests.length;
   harness.daemonLinks.unblock();
   await expect
-    .poll(() => fetchEvents(harness, "server_info").length, { timeout: 15_000 })
-    .toBeGreaterThan(info);
+    .poll(() => statuses().some((event) => !previousConnections.has(event.fields.connectionId)), {
+      timeout: 15_000,
+    })
+    .toBe(true);
   expect(fetchEvents(harness, "network.fetch.open.request", "sent")).toHaveLength(opens);
   expect(harness.requests).toHaveLength(requestCount);
 }

@@ -2,6 +2,7 @@ import type { Page } from "@playwright/test";
 import type * as NetworkFetchProtocol from "@getpaseo/protocol/binary-frames/network-fetch";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { loadProtocolSchemas } from "../helpers/daemon-client-loader";
 
 // Keep protocol runtime in the same ESM loader as the SDK. Playwright transforms
 // static imports in this CommonJS test package and otherwise mixes the graphs.
@@ -25,7 +26,65 @@ function object(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function projectRpc(payload: string): { type: string; fields: FetchObservation["fields"] } | null {
+interface ProjectedRpc {
+  type: string;
+  fields: FetchObservation["fields"];
+}
+type ProtocolSchemas = Awaited<ReturnType<typeof loadProtocolSchemas>>;
+
+function sameEndpoint(actual: string, expected: string): boolean {
+  try {
+    return new URL(actual).href === new URL(expected).href;
+  } catch {
+    return false;
+  }
+}
+
+// Connection identity is assigned by the Playwright socket owner, never by a frame.
+export async function createProductRpcProjector(expected: {
+  serverId: string;
+  webSocketUrl: string;
+}) {
+  const { serverId, webSocketUrl } = expected;
+  const schemas = await loadProtocolSchemas();
+  let sequence = 0;
+  return (socketUrl: string) => {
+    const connectionId = `socket-${++sequence}`;
+    const matchesEndpoint = sameEndpoint(socketUrl, webSocketUrl);
+    return {
+      connectionId,
+      project(payload: string, direction: FetchObservation["direction"]): ProjectedRpc | null {
+        if (!matchesEndpoint) return null;
+        const projected = projectRpc(payload, direction, serverId, schemas);
+        return projected
+          ? { type: projected.type, fields: { ...projected.fields, connectionId } }
+          : null;
+      },
+    };
+  };
+}
+
+function projectServerInfo(
+  envelope: unknown,
+  direction: FetchObservation["direction"],
+  serverId: string,
+  schemas: ProtocolSchemas,
+): ProjectedRpc | null {
+  if (direction !== "received") return null;
+  const parsed = schemas.WSOutboundMessageSchema.safeParse(envelope);
+  if (!parsed.success || parsed.data.type !== "session" || parsed.data.message.type !== "status")
+    return null;
+  const info = schemas.ServerInfoStatusPayloadSchema.safeParse(parsed.data.message.payload);
+  if (!info.success || info.data.serverId !== serverId) return null;
+  return { type: "server_info", fields: { serverId: info.data.serverId } };
+}
+
+function projectRpc(
+  payload: string,
+  direction: FetchObservation["direction"],
+  serverId: string,
+  schemas: ProtocolSchemas,
+): ProjectedRpc | null {
   let envelope: Record<string, unknown> | null;
   try {
     envelope = object(JSON.parse(payload));
@@ -34,14 +93,14 @@ function projectRpc(payload: string): { type: string; fields: FetchObservation["
   }
   const message = envelope?.type === "session" ? object(envelope.message) : envelope;
   if (!message || typeof message.type !== "string") return null;
-  if (message.type === "hello") {
+  if (message.type === "hello" && direction === "sent") {
     const hello = object(message.payload) ?? message;
     return {
       type: "hello",
       fields: typeof hello.clientId === "string" ? { clientId: hello.clientId.slice(0, 128) } : {},
     };
   }
-  if (message.type === "server_info") return { type: message.type, fields: {} };
+  if (message.type === "status") return projectServerInfo(envelope, direction, serverId, schemas);
   if (!message.type.startsWith("network.fetch.")) return null;
   const body = object(message.payload) ?? message;
   return { type: message.type, fields: projectFetchFields(body) };
@@ -80,8 +139,13 @@ export interface PortObservation {
 }
 
 // Test-only observation. These records never supply authority or a product response.
-export async function observeProductChannels(page: Page, traceReceipts = false) {
+export async function observeProductChannels(
+  page: Page,
+  traceReceipts: boolean,
+  expected: { serverId: string; webSocketUrl: string },
+) {
   const { decodeNetworkFetchFrame } = await loadProductFetchProtocol();
+  const bindProjection = await createProductRpcProjector(expected);
   const messages: PortObservation[] = [];
   const rpcTypes: string[] = [];
   const fetchEvents: FetchObservation[] = [];
@@ -119,9 +183,11 @@ export async function observeProductChannels(page: Page, traceReceipts = false) 
     }
   });
   page.on("websocket", (socket) => {
+    if (!sameEndpoint(socket.url(), expected.webSocketUrl)) return;
+    const projection = bindProjection(socket.url());
     const observeFrame = (direction: FetchObservation["direction"], payload: string | Buffer) => {
       if (typeof payload === "string") {
-        const projected = projectRpc(payload);
+        const projected = projection.project(payload, direction);
         if (projected) recordFetch(direction, projected.type, projected.fields);
         return;
       }
@@ -135,6 +201,7 @@ export async function observeProductChannels(page: Page, traceReceipts = false) 
           subscriptionId: decoded.subscriptionId,
           fetchId: decoded.fetchId,
           bytes: payload.byteLength,
+          connectionId: projection.connectionId,
         });
     };
     socket.on("framereceived", ({ payload }) => observeFrame("received", payload));

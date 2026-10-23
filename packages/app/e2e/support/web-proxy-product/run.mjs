@@ -96,7 +96,8 @@ async function runBrowserScenario() {
 
 // This diagnostic uses Playwright's actual worker/transform loader without globalSetup.
 async function runLoadCheck(mode, output) {
-  if (!["static", "static-negative", "esm"].includes(mode)) throw new Error("Unknown load control");
+  if (!["static", "static-negative", "esm", "observation"].includes(mode))
+    throw new Error("Unknown load control");
   if (!output || !path.isAbsolute(output) || existsSync(output))
     throw new Error("Provide a new absolute load evidence directory");
   mkdirSync(output, { mode: 0o700 });
@@ -124,10 +125,17 @@ test("canonical protocol and SDK load: ${mode}", async () => {
   process.stdout.write(JSON.stringify({ control: ${JSON.stringify(mode)}, decoder: true, opcodes: true, sdk: ${JSON.stringify(mode === "static-negative" ? "expected-rejection" : "loaded")}, browserRequested: false, globalSetup: false }) + "\\n");
 });
 `;
-    const config = `module.exports = ${JSON.stringify({ testDir: temporary, testMatch: "load.spec.ts", workers: 1, retries: 0, maxFailures: 1, timeout: 15000, globalTimeout: 30000, reporter: [["list"], ["json", { outputFile: path.join(output, "result.json") }]], outputDir: path.join(output, "artifacts") })};\n`;
-    writeFileSync(path.join(temporary, "load.spec.ts"), source, { mode: 0o600 });
+    const observationOnly = mode === "observation";
+    const config = `module.exports = ${JSON.stringify({ testDir: observationOnly ? path.join(appRoot, "e2e/browser") : temporary, testMatch: observationOnly ? "web-proxy-product.spec.ts" : "load.spec.ts", workers: 1, retries: 0, maxFailures: 1, timeout: 15000, globalTimeout: 30000, reporter: [["list"], ["json", { outputFile: path.join(output, "result.json") }]], outputDir: path.join(output, "artifacts") })};\n${observationOnly ? "module.exports.grep = /U observer projection/;\n" : ""}`;
+    if (!observationOnly)
+      writeFileSync(path.join(temporary, "load.spec.ts"), source, { mode: 0o600 });
     writeFileSync(path.join(temporary, "playwright.config.cjs"), config, { mode: 0o600 });
-    writeFileSync(path.join(output, "load.spec.ts"), source, { mode: 0o600 });
+    if (observationOnly)
+      copyFileSync(
+        path.join(appRoot, "e2e/browser/web-proxy-product.spec.ts"),
+        path.join(output, "web-proxy-product.spec.ts"),
+      );
+    else writeFileSync(path.join(output, "load.spec.ts"), source, { mode: 0o600 });
     writeFileSync(path.join(output, "playwright.config.cjs"), config, { mode: 0o600 });
     const environment = {};
     for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TZ"]) {

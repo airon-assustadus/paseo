@@ -422,7 +422,10 @@ export async function startProductHarness(
       });
       const page = await context.newPage();
       const observation = options.observeChannels
-        ? await observeProductChannels(page, runtimeOptions.observeReceipts)
+        ? await observeProductChannels(page, runtimeOptions.observeReceipts, {
+            serverId: host.serverId,
+            webSocketUrl: `${CONTROL.replace("https:", "wss:")}/ws`,
+          })
         : null;
       if (observation) observations.push(observation);
       page.setDefaultTimeout(15_000);
