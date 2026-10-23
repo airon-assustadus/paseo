@@ -6,7 +6,18 @@ import {
   type NetworkFetchConfiguration,
   type NetworkFetchDescriptor,
 } from "@getpaseo/protocol/network-fetch/rpc-schemas";
-import { attachWebProxyBroker, type WebProxyBroker, type WebProxyBrokerState } from "./broker.web";
+import {
+  attachWebProxyBroker,
+  type WebProxyBroker,
+  type WebProxyBrokerState,
+  type WebProxyNavigationSnapshot,
+} from "./broker.web";
+import {
+  NAVIGATION_LIMITS,
+  type NavigationCommand,
+  type NavigationFailureReason,
+  type NavigationOutcome,
+} from "./navigation-messages";
 import { createDaemonFetchChannel } from "./daemon-fetch-channel.web";
 import {
   openNetworkFetchTransport,
@@ -101,6 +112,37 @@ function initialSnapshot(): WebProxyProductSnapshot {
   };
 }
 
+const NAVIGATION_ERRORS: Record<NavigationFailureReason, WebProxyProductErrorCode> = {
+  unsupported: "navigation_unavailable",
+  out_of_scope: "scope_not_allowlisted",
+  busy: "limit_exceeded",
+  timeout: "navigation_unavailable",
+  channel_lost: "channel_lost",
+  superseded: "navigation_unavailable",
+  unsafe_replay: "navigation_unavailable",
+  protocol_error: "protocol_error",
+};
+
+function parseProductUrl(value: string): URL {
+  if (
+    new TextEncoder().encode(value).length > NAVIGATION_LIMITS.maxUrlBytes ||
+    !URL.canParse(value) ||
+    Array.from(value).some(
+      (character) =>
+        character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127 || character === "\\",
+    )
+  )
+    throw new ProductError("invalid_url");
+  const target = new URL(value);
+  if (
+    (target.protocol !== "http:" && target.protocol !== "https:") ||
+    target.username ||
+    target.password
+  )
+    throw new ProductError("invalid_url");
+  return target;
+}
+
 export function createWebProxyProductController(
   options: WebProxyProductControllerOptions,
 ): WebProxyProductController {
@@ -122,9 +164,22 @@ export function createWebProxyProductController(
   let observingAuthority = false;
   let releaseServerInfo = () => {};
   let releaseConnection = () => {};
+  let navigationState: WebProxyNavigationSnapshot | null = null;
+  let initialNavigation = false;
+  let navigationOperation: object | null = null;
+  let finishWaitingForNavigation: ((ready: boolean) => void) | null = null;
 
   function publish(change: Partial<WebProxyProductSnapshot>): void {
     snapshot = { ...snapshot, ...change };
+    if (snapshot.phase !== "active") {
+      snapshot = {
+        ...snapshot,
+        canNavigate: false,
+        canReload: false,
+        canGoBack: false,
+        canGoForward: false,
+      };
+    }
     for (const listener of listeners) listener();
   }
 
@@ -203,6 +258,7 @@ export function createWebProxyProductController(
 
   function detach(): void {
     brokerVersion += 1;
+    resetNavigation();
     const previousTransport = transport;
     const previousBroker = broker;
     transport = null;
@@ -334,6 +390,7 @@ export function createWebProxyProductController(
 
   function suspend(reason: "channel_lost" | "expired"): void {
     generation += 1;
+    resetNavigation();
     const previous = transport;
     transport = null;
     previous?.close();
@@ -469,7 +526,12 @@ export function createWebProxyProductController(
         else invalidateAuthority(error);
         return;
       }
-      publish({ phase: "active", error: { code: "navigation_unavailable" }, canResume: false });
+      publish({
+        phase: "active",
+        error: broker?.getNavigationState().ready ? null : { code: "navigation_unavailable" },
+        canResume: false,
+      });
+      if (broker !== null) onNavigationState(broker.getNavigationState(), version);
     } else if (state.status === "failed" || state.status === "revoked") {
       generation += 1;
       detach();
@@ -491,7 +553,9 @@ export function createWebProxyProductController(
       container: options.container,
       bootstrapPath: configuration.bootstrapPath,
       handshakeTimeoutMs: configuration.handshakeTimeoutMs,
+      navigation: { assetVersion: configuration.assetVersion },
       onStateChange: (state) => onBrokerState(state, version),
+      onNavigationState: (state) => onNavigationState(state, version),
     });
     if (ticket !== generation || version !== brokerVersion) {
       const frame = attached.getFrame();
@@ -501,6 +565,217 @@ export function createWebProxyProductController(
     }
     broker = attached;
     requireConfiguration();
+    onBrokerState(attached.getState(), version);
+  }
+
+  function resetNavigation(): void {
+    initialNavigation = false;
+    navigationOperation = null;
+    navigationState = null;
+    finishWaitingForNavigation?.(false);
+  }
+
+  function destinationUrl(value: string, sourceOrigin: string): string {
+    const configuration = requireConfiguration();
+    if (descriptor === null) throw new ProductError("identity_unavailable");
+    const capability = validateDescriptor(descriptor, configuration);
+    const target = parseProductUrl(value);
+    if (target.origin !== sourceOrigin) throw new ProductError("scope_not_allowlisted");
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(target.pathname);
+    } catch {
+      throw new ProductError("invalid_url");
+    }
+    if (
+      decodedPath === "/__paseo" ||
+      decodedPath.startsWith("/__paseo/") ||
+      decodedPath === configuration.bootstrapPath
+    )
+      throw new ProductError("scope_not_allowlisted");
+    const resolved = resolveDestinationUrl(capability, target.pathname + target.search);
+    if (resolved.kind !== "ok") throw new ProductError("scope_not_allowlisted");
+    resolved.url.hash = target.hash;
+    return resolved.url.href;
+  }
+
+  function publishNavigation(): void {
+    const current = navigationState;
+    const idle = !initialNavigation && navigationOperation === null;
+    const ready = current?.ready === true && snapshot.phase === "active";
+    publish({
+      canNavigate: ready && idle && current.operations.includes("navigate"),
+      canReload:
+        ready &&
+        idle &&
+        current.operations.includes("reload") &&
+        current.document?.canReload === true,
+      canGoBack:
+        ready &&
+        idle &&
+        current.operations.includes("back") &&
+        current.document?.canGoBack === true,
+      canGoForward:
+        ready &&
+        idle &&
+        current.operations.includes("forward") &&
+        current.document?.canGoForward === true,
+    });
+  }
+
+  function reportNavigationError(error: unknown): void {
+    const code = errorCode(error);
+    if (
+      code === "invalid_configuration" ||
+      code === "unsupported_capability" ||
+      code === "disabled"
+    ) {
+      invalidateAuthority(error);
+    } else if (code === "channel_lost") suspend("channel_lost");
+    else publish({ error: { code } });
+  }
+
+  function onNavigationState(state: WebProxyNavigationSnapshot, version: number): void {
+    if (version !== brokerVersion || transport === null || broker?.getState().status !== "granted")
+      return;
+    try {
+      requireConfiguration();
+      let metadata: Partial<WebProxyProductSnapshot> = {};
+      if (state.ready && state.document !== null && descriptor !== null) {
+        const url = destinationUrl(state.document.url, descriptor.contentOrigin);
+        if (
+          new TextEncoder().encode(state.document.title).length > NAVIGATION_LIMITS.maxTitleBytes
+        ) {
+          throw new ProductError("protocol_error");
+        }
+        metadata = { url, title: state.document.title };
+      }
+      navigationState = state;
+      publish(metadata);
+      publishNavigation();
+      if (state.ready && state.operations.includes("navigate")) finishWaitingForNavigation?.(true);
+    } catch (error) {
+      const code = errorCode(error);
+      if (
+        code === "invalid_configuration" ||
+        code === "unsupported_capability" ||
+        code === "disabled"
+      ) {
+        invalidateAuthority(error);
+      } else if (code === "channel_lost") suspend("channel_lost");
+      else {
+        navigationState = null;
+        publish({ error: { code: "protocol_error" } });
+        publishNavigation();
+      }
+    }
+  }
+
+  function waitForNavigation(timeoutMs: number): Promise<boolean> {
+    if (navigationState?.ready && navigationState.operations.includes("navigate"))
+      return Promise.resolve(true);
+    let settle = (_ready: boolean) => {};
+    const result = new Promise<boolean>((resolve) => {
+      settle = resolve;
+    });
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    function finish(ready: boolean): void {
+      if (finishWaitingForNavigation !== finish) return;
+      finishWaitingForNavigation = null;
+      clearTimeout(timer);
+      settle(ready);
+    }
+    finishWaitingForNavigation = finish;
+    return result;
+  }
+
+  function navigationResult(outcome: NavigationOutcome, retained: WebProxyBroker): void {
+    if (outcome.status === "failed") throw new ProductError(NAVIGATION_ERRORS[outcome.reason]);
+    const state = retained.getNavigationState();
+    const document = state.document;
+    if (
+      !state.ready ||
+      document === null ||
+      document.documentId !== outcome.documentId ||
+      document.entryKey !== outcome.entryKey ||
+      JSON.stringify(document.commit) !== JSON.stringify(outcome.commit)
+    )
+      throw new ProductError("protocol_error");
+    onNavigationState(retained.getNavigationState(), brokerVersion);
+    if (navigationState === null) throw new ProductError("protocol_error");
+  }
+
+  function supportsNavigation(command: NavigationCommand): boolean {
+    if (!navigationState?.ready || !navigationState.operations.includes(command.kind)) return false;
+    const document = navigationState.document;
+    switch (command.kind) {
+      case "navigate":
+        return true;
+      case "reload":
+        return document?.canReload === true;
+      case "back":
+        return document?.canGoBack === true;
+      case "forward":
+        return document?.canGoForward === true;
+    }
+  }
+
+  async function runNavigation(command: NavigationCommand): Promise<void> {
+    const retained = broker;
+    const ticket = generation;
+    const operation = {};
+    try {
+      requireConfiguration();
+      if (navigationOperation !== null) throw new ProductError("limit_exceeded");
+      if (
+        descriptor === null ||
+        retained === null ||
+        retained.getState().status !== "granted" ||
+        !supportsNavigation(command)
+      )
+        throw new ProductError("navigation_unavailable");
+      navigationOperation = operation;
+      publish({ error: null });
+      publishNavigation();
+      let outcome: NavigationOutcome;
+      switch (command.kind) {
+        case "navigate":
+          outcome = await retained.navigate({
+            url: destinationUrl(command.url, descriptor.origin),
+          });
+          break;
+        case "reload":
+          outcome = await retained.reload();
+          break;
+        case "back":
+          outcome = await retained.goBack();
+          break;
+        case "forward":
+          outcome = await retained.goForward();
+          break;
+      }
+      if (ticket !== generation || broker !== retained || navigationOperation !== operation) return;
+      requireConfiguration();
+      navigationResult(outcome, retained);
+      publish({ error: null });
+    } catch (error) {
+      if (ticket === generation && broker === retained) reportNavigationError(error);
+    } finally {
+      if (navigationOperation === operation) {
+        navigationOperation = null;
+        publishNavigation();
+      }
+    }
+  }
+
+  async function navigateInitial(url: string, ticket: number, timeoutMs: number): Promise<void> {
+    const ready = await waitForNavigation(timeoutMs);
+    if (ticket !== generation) return;
+    if (ready) await runNavigation({ kind: "navigate", url });
+    else publish({ error: { code: "navigation_unavailable" } });
+    if (ticket !== generation) return;
+    initialNavigation = false;
+    publishNavigation();
   }
 
   async function open(url: string): Promise<void> {
@@ -516,13 +791,7 @@ export function createWebProxyProductController(
       startObservingAuthority();
       if (ticket !== generation) return;
       if (persistenceFailed) throw new ProductError("persistence_unavailable");
-      if (url.length > 8192 || !URL.canParse(url)) throw new ProductError("invalid_url");
-      const target = new URL(url);
-      const validTarget =
-        (target.protocol === "http:" || target.protocol === "https:") &&
-        !target.username &&
-        !target.password;
-      if (!validTarget) throw new ProductError("invalid_url");
+      const target = parseProductUrl(url);
       const resolved = await client.resolveNetworkFetchDestination({
         origin: target.origin,
         pathPrefix: configuration.pathPrefix,
@@ -536,6 +805,7 @@ export function createWebProxyProductController(
         throw new ProductError("scope_not_allowlisted");
       }
       descriptor = resolved;
+      destinationUrl(url, resolved.origin);
       record = null;
       bind(resolved);
       publish({ canRequestClear: true });
@@ -544,7 +814,10 @@ export function createWebProxyProductController(
       const opened = await openTransport(reconciled, ticket);
       if (opened === null || ticket !== generation) return;
       transport = opened;
+      initialNavigation = true;
       mountBroker(reconciled, configuration, opened, ticket);
+      if (ticket !== generation) return;
+      await navigateInitial(url, ticket, configuration.handshakeTimeoutMs);
     } catch (error) {
       if (ticket !== generation) return;
       generation += 1;
@@ -582,7 +855,7 @@ export function createWebProxyProductController(
       if (result.kind !== "resumed") throw new ProductError("resume_failed");
       const frame = retained.getFrame();
       if (frame) frame.inert = false;
-      publish({ phase: "active", error: { code: "navigation_unavailable" }, canResume: false });
+      onBrokerState(retained.getState(), brokerVersion);
     } catch (error) {
       if (ticket !== generation) return;
       if (errorCode(error) === "channel_lost") {
@@ -685,9 +958,25 @@ export function createWebProxyProductController(
     publish({ phase: "closed", canResume: false });
   }
 
-  function navigationUnavailable(): Promise<void> {
-    publish({ error: { code: "navigation_unavailable" } });
-    return Promise.resolve();
+  async function navigate(url: string): Promise<void> {
+    try {
+      requireConfiguration();
+      if (navigationOperation !== null || initialNavigation)
+        throw new ProductError("limit_exceeded");
+      const target = parseProductUrl(url);
+      if (descriptor === null) throw new ProductError("navigation_unavailable");
+      const capability = validateDescriptor(descriptor, requireConfiguration());
+      if (
+        target.origin !== descriptor.origin ||
+        resolveDestinationUrl(capability, target.pathname + target.search).kind !== "ok"
+      ) {
+        await open(url);
+        return;
+      }
+      await runNavigation({ kind: "navigate", url });
+    } catch (error) {
+      reportNavigationError(error);
+    }
   }
 
   return {
@@ -697,10 +986,10 @@ export function createWebProxyProductController(
     },
     getSnapshot: () => snapshot,
     open,
-    navigate: navigationUnavailable,
-    reload: navigationUnavailable,
-    goBack: navigationUnavailable,
-    goForward: navigationUnavailable,
+    navigate,
+    reload: () => runNavigation({ kind: "reload" }),
+    goBack: () => runNavigation({ kind: "back" }),
+    goForward: () => runNavigation({ kind: "forward" }),
     stop: closeView,
     closeView,
     resume,
