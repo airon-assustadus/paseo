@@ -11,7 +11,7 @@ import { CreationClient } from "./creation/index.js";
 import type { CreationSnapshot } from "@getpaseo/protocol/messages";
 import type { z } from "zod";
 import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
-import type { ClientCapability } from "@getpaseo/protocol/client-capabilities";
+import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
 import type { AgentAttentionNotificationPayload } from "@getpaseo/protocol/agent-attention-notification";
 import {
   AgentCreateFailedStatusPayloadSchema,
@@ -148,6 +148,9 @@ import {
   encodeFileTransferFrame,
   decodeTerminalStreamFrame,
   decodeTunnelFrame,
+  decodeNetworkFetchFrame,
+  NetworkFetchOpcode,
+  type NetworkFetchServerFrame,
   decodeRemoteBrowserFrame,
   FileTransferOpcode,
   RemoteBrowserOpcode,
@@ -167,6 +170,21 @@ import {
   withinClientNetworkTunnelLimits,
   type NetworkTunnel,
 } from "./network-tunnel.js";
+import {
+  NetworkFetchRegistry,
+  NetworkFetchRpcError,
+  withinNetworkFetchLimits,
+  type NetworkFetch,
+  type NetworkFetchOpenOptions,
+  type NetworkFetchOperation,
+} from "./network-fetch.js";
+import type {
+  NetworkFetchScope,
+  NetworkFetchDescriptor,
+  NetworkFetchReconciliation,
+  NetworkFetchCleanupPending,
+  NetworkFetchRpcFailure,
+} from "@getpaseo/protocol/network-fetch/rpc-schemas";
 import {
   RemoteBrowserRegistry,
   RemoteBrowserRpcError,
@@ -358,6 +376,20 @@ export type {
   NetworkTunnelTarget,
 } from "./network-tunnel.js";
 export { NetworkTunnelError, NetworkTunnelRpcError } from "./network-tunnel.js";
+export type {
+  NetworkFetch,
+  NetworkFetchOpenOptions,
+  NetworkFetchSendFrame,
+  NetworkFetchEnd,
+  NetworkFetchDescriptor,
+  NetworkFetchScope,
+  NetworkFetchLimits,
+  NetworkFetchReconciliation,
+  NetworkFetchCleanupPending,
+  NetworkFetchClientFrame,
+  NetworkFetchServerFrame,
+} from "./network-fetch.js";
+export { NetworkFetchRpcError } from "./network-fetch.js";
 export type {
   RemoteBrowserAttachment,
   RemoteBrowserEnd,
@@ -1313,6 +1345,16 @@ export class DaemonClient {
   private authFailureReasonValue: DaemonAuthFailureReason | null = null;
   private connectionState: ConnectionState = { status: "idle" };
   private readonly terminalStreams = new TerminalStreamRouter();
+  private networkFetchSupported = false;
+  private readonly networkFetches = new NetworkFetchRegistry({
+    send: (frame) => {
+      if (!this.transport || this.connectionState.status !== "connected")
+        throw new NetworkFetchRpcError("open", "channel_lost");
+      this.sendTransportFrame(frame);
+    },
+    close: (subscriptionId) => this.closeNetworkFetchSubscription(subscriptionId),
+    handlerError: () => this.logger.error({}, "Network fetch listener failed"),
+  });
   private readonly networkTunnels = new NetworkTunnelRegistry({
     send: (frame) => this.sendBinaryFrame(frame),
     close: (subscriptionId) => this.closeNetworkTunnelSubscription(subscriptionId),
@@ -6336,6 +6378,149 @@ export class DaemonClient {
     return tunnel;
   }
 
+  isNetworkFetchSupported(): boolean {
+    return (
+      this.networkFetchSupported &&
+      this.connectionState.status === "connected" &&
+      this.config.capabilities?.[CLIENT_CAPS.networkFetch] !== false &&
+      this.config.capabilities?.[CLIENT_CAPS.ownedSubscriptions] !== false
+    );
+  }
+
+  async resolveNetworkFetchDestination(scope: NetworkFetchScope): Promise<NetworkFetchDescriptor> {
+    const payload = await this.withNetworkFetchSource("resolve_destination", () =>
+      this.sendCorrelatedSessionRequest({
+        message: { type: "network.fetch.resolve_destination.request", ...scope },
+        responseType: "network.fetch.resolve_destination.response",
+      }),
+    );
+    return this.unwrapNetworkFetch("resolve_destination", payload).descriptor;
+  }
+
+  async reconcileNetworkFetchDestination(input: {
+    destinationId: string;
+    knownEpoch: string;
+  }): Promise<NetworkFetchReconciliation> {
+    const payload = await this.withNetworkFetchSource("reconcile_destination", () =>
+      this.sendCorrelatedSessionRequest({
+        message: { type: "network.fetch.reconcile_destination.request", ...input },
+        responseType: "network.fetch.reconcile_destination.response",
+      }),
+    );
+    const { descriptor, state, cleanupRequiredEpoch } = this.unwrapNetworkFetch(
+      "reconcile_destination",
+      payload,
+    );
+    if (
+      descriptor.destinationId !== input.destinationId ||
+      cleanupRequiredEpoch !== descriptor.cleanupRequiredEpoch
+    )
+      throw new NetworkFetchRpcError("reconcile_destination", "protocol_error");
+    return { descriptor, state, cleanupRequiredEpoch };
+  }
+
+  async requestNetworkFetchCleanup(input: {
+    destinationId: string;
+    expectedAuthorityEpoch: string;
+  }): Promise<NetworkFetchCleanupPending> {
+    const payload = await this.withNetworkFetchSource("request_cleanup", () =>
+      this.sendCorrelatedSessionRequest({
+        message: { type: "network.fetch.request_cleanup.request", ...input },
+        responseType: "network.fetch.request_cleanup.response",
+      }),
+    );
+    const { destinationId, authorityEpoch, cleanupRequiredEpoch, status } = this.unwrapNetworkFetch(
+      "request_cleanup",
+      payload,
+    );
+    if (
+      destinationId !== input.destinationId ||
+      BigInt(cleanupRequiredEpoch) > BigInt(authorityEpoch)
+    )
+      throw new NetworkFetchRpcError("request_cleanup", "protocol_error");
+    return { destinationId, authorityEpoch, cleanupRequiredEpoch, status };
+  }
+
+  async openNetworkFetch(options: NetworkFetchOpenOptions): Promise<NetworkFetch> {
+    const openingTransport = this.transport;
+    let handle: NetworkFetch | undefined;
+    const payload = await this.withNetworkFetchSource("open", () =>
+      this.sendCorrelatedSessionRequest({
+        message: { type: "network.fetch.open.request", ...options },
+        responseType: "network.fetch.open.response",
+        selectPayload: (response) => {
+          if (
+            response.ok &&
+            this.transport === openingTransport &&
+            this.connectionState.status === "connected" &&
+            response.descriptor.destinationId === options.destinationId &&
+            response.descriptor.authorityEpoch === options.expectedAuthorityEpoch &&
+            response.descriptor.allowlistRevision === options.allowlistRevision &&
+            response.descriptor.cleanupRequiredEpoch === null &&
+            withinNetworkFetchLimits(response.limits, options.limits)
+          ) {
+            handle = this.networkFetches.open(response);
+          }
+          return response;
+        },
+      }),
+    );
+    const opened = this.unwrapNetworkFetch("open", payload);
+    if (!handle) {
+      await this.closeNetworkFetchSubscription(opened.subscriptionId);
+      throw new NetworkFetchRpcError("open", "protocol_error");
+    }
+    return handle;
+  }
+
+  private unwrapNetworkFetch<Payload extends { ok: true } | { ok: false; error: NetworkFetchRpcFailure }>(
+    operation: NetworkFetchOperation,
+    payload: Payload,
+  ): Extract<Payload, { ok: true }> {
+    if (!payload.ok) throw new NetworkFetchRpcError(operation, payload.error.code);
+    return payload as Extract<Payload, { ok: true }>;
+  }
+
+  private async withNetworkFetchSource<Result>(
+    operation: NetworkFetchOperation,
+    send: () => Promise<Result>,
+  ): Promise<Result> {
+    if (!this.isNetworkFetchSupported())
+      throw new NetworkFetchRpcError(
+        operation,
+        this.connectionState.status === "connected" ? "unsupported_capability" : "channel_lost",
+      );
+    const source = this.transport;
+    try {
+      const result = await send();
+      if (this.transport !== source || this.connectionState.status !== "connected")
+        throw new NetworkFetchRpcError(operation, "channel_lost");
+      return result;
+    } catch (error) {
+      if (error instanceof NetworkFetchRpcError) throw error;
+      if (
+        error instanceof DaemonConnectionError ||
+        this.transport !== source ||
+        this.connectionState.status !== "connected"
+      )
+        throw new NetworkFetchRpcError(operation, "channel_lost");
+      if (error instanceof DaemonRpcError && error.code === "permission_denied")
+        throw new NetworkFetchRpcError(operation, "permission_denied");
+      throw new NetworkFetchRpcError(operation, "protocol_error");
+    }
+  }
+
+  private async closeNetworkFetchSubscription(subscriptionId: string): Promise<void> {
+    const payload = await this.withNetworkFetchSource("close", () =>
+      this.sendCorrelatedSessionRequest({
+        message: { type: "network.fetch.close.request", subscriptionId },
+        responseType: "network.fetch.close.response",
+      }),
+    );
+    if (this.unwrapNetworkFetch("close", payload).subscriptionId !== subscriptionId)
+      throw new NetworkFetchRpcError("close", "protocol_error");
+  }
+
   /** Gate for the remote browser; an older or unsupported host answers false. */
   isRemoteBrowserSupported(): boolean {
     // COMPAT(remoteBrowser): added in v0.11.5, remove after 2027-04-19.
@@ -6591,6 +6776,8 @@ export class DaemonClient {
   }
 
   private disposeTransport(code = CLIENT_CLOSE_NORMAL, reason = "Reconnecting"): void {
+    this.networkFetchSupported = false;
+    this.networkFetches.disconnected();
     this.owned.disconnected();
     this.networkTunnels.disconnected();
     this.remoteBrowsers.disconnected();
@@ -6759,6 +6946,20 @@ export class DaemonClient {
     }
 
     const opcode = rawBytes[0];
+    if (opcode >= NetworkFetchOpcode.Request && opcode <= NetworkFetchOpcode.Cancelled) {
+      const frame = decodeNetworkFetchFrame(rawBytes, "host_to_client");
+      if (!frame || !this.networkFetches.receive(frame as NetworkFetchServerFrame)) {
+        this.disposeTransport(CLIENT_CLOSE_PROTOCOL_ERROR, "Invalid network fetch frame");
+        this.scheduleReconnect({
+          reason: "Invalid network fetch frame",
+          reasonCode: "protocol_error",
+        });
+      } else {
+        this.consecutiveLivenessFailures = 0;
+        this.runtimeMetrics?.recordBinaryFrame("other", rawBytes.byteLength, 0);
+      }
+      return true;
+    }
     if (opcode >= TunnelOpcode.Data && opcode <= 0x2f) {
       // A malformed frame or unknown subscription drops the transport and reconnects: ownership
       // cannot be trusted, so the bad frame cannot be isolated (late frames for recently closed
@@ -6969,6 +7170,8 @@ export class DaemonClient {
     this.providerSnapshotUpdates.clear();
 
     // Clear all pending waiters and queued sends since the connection was lost
+    this.networkFetchSupported = false;
+    this.networkFetches.disconnected();
     // and responses from the previous connection will never arrive.
     this.clearWaiters(new DaemonConnectionError(reason ?? "Connection lost"));
     this.rejectPendingSendQueue(new DaemonConnectionError(reason ?? "Connection lost"));
@@ -7113,10 +7316,28 @@ export class DaemonClient {
       );
     }
 
+    if (consumerMessage.type === "network.fetch.closed.update") {
+      if (
+        !this.networkFetches.closed(
+          consumerMessage.payload.subscriptionId,
+          consumerMessage.payload.reason,
+        )
+      ) {
+        this.disposeTransport(CLIENT_CLOSE_PROTOCOL_ERROR, "Unknown network fetch owner");
+        this.scheduleReconnect({
+          reason: "Unknown network fetch owner",
+          reasonCode: "protocol_error",
+        });
+      }
+    }
+
     if (consumerMessage.type === "status") {
       const serverInfo = parseServerInfoStatusPayload(consumerMessage.payload);
       if (serverInfo) {
         this.lastServerInfoMessage = serverInfo;
+        this.networkFetchSupported =
+          serverInfo.features?.networkFetch === true &&
+          serverInfo.features?.ownedSubscriptions === true;
         if (this.connectionState.status === "connecting") {
           this.resetConnectTimeout();
           this.reconnectAttempt = 0;

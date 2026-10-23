@@ -1,5 +1,10 @@
 import { decodeTunnelFrame, TunnelOpcode, type TunnelFrame } from "./tunnel.js";
 import {
+  decodeNetworkFetchFrame,
+  NetworkFetchOpcode,
+  type NetworkFetchBinaryFrame,
+} from "./network-fetch.js";
+import {
   decodeRemoteBrowserFrame,
   RemoteBrowserOpcode,
   type RemoteBrowserBinaryFrame,
@@ -16,6 +21,7 @@ import {
 } from "./terminal.js";
 
 export type BinaryFrame =
+  | { kind: "network_fetch"; frame: NetworkFetchBinaryFrame }
   | { kind: "terminal"; frame: TerminalStreamFrame }
   | { kind: "file_transfer"; frame: FileTransferFrame }
   | { kind: "tunnel"; frame: TunnelFrame }
@@ -23,6 +29,17 @@ export type BinaryFrame =
 
 export function decodeBinaryFrame(bytes: Uint8Array): BinaryFrame | null {
   switch (bytes[0]) {
+    case NetworkFetchOpcode.Request:
+    case NetworkFetchOpcode.Body:
+    case NetworkFetchOpcode.End:
+    case NetworkFetchOpcode.Cancel:
+    case NetworkFetchOpcode.Credit:
+    case NetworkFetchOpcode.Head:
+    case NetworkFetchOpcode.Fail:
+    case NetworkFetchOpcode.Cancelled: {
+      const frame = decodeNetworkFetchFrame(bytes);
+      return frame ? { kind: "network_fetch", frame } : null;
+    }
     case TerminalStreamOpcode.Output:
     case TerminalStreamOpcode.Input:
     case TerminalStreamOpcode.Resize:

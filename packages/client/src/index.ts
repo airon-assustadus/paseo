@@ -1,4 +1,21 @@
 export { NetworkTunnelError, NetworkTunnelRpcError } from "./network-tunnel.js";
+export { NetworkFetchRpcError, NetworkFetchOpcode } from "./network-fetch.js";
+export type {
+  NetworkFetch,
+  NetworkFetchOpenOptions,
+  NetworkFetchSendFrame,
+  NetworkFetchEnd,
+  NetworkFetchDescriptor,
+  NetworkFetchScope,
+  NetworkFetchLimits,
+  NetworkFetchReconciliation,
+  NetworkFetchCleanupPending,
+  NetworkFetchClientFrame,
+  NetworkFetchServerFrame,
+  NetworkFetchRequestMetadata,
+  NetworkFetchResponseHead,
+  NetworkFetchFailure,
+} from "./network-fetch.js";
 export type {
   NetworkTunnel,
   NetworkTunnelLimits,
@@ -506,6 +523,11 @@ export interface PaseoConfigActions {
 }
 
 export interface PaseoApi {
+  isNetworkFetchSupported: DaemonClient["isNetworkFetchSupported"];
+  resolveNetworkFetchDestination: DaemonClient["resolveNetworkFetchDestination"];
+  reconcileNetworkFetchDestination: DaemonClient["reconcileNetworkFetchDestination"];
+  requestNetworkFetchCleanup: DaemonClient["requestNetworkFetchCleanup"];
+  openNetworkFetch: DaemonClient["openNetworkFetch"];
   dispose(): Promise<void>;
   observeEvents: DaemonClient["observeEvents"];
   readonly terminals: PaseoTerminalActions;
@@ -718,6 +740,31 @@ export function createPaseoApi(
   return {
     dispose,
     observeEvents,
+    isNetworkFetchSupported: () =>
+      !lifetime.signal.aborted && daemonClient.isNetworkFetchSupported(),
+    resolveNetworkFetchDestination: (scope) => {
+      if (lifetime.signal.aborted) throw new Error("Paseo API is disposed");
+      return daemonClient.resolveNetworkFetchDestination(scope);
+    },
+    reconcileNetworkFetchDestination: (input) => {
+      if (lifetime.signal.aborted) throw new Error("Paseo API is disposed");
+      return daemonClient.reconcileNetworkFetchDestination(input);
+    },
+    requestNetworkFetchCleanup: (input) => {
+      if (lifetime.signal.aborted) throw new Error("Paseo API is disposed");
+      return daemonClient.requestNetworkFetchCleanup(input);
+    },
+    openNetworkFetch: async (options) => {
+      if (lifetime.signal.aborted) throw new Error("Paseo API is disposed");
+      const handle = await daemonClient.openNetworkFetch(options);
+      if (lifetime.signal.aborted) {
+        await handle.close();
+        throw new Error("Paseo API is disposed");
+      }
+      const resource = own(() => ({ release: () => handle.close() }));
+      handle.onEnd(() => handles.delete(resource));
+      return handle;
+    },
     terminals,
     projects: {
       list: (options) => daemonClient.listProjects(options),

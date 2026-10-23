@@ -15,6 +15,12 @@ import {
   type RemoteBrowserFrame,
 } from "./daemon-client";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import { NETWORK_FETCH_LIMITS } from "@getpaseo/protocol/network-fetch/rpc-schemas";
+import { createPaseoApi } from "./index.js";
+import {
+  NetworkFetchOpcode, encodeNetworkFetchFrame, decodeNetworkFetchFrame,
+  type NetworkFetchRequestMetadata,
+} from "@getpaseo/protocol/binary-frames/index";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
   decodeRemoteBrowserFrame,
@@ -204,6 +210,166 @@ function respondToScheduleRequest(
 }
 
 const clients: DaemonClient[] = [];
+
+const fetchDescriptor = {
+  destinationId: "a".repeat(52), origin: "https://destination.test", pathPrefix: "/",
+  allowlistRevision: 1, authorityEpoch: "7", cleanupRequiredEpoch: null,
+  contentOrigin: `https://${"a".repeat(52)}.content.test`, assetVersion: "v1",
+};
+const fetchOpenOptions = {
+  destinationId: fetchDescriptor.destinationId, expectedAuthorityEpoch: "7", allowlistRevision: 1,
+  scope: { origin: fetchDescriptor.origin, pathPrefix: "/" }, ttlMs: 1000,
+};
+const fetchRequest: NetworkFetchRequestMetadata = {
+  method: "POST", url: "https://destination.test/action", headers: [], redirect: "manual",
+  body: { kind: "stream", length: 3 },
+};
+async function openFetch(client: DaemonClient, transport: ReturnType<typeof createMockTransport>, afterReply?: () => void) {
+  const opening = client.openNetworkFetch(fetchOpenOptions);
+  const request = parseSentFrame(transport.sent.at(-1));
+  transport.triggerMessage(wrapSessionMessage({
+    type: "network.fetch.open.response",
+    payload: { requestId: request.requestId, ok: true, subscriptionId: "fetch-owner", descriptor: fetchDescriptor, limits: NETWORK_FETCH_LIMITS },
+  }));
+  afterReply?.();
+  return opening;
+}
+test.each([{}, { networkFetch: true }, { ownedSubscriptions: true }, { ownedSubscriptions: true, networkFetch: false }])("network fetch refuses absent feature or owned support %j", async (features) => {
+  const { client, transport, connecting } = createTunnelClient(features);
+  await connecting;
+  expect(client.isNetworkFetchSupported()).toBe(false);
+  await expect(client.openNetworkFetch(fetchOpenOptions)).rejects.toMatchObject({ code: "unsupported_capability" });
+  await expect(client.requestNetworkFetchCleanup({ destinationId: fetchDescriptor.destinationId, expectedAuthorityEpoch: "7" })).rejects.toMatchObject({ code: "unsupported_capability" });
+  expect(transport.sent).toHaveLength(0);
+});
+test("network fetch captures closed in the same turn as open and replays its end", async () => {
+  const { client, transport, connecting } = createTunnelClient({ networkFetch: true, ownedSubscriptions: true });
+  await connecting;
+  const handle = await openFetch(client, transport, () => transport.triggerMessage(wrapSessionMessage({
+    type: "network.fetch.closed.update", payload: { subscriptionId: "fetch-owner", reason: "revoked" },
+  })));
+  const ended = vi.fn();
+  handle.onEnd(ended);
+  expect(handle.ended).toBe("revoked");
+  expect(ended).toHaveBeenCalledExactlyOnceWith("revoked");
+  await handle.close();
+  expect(transport.sent).toHaveLength(1);
+});
+test("network fetch cleanup needs no owner, preserves retry identity and exposes durability failure", async () => {
+  const { client, transport, connecting } = createTunnelClient({ networkFetch: true, ownedSubscriptions: true });
+  await connecting;
+  const input = { destinationId: fetchDescriptor.destinationId, expectedAuthorityEpoch: "7" };
+  for (const code of ["durability_unavailable", "epoch_conflict", "permission_denied"] as const) {
+    const pending = client.requestNetworkFetchCleanup(input);
+    const request = parseSentFrame(transport.sent.at(-1));
+    expect(request).toMatchObject({ type: "network.fetch.request_cleanup.request", ...input });
+    expect(request).not.toHaveProperty("subscriptionId");
+    transport.triggerMessage(wrapSessionMessage({ type: "network.fetch.request_cleanup.response", payload: { requestId: request.requestId, ok: false, error: { code, message: "sensitive upstream details" } } }));
+    await expect(pending).rejects.toMatchObject({ code, message: `Network fetch request_cleanup: ${code}` });
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const pending = client.requestNetworkFetchCleanup(input);
+    const request = parseSentFrame(transport.sent.at(-1));
+    transport.triggerMessage(wrapSessionMessage({ type: "network.fetch.request_cleanup.response", payload: { requestId: request.requestId, ok: true, destinationId: input.destinationId, authorityEpoch: "8", cleanupRequiredEpoch: "8", status: "cleanup_pending" } }));
+    expect(await pending).toEqual({ destinationId: input.destinationId, authorityEpoch: "8", cleanupRequiredEpoch: "8", status: "cleanup_pending" });
+  }
+});
+test("network fetch resolve and reconcile use correlated authoritative descriptors", async () => {
+  const { client, transport, connecting } = createTunnelClient({ networkFetch: true, ownedSubscriptions: true });
+  await connecting;
+  const resolve = client.resolveNetworkFetchDestination(fetchOpenOptions.scope);
+  const resolveRequest = parseSentFrame(transport.sent.at(-1));
+  transport.triggerMessage(wrapSessionMessage({ type: "network.fetch.resolve_destination.response", payload: { requestId: resolveRequest.requestId, ok: true, descriptor: fetchDescriptor } }));
+  expect(await resolve).toEqual(fetchDescriptor);
+  const reconcile = client.reconcileNetworkFetchDestination({ destinationId: fetchDescriptor.destinationId, knownEpoch: "7" });
+  const request = parseSentFrame(transport.sent.at(-1));
+  const revoked = { ...fetchDescriptor, authorityEpoch: "8", cleanupRequiredEpoch: "8" };
+  transport.triggerMessage(wrapSessionMessage({ type: "network.fetch.reconcile_destination.response", payload: { requestId: request.requestId, ok: true, descriptor: revoked, state: "revoked", cleanupRequiredEpoch: "8" } }));
+  expect(await reconcile).toEqual({ descriptor: revoked, state: "revoked", cleanupRequiredEpoch: "8" });
+});
+test("network fetch preserves frame order and enforces credit, IDs and close idempotency", async () => {
+  const { client, transport, connecting } = createTunnelClient({ networkFetch: true, ownedSubscriptions: true });
+  await connecting;
+  const handle = await openFetch(client, transport);
+  const received: number[] = [];
+  handle.onFrame((frame) => received.push(frame.opcode));
+  handle.send({ opcode: NetworkFetchOpcode.Request, fetchId: 1, request: fetchRequest });
+  expect(() => handle.send({ opcode: NetworkFetchOpcode.Request, fetchId: 1, request: fetchRequest })).toThrow();
+  handle.send({ opcode: NetworkFetchOpcode.Body, fetchId: 1, data: new Uint8Array([1, 2, 3]) });
+  handle.send({ opcode: NetworkFetchOpcode.End, fetchId: 1 });
+  expect(() => handle.send({ opcode: NetworkFetchOpcode.Credit, fetchId: 1, bytes: 1 })).toThrow();
+  const head = { status: 200, statusText: "OK", headers: [] as [string, string][], url: fetchRequest.url, redirected: false, redirect: null, setCookieDropped: 0, droppedRequestHeaders: [] };
+  for (const frame of [
+    { opcode: NetworkFetchOpcode.Head, head },
+    { opcode: NetworkFetchOpcode.Body, data: new Uint8Array([4]) },
+  ]) transport.triggerMessage(encodeNetworkFetchFrame({ ...frame, subscriptionId: handle.subscriptionId, fetchId: 1 }));
+  handle.send({ opcode: NetworkFetchOpcode.Credit, fetchId: 1, bytes: 1 });
+  expect(decodeNetworkFetchFrame(assertUint8Array(transport.sent.at(-1)))).toMatchObject({ opcode: NetworkFetchOpcode.Credit, bytes: 1 });
+  transport.triggerMessage(encodeNetworkFetchFrame({ opcode: NetworkFetchOpcode.End, subscriptionId: handle.subscriptionId, fetchId: 1 }));
+  expect(received).toEqual([NetworkFetchOpcode.Head, NetworkFetchOpcode.Body, NetworkFetchOpcode.End]);
+  const closing = handle.close();
+  expect(handle.close()).toBe(closing);
+  expect(handle.ended).toBe("closed");
+  const request = parseSentFrame(transport.sent.at(-1));
+  expect(request.type).toBe("network.fetch.close.request");
+  transport.triggerMessage(wrapSessionMessage({ type: "network.fetch.close.response", payload: { requestId: request.requestId, ok: true, subscriptionId: handle.subscriptionId } }));
+  await closing;
+  expect(() => handle.send({ opcode: NetworkFetchOpcode.Request, fetchId: 2, request: fetchRequest })).toThrow();
+});
+test.each([
+  new Uint8Array([0x40, 0]),
+  encodeNetworkFetchFrame({ subscriptionId: "another-source", fetchId: 1, opcode: NetworkFetchOpcode.End }),
+  encodeNetworkFetchFrame({ subscriptionId: "fetch-owner", fetchId: 1, opcode: NetworkFetchOpcode.Request, request: fetchRequest }),
+])("network fetch rejects malformed, foreign owner and wrong direction frames", async (frame) => {
+  const { client, transport, connecting } = createTunnelClient({ networkFetch: true, ownedSubscriptions: true });
+  await connecting;
+  const handle = await openFetch(client, transport);
+  transport.triggerMessage(frame);
+  expect(handle.ended).toBe("channel_lost");
+  expect(client.isNetworkFetchSupported()).toBe(false);
+});
+test("network fetch disconnect loses pending cleanup and never replays POST on reconnect", async () => {
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let connection = 0;
+  const client = new DaemonClient({ url: "ws://test", clientId: "fetch", transportFactory: () => connection++ === 0 ? first.transport : second.transport, reconnect: { enabled: false } });
+  clients.push(client);
+  const connecting = client.connect();
+  first.triggerOpen({ features: { networkFetch: true, ownedSubscriptions: true } });
+  await connecting;
+  const handle = await openFetch(client, first);
+  handle.onFrame(() => {});
+  handle.send({ opcode: NetworkFetchOpcode.Request, fetchId: 1, request: fetchRequest });
+  const pending = client.requestNetworkFetchCleanup({ destinationId: fetchDescriptor.destinationId, expectedAuthorityEpoch: "7" });
+  const rejection = expect(pending).rejects.toMatchObject({ code: "channel_lost" });
+  first.triggerClose();
+  await rejection;
+  expect(handle.ended).toBe("channel_lost");
+  const reconnecting = client.connect();
+  second.triggerOpen({ features: { networkFetch: true, ownedSubscriptions: true } });
+  await reconnecting;
+  expect(second.sent).toHaveLength(0);
+  await handle.close();
+  expect(() => handle.send({ opcode: NetworkFetchOpcode.Body, fetchId: 1, data: new Uint8Array([1]) })).toThrow();
+  first.triggerMessage(encodeNetworkFetchFrame({ subscriptionId: "foreign-old-source", fetchId: 1, opcode: NetworkFetchOpcode.End }));
+  expect(client.getConnectionState().status).toBe("connected");
+});
+test("network fetch SDK facade releases its handle on dispose", async () => {
+  const { client, transport, connecting } = createTunnelClient({ networkFetch: true, ownedSubscriptions: true });
+  await connecting;
+  const api = createPaseoApi(client);
+  expect(api.isNetworkFetchSupported()).toBe(true);
+  const opening = api.openNetworkFetch(fetchOpenOptions);
+  const request = parseSentFrame(transport.sent.at(-1));
+  transport.triggerMessage(wrapSessionMessage({ type: "network.fetch.open.response", payload: { requestId: request.requestId, ok: true, subscriptionId: "fetch-owner", descriptor: fetchDescriptor, limits: NETWORK_FETCH_LIMITS } }));
+  const handle = await opening;
+  const disposed = api.dispose();
+  const close = parseSentFrame(transport.sent.at(-1));
+  transport.triggerMessage(wrapSessionMessage({ type: "network.fetch.close.response", payload: { requestId: close.requestId, ok: true, subscriptionId: "fetch-owner" } }));
+  await disposed;
+  expect(handle.ended).toBe("closed");
+  expect(api.isNetworkFetchSupported()).toBe(false);
+});
 
 afterEach(async () => {
   await Promise.all(clients.map((client) => client.close()));

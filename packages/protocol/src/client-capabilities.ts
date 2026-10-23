@@ -1,4 +1,5 @@
 export const CLIENT_CAPS = {
+  networkFetch: "network_fetch_v1",
   helloRejection: "hello_rejection",
   // COMPAT(ownedSubscriptions): added in v0.8.0, remove legacy ownership after 2027-03-09.
   ownedSubscriptions: "owned_subscriptions",
