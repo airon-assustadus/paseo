@@ -1,8 +1,12 @@
 import React, { type RefCallback } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { useWebOverlayRegistration } from "./overlay-root";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  hasActiveWebOverlay,
+  subscribeWebOverlayState,
+  useWebOverlayRegistration,
+} from "./overlay-root";
 
 function nextFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
@@ -36,6 +40,39 @@ describe("useWebOverlayRegistration in the browser", () => {
     document.body.replaceChildren();
   });
 
+  it("preserves canonical registration when an observer throws", () => {
+    const deferredErrors: Array<() => void> = [];
+    const microtasks = vi
+      .spyOn(globalThis, "queueMicrotask")
+      .mockImplementation((callback) => deferredErrors.push(callback));
+    const removeFault = subscribeWebOverlayState(() => {
+      throw new Error("overlay observer");
+    });
+    const observed = vi.fn();
+    const removeObserver = subscribeWebOverlayState(observed);
+    try {
+      flushSync(() => root.render(<OverlayHarness active showScope />));
+      expect(hasActiveWebOverlay()).toBe(true);
+      expect(observed).toHaveBeenCalled();
+      expect(
+        deferredErrors.some((callback) => {
+          try {
+            callback();
+            return false;
+          } catch {
+            return true;
+          }
+        }),
+      ).toBe(true);
+    } finally {
+      removeFault();
+      removeObserver();
+      microtasks.mockRestore();
+    }
+    flushSync(() => root.render(null));
+    expect(hasActiveWebOverlay()).toBe(false);
+  });
+
   async function renderHarness(active: boolean, showScope: boolean): Promise<void> {
     flushSync(() => {
       root.render(<OverlayHarness active={active} showScope={showScope} />);
@@ -66,5 +103,45 @@ describe("useWebOverlayRegistration in the browser", () => {
     await renderHarness(false, false);
 
     expect(openerFocusCalls).toBe(1);
+  });
+
+  it("publishes the interaction fence synchronously and stops notifying after unsubscribe", () => {
+    const seen: boolean[] = [];
+    const unsubscribe = subscribeWebOverlayState(() => seen.push(hasActiveWebOverlay()));
+    flushSync(() => root.render(<OverlayHarness active showScope />));
+    expect(seen.at(-1)).toBe(true);
+    flushSync(() => root.render(<OverlayHarness active={false} showScope />));
+    expect(seen.at(-1)).toBe(false);
+    unsubscribe();
+    unsubscribe();
+    const count = seen.length;
+    flushSync(() => root.render(<OverlayHarness active showScope />));
+    expect(seen).toHaveLength(count);
+  });
+
+  it("keeps the fence while a nested registered overlay remains", () => {
+    const seen: boolean[] = [];
+    const unsubscribe = subscribeWebOverlayState(() => seen.push(hasActiveWebOverlay()));
+    flushSync(() =>
+      root.render(
+        <>
+          <OverlayHarness active showScope />
+          <OverlayHarness active showScope />
+        </>,
+      ),
+    );
+    expect(seen.at(-1)).toBe(true);
+    flushSync(() =>
+      root.render(
+        <>
+          <OverlayHarness active={false} showScope />
+          <OverlayHarness active showScope />
+        </>,
+      ),
+    );
+    expect(seen.at(-1)).toBe(true);
+    flushSync(() => root.render(null));
+    expect(seen.at(-1)).toBe(false);
+    unsubscribe();
   });
 });

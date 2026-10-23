@@ -24,6 +24,7 @@ import { AppearanceProvider } from "@/appearance/provider";
 import { CommandCenter } from "@/command-center/command-center";
 import { CommandCenterRootActions } from "@/command-center/root-registration";
 import { CommandCenterProvider } from "@/command-center/provider";
+import { ResidentDomProxyProvider } from "@/desktop/browser/resident-dom-proxy/provider";
 import { CommandCenterWorkspaceActions } from "@/command-center/workspace-registration";
 import { PluginCommandCenterActions } from "@/plugins/command-center/registration";
 import { AddProjectFlowHost } from "@/components/add-project-flow-host";
@@ -625,7 +626,11 @@ function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppCon
     surface
   );
 
-  return <CommandCenterProvider>{content}</CommandCenterProvider>;
+  return (
+    <CommandCenterProvider>
+      <ResidentDomProxyProvider>{content}</ResidentDomProxyProvider>
+    </CommandCenterProvider>
+  );
 }
 
 function SidebarChrome({

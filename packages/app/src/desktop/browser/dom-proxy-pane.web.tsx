@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { View } from "react-native";
 import { useTranslation } from "react-i18next";
 import { StyleSheet } from "react-native-unistyles";
@@ -10,7 +18,7 @@ import { useRetainedPanelActive } from "@/components/retained-panel";
 import { isWeb } from "@/constants/platform";
 import { useHostRuntimeClient } from "@/runtime/host-runtime";
 import { UrlForm } from "@/remote-browser/url-form";
-import { createWebProxyProductController } from "@/web-proxy/product-controller.web";
+import { useResidentDomProxy } from "./resident-dom-proxy/provider.web";
 import type { WebProxyProductController, WebProxyProductSnapshot } from "@/web-proxy/product-types";
 import { normalizeWorkspaceBrowserUrl, useBrowserStore } from "./store";
 
@@ -66,25 +74,45 @@ function useProductController({
   serverId,
   workspaceId,
   configuration,
-}: DomProxyPaneProps) {
+  presented,
+  interactive,
+}: DomProxyPaneProps & { presented: boolean; interactive: boolean }) {
   const client = useHostRuntimeClient(serverId);
+  const registry = useResidentDomProxy();
   const [surface, setSurface] = useState<HTMLDivElement | null>(null);
   const [controller, setController] = useState<WebProxyProductController | null>(null);
-  useEffect(() => {
-    if (!isWeb || !client || !surface) return;
-    const next = createWebProxyProductController({
+  useLayoutEffect(() => {
+    if (!isWeb || !client || !surface || !registry) return;
+    const next = registry.bind({
       client,
-      container: surface,
       view: { serverId, workspaceId, browserId },
-      enabled: true,
       configuration,
     });
-    setController(next);
-    return () => {
-      next.closeView();
+    if (!next) {
       setController(null);
+      return;
+    }
+    const lease = next.attachPresentation({
+      anchor: surface,
+      presented,
+      interactive,
+      returnFocus: null,
+    });
+    setController(next.controller);
+    return () => {
+      lease.release();
     };
-  }, [browserId, client, configuration, serverId, surface, workspaceId]);
+  }, [
+    browserId,
+    client,
+    configuration,
+    serverId,
+    surface,
+    workspaceId,
+    registry,
+    presented,
+    interactive,
+  ]);
   const snapshot = useSyncExternalStore(
     controller?.subscribe ?? noSubscribe,
     () => controller?.getSnapshot() ?? emptySnapshot,
@@ -128,37 +156,23 @@ export function DomProxyPane({
   onFocusPane,
 }: DomProxyPaneProps) {
   const { t } = useTranslation();
-  const { client, surface, setSurface, controller, snapshot } = useProductController({
+  const presented = useRetainedPanelActive();
+  const interactive = isInteractive && presented;
+  const { client, setSurface, controller, snapshot } = useProductController({
     browserId,
     serverId,
     workspaceId,
     configuration,
+    presented,
+    interactive,
   });
-  const presented = useRetainedPanelActive();
-  const interactive = isInteractive && presented;
   const { actions, run, actionFailed } = useControllerActions(controller, interactive);
   const input = useRef<EditingTextInputHandle | null>(null);
   const initialUrl = useBrowserStore((state) => state.browsersById[browserId]?.url ?? "");
 
   useEffect(() => {
-    if (isWeb && surface) surface.inert = !interactive;
-  }, [interactive, surface]);
-
-  useEffect(() => {
     if (snapshot.url !== null) input.current?.replaceText(snapshot.url);
   }, [snapshot.url]);
-
-  useEffect(() => {
-    if (snapshot.url !== null) {
-      useBrowserStore.getState().updateBrowser(browserId, {
-        url: snapshot.url,
-        ...(snapshot.title !== null ? { title: snapshot.title } : {}),
-        canGoBack: snapshot.canGoBack,
-        canGoForward: snapshot.canGoForward,
-        isLoading: snapshot.phase === "opening",
-      });
-    }
-  }, [browserId, snapshot]);
 
   const canSubmit =
     interactive &&

@@ -719,6 +719,44 @@ function isSessionServerInfoUnchanged(input: {
   );
 }
 
+export interface WorkspaceRemoval {
+  serverId: string;
+  workspaceId: string;
+}
+
+const workspaceRemovalListeners = new Set<(removal: WorkspaceRemoval) => void>();
+const notifyingWorkspaceRemovals = new Set<string>();
+
+export function subscribeWorkspaceRemoval(
+  listener: (removal: WorkspaceRemoval) => void,
+): () => void {
+  workspaceRemovalListeners.add(listener);
+  return () => {
+    workspaceRemovalListeners.delete(listener);
+  };
+}
+
+function notifyWorkspaceRemoval(removal: WorkspaceRemoval): void {
+  const key = JSON.stringify([removal.serverId, removal.workspaceId]);
+  if (notifyingWorkspaceRemovals.has(key)) return;
+  notifyingWorkspaceRemovals.add(key);
+  try {
+    for (const listener of Array.from(workspaceRemovalListeners)) {
+      if (!workspaceRemovalListeners.has(listener)) continue;
+      try {
+        listener(removal);
+      } catch (error) {
+        // A presentation observer cannot prevent the canonical removal.
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    }
+  } finally {
+    notifyingWorkspaceRemovals.delete(key);
+  }
+}
+
 export const useSessionStore = create<SessionStore>()(
   subscribeWithSelector((set, get) => {
     const commitActivityUpdates: AgentLastActivityCommitter = (updates) => {
@@ -1696,6 +1734,12 @@ export const useSessionStore = create<SessionStore>()(
       },
 
       removeWorkspace: (serverId, workspaceId) => {
+        const workspaces = get().sessions[serverId]?.workspaces;
+        const key = resolveWorkspaceMapKeyByIdentity({ workspaces, workspaceId });
+        const workspace = key ? workspaces?.get(key) : undefined;
+        if (workspace) {
+          notifyWorkspaceRemoval({ serverId, workspaceId: workspace.id });
+        }
         set((prev) => {
           const session = prev.sessions[serverId];
           const workspaceKey = resolveWorkspaceMapKeyByIdentity({

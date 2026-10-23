@@ -92,6 +92,7 @@ interface WebOverlayEntry {
 }
 
 const webOverlayEntries: WebOverlayEntry[] = [];
+const webOverlayStateListeners = new Set<() => void>();
 let webOverlayOrder = 0;
 let webOverlayListenersAttached = false;
 let webOverlayFocusCheckQueued = false;
@@ -110,6 +111,27 @@ function getTopWebOverlay(): WebOverlayEntry | undefined {
 
 export function hasActiveWebOverlay(): boolean {
   return getTopWebOverlay() !== undefined;
+}
+
+export function subscribeWebOverlayState(listener: () => void): () => void {
+  webOverlayStateListeners.add(listener);
+  return () => {
+    webOverlayStateListeners.delete(listener);
+  };
+}
+
+function publishWebOverlayState(): void {
+  for (const listener of Array.from(webOverlayStateListeners)) {
+    if (!webOverlayStateListeners.has(listener)) continue;
+    try {
+      listener();
+    } catch (error) {
+      // An observer cannot prevent another surface from becoming inert.
+      queueMicrotask(() => {
+        throw error;
+      });
+    }
+  }
 }
 
 function getFocusableElements(scope: HTMLElement): HTMLElement[] {
@@ -214,6 +236,7 @@ function detachWebOverlayListeners(): void {
 function addWebOverlay(entry: WebOverlayEntry): (options?: RemoveWebOverlayOptions) => void {
   webOverlayEntries.push(entry);
   attachWebOverlayListeners();
+  publishWebOverlayState();
 
   const focusFrame = window.requestAnimationFrame(() => {
     const scope = entry.getScope();
@@ -230,7 +253,10 @@ function addWebOverlay(entry: WebOverlayEntry): (options?: RemoveWebOverlayOptio
   return (options) => {
     window.cancelAnimationFrame(focusFrame);
     const index = webOverlayEntries.findIndex((candidate) => candidate.id === entry.id);
-    if (index !== -1) webOverlayEntries.splice(index, 1);
+    if (index !== -1) {
+      webOverlayEntries.splice(index, 1);
+      publishWebOverlayState();
+    }
     detachWebOverlayListeners();
     if (
       entry.manageFocus &&
