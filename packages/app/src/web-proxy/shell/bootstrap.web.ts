@@ -23,6 +23,7 @@ import {
 import { parseNavigationToShell, type NavigationQueryMessage } from "../navigation-messages";
 import { parseShellNavigationReady } from "./navigation-binding";
 import { createShellNavigation } from "./navigation.web";
+import { enterProductNavigation } from "./navigation-entry.web";
 import {
   isResync,
   parseLifecycleArmed,
@@ -214,31 +215,33 @@ function startRelay(input: {
           },
         });
 
-  async function prepareNavigationEntry(target: string): Promise<boolean> {
-    if (sessionPort === null || current.state !== "live") return false;
-    const ctx = current;
-    const ticket = createTicket();
-    const reply = nextReply();
-    sessionPort.postMessage(
-      {
-        type: "paseo.shell.navigation.ticket.prepare",
-        v: 1,
-        ticket,
-        target,
-      },
-      [],
-    );
-    const ready = await reply;
-    if (
-      ctx !== current ||
-      ctx.state !== "live" ||
-      ready?.type !== "paseo.shell.ticket.ready" ||
-      ready.ticket !== ticket
-    )
+  async function prepareNavigationEntry(
+    target: string,
+    authority: { signal: AbortSignal; isCurrent(): boolean },
+  ): Promise<boolean> {
+    if (sessionPort === null || current.state !== "live" || !navigationReadyForBinding)
       return false;
-    appFrame.referrerPolicy = "no-referrer";
-    appFrame.src = `${options.enterPath}?t=${ticket}`;
-    return true;
+    const ctx = current;
+    const port = sessionPort;
+    const worker = binding;
+    const bindingAttempt = navigationAttempt;
+    return enterProductNavigation({
+      frame: appFrame,
+      port,
+      target,
+      ticket: createTicket(),
+      enterPath: options.enterPath,
+      timeoutMs: options.sessionReplyTimeoutMs,
+      signal: authority.signal,
+      isCurrent: () =>
+        authority.isCurrent() &&
+        ctx === current &&
+        ctx.state === "live" &&
+        port === sessionPort &&
+        worker === binding &&
+        bindingAttempt === navigationAttempt &&
+        navigationReadyForBinding,
+    });
   }
 
   function negotiateNavigation(): void {
@@ -483,6 +486,7 @@ function startRelay(input: {
     }
     const message = parseWorkerToBootstrapMessage(event.data);
     if (message === null) return;
+    if (options.navigation !== undefined && message.type === "paseo.shell.ticket.ready") return;
     if (message.type === "paseo.shell.admitted") {
       admitted = message.clientIds;
       if (!navigationReadyForBinding) negotiateNavigation();

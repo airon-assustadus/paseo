@@ -29,6 +29,7 @@ interface DocumentRecord {
 }
 
 interface Attempt {
+  abort: AbortController;
   kind: string | null;
   entryKey: string | null;
   operationId: number | null;
@@ -66,7 +67,7 @@ export function createShellNavigation(options: {
   origin: string;
   assetVersion: string;
   timeoutMs: number;
-  enter(target: string): Promise<boolean>;
+  enter(target: string, authority: { signal: AbortSignal; isCurrent(): boolean }): Promise<boolean>;
   send(message: NavigationToBrokerMessage): void;
 }) {
   const { frame } = options;
@@ -99,6 +100,7 @@ export function createShellNavigation(options: {
     if (current === null) return;
     clearTimeout(current.timer);
     attempt = null;
+    current.abort.abort();
     if (current.operationId !== null)
       outcome({ status: "failed", operationId: current.operationId, reason });
   }
@@ -228,6 +230,7 @@ export function createShellNavigation(options: {
     if (current === null) return;
     clearTimeout(current.timer);
     attempt = null;
+    current.abort.abort();
     if (current.operationId !== null)
       outcome({
         status: "committed",
@@ -296,6 +299,7 @@ export function createShellNavigation(options: {
 
   function startAttempt(operationId: number | null, url: string): Attempt {
     const started: Attempt = {
+      abort: new AbortController(),
       kind: null,
       entryKey: null,
       operationId,
@@ -404,7 +408,10 @@ export function createShellNavigation(options: {
     current.kind = message.command.kind;
     if (frame.contentDocument?.location.href === "about:blank") {
       if (
-        !(await options.enter(`${parsed.pathname}${parsed.search}${parsed.hash}`)) &&
+        !(await options.enter(`${parsed.pathname}${parsed.search}${parsed.hash}`, {
+          signal: current.abort.signal,
+          isCurrent: () => active && attempt === current && !current.abort.signal.aborted,
+        })) &&
         attempt === current
       )
         finish("unsupported");

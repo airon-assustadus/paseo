@@ -78,7 +78,7 @@ it("observes real Documents and history with admission signals supplied at the o
         navigation.request({ type: "paseo.web.request", v: 1, generation: 1, requestId, method: "GET", path, headers: [], body: null, mode: "navigate" });
         navigation.response({ type: "paseo.web.response.head", v: 1, generation: 1, requestId, status: 200, statusText: "OK", headers: [] });
         navigation.response({ type: "paseo.web.response.end", v: 1, generation: 1, requestId });
-      }, stop: () => navigation.dispose() };
+      }, fence: () => { navigation.deactivate(); navigation.activate({ generation: 2, shellInstance: "runtime-next" }); }, stop: () => navigation.dispose() };
     `;
     const bundle = await build({
       stdin: { contents: source, loader: "ts", resolveDir: dirname(sourcePath) },
@@ -156,10 +156,47 @@ it("observes real Documents and history with admission signals supplied at the o
       back.outcome.commit.kind === "bfcache"
     )
       expect(requests).toHaveLength(beforeBack);
-    const hash = await command("navigate", "/a?initial=1#section");
+    const forward = await command("forward");
+    expect(forward).toMatchObject({ outcome: { status: "committed" } });
+    expect(await page.frames()[1]?.locator("#page").textContent()).toBe("/b");
+    await page.frames()[1]?.evaluate(() => {
+      document.title = "Live document title";
+      history.pushState(null, "", "/b?state=1");
+    });
+    await page.waitForFunction(() =>
+      (
+        window as unknown as { runtime: { messages: NavigationToBrokerMessage[] } }
+      ).runtime.messages.some(
+        (message) =>
+          message.type === "paseo.web.navigation.state" &&
+          message.state.title === "Live document title" &&
+          message.state.url.endsWith("/b?state=1") &&
+          message.state.commit.kind === "same_document",
+      ),
+    );
+    const hash = await command("navigate", "/b?state=1#section");
     expect(hash).toMatchObject({
       outcome: { status: "committed", commit: { kind: "same_document" } },
     });
+    const beforeFence = requests.length;
+    await page.evaluate(() =>
+      (window as unknown as { runtime: { fence(): void } }).runtime.fence(),
+    );
+    await page.frames()[1]?.evaluate(() => {
+      document.title = "Old grant document";
+      history.pushState(null, "", "/b?old-grant=1");
+    });
+    await page.waitForTimeout(150);
+    expect(
+      await page.evaluate(() =>
+        (
+          window as unknown as { runtime: { messages: NavigationToBrokerMessage[] } }
+        ).runtime.messages
+          .filter((message) => message.generation === 2)
+          .map((message) => message.type),
+      ),
+    ).toEqual(["paseo.web.navigation.ready"]);
+    expect(requests).toHaveLength(beforeFence);
     await page.evaluate(() => (window as unknown as { runtime: { stop(): void } }).runtime.stop());
   } finally {
     await browser?.close();
