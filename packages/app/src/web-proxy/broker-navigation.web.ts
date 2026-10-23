@@ -8,7 +8,7 @@ import {
   type NavigationToShellMessage,
 } from "./navigation-messages";
 import { resolveDestinationUrl, type WebProxyCapability } from "./request-policy";
-import type { RequestMessage } from "./bridge-messages";
+import type { PortSessionAdmission } from "./port-session.web";
 
 export interface WebProxyNavigationSnapshot {
   ready: boolean;
@@ -163,15 +163,13 @@ export function createBrokerNavigation(options: {
     });
   }
 
-  function observeRequest(request: RequestMessage): void {
-    if (send === null || request.generation !== generation || request.mode !== "navigate") return;
-    const resolved = resolveDestinationUrl(options.capability, request.path);
-    if (resolved.kind !== "ok") return;
-    requestWatermark = Math.max(requestWatermark, request.requestId);
-    requests.set(
-      request.requestId,
-      `${options.capability.contentOrigin}${resolved.url.pathname}${resolved.url.search}`,
-    );
+  function observeAdmission(admission: PortSessionAdmission): void {
+    if (send === null || admission.generation !== generation || admission.mode !== "navigate")
+      return;
+    const url = contentUrl(admission.url, false);
+    if (url === null) return;
+    requestWatermark = Math.max(requestWatermark, admission.requestId);
+    requests.set(admission.requestId, url.split("#")[0]);
     if (requests.size > 128) requests.delete(requests.keys().next().value!);
   }
 
@@ -237,5 +235,5 @@ export function createBrokerNavigation(options: {
     return true;
   }
 
-  return { activate, reset, run, receive, observeRequest, getSnapshot };
+  return { activate, reset, run, receive, observeAdmission, getSnapshot };
 }

@@ -36,15 +36,10 @@ function harness() {
     });
   }
   function observe(requestId = 1, path = "/allowed/page") {
-    navigation.observeRequest({
-      type: "paseo.web.request",
-      v: 1,
+    navigation.observeAdmission({
       generation: 1,
       requestId,
-      method: "GET",
-      path,
-      headers: [],
-      body: null,
+      url: `${capability.destinationOrigin}${path}`,
       mode: "navigate",
     });
   }

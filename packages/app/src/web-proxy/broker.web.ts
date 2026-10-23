@@ -3,7 +3,6 @@ import {
   PURGE_DEADLINE_MS,
   createLifecycleToken,
   parseHello,
-  parseContentMessage,
   parseLifecycleToBroker,
   parseResumed,
   validateBridgeLimits,
@@ -367,17 +366,16 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     transport: WebProxyTransport;
   }): PortSession {
     const { generation } = input;
-    input.port.addEventListener("message", (event) => {
-      const message = parseContentMessage(event.data, limits);
-      if (message?.type === "paseo.web.request" && state.status === "granted")
-        navigation.observeRequest(message);
-    });
     const started = startPortSession({
       port: input.port,
       generation,
       capability,
       limits,
       transport: input.transport,
+      onRequestAdmitted: (admission) => {
+        if (session === started && state.status === "granted")
+          navigation.observeAdmission(admission);
+      },
       onRevoked: (reason) => {
         // Revocations started by the session itself (protocol errors) end the generation too.
         if (session !== started) return;

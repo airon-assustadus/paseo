@@ -22,6 +22,13 @@ import {
   type WebProxyTransportResponse,
 } from "./transport";
 
+export interface PortSessionAdmission {
+  readonly requestId: number;
+  readonly generation: number;
+  readonly url: string;
+  readonly mode: BridgeRequestMode;
+}
+
 export interface PortSessionOptions {
   port: MessagePort;
   generation: number;
@@ -30,6 +37,7 @@ export interface PortSessionOptions {
   transport: WebProxyTransport;
   onRevoked(reason: BridgeRevokeReason): void;
   onRedirectBlocked(requestUrl: string): void;
+  onRequestAdmitted?(admission: PortSessionAdmission): void;
   // What the content port closing means. The broker owns the answer: the current generation
   // ends the view, a generation it is already replacing is only dropped. Default: terminal.
   closePolicy?(): "terminal" | "discard";
@@ -238,6 +246,18 @@ export function startPortSession(options: PortSessionOptions): PortSession {
 
   async function serve(message: RequestMessage, url: URL, entry: InFlightRequest): Promise<void> {
     try {
+      options.onRequestAdmitted?.({
+        requestId: message.requestId,
+        generation,
+        url: url.href,
+        mode: message.mode,
+      });
+      if (
+        phase !== "serving" ||
+        entry.abort.signal.aborted ||
+        inFlight.get(message.requestId) !== entry
+      )
+        return;
       const response = await transport.request(
         {
           url: url.href,
@@ -305,6 +325,7 @@ export function startPortSession(options: PortSessionOptions): PortSession {
   }
 
   function onMessage(event: MessageEvent): void {
+    if (phase === "closed") return;
     const message = parseContentMessage(event.data, limits);
     if (message === null || message.generation !== generation) {
       violate();
