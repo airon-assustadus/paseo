@@ -6,6 +6,7 @@ import {
 } from "@getpaseo/protocol/network-fetch/rpc-schemas";
 import { NetworkFetchRegistry } from "../../../client/src/network-fetch";
 import { createDaemonFetchChannel } from "./daemon-fetch-channel.web";
+import { openNetworkFetchTransport } from "./network-fetch-transport";
 
 const descriptor: NetworkFetchDescriptor = {
   destinationId: "a".repeat(52),
@@ -27,17 +28,17 @@ const request = {
   body: { kind: "none" },
 } as const;
 
-function setup() {
+function setup(limits = NETWORK_FETCH_LIMITS, listen = true) {
   const send = vi.fn();
   const close = vi.fn(async () => {});
   const wire = new NetworkFetchRegistry({ send, close, handlerError: vi.fn() });
-  const handle = wire.open({ subscriptionId: "owner", descriptor, limits: NETWORK_FETCH_LIMITS });
+  const handle = wire.open({ subscriptionId: "owner", descriptor, limits });
   const client = { openNetworkFetch: vi.fn(async () => handle) };
   const onError = vi.fn();
   const frame = vi.fn();
   const lost = vi.fn();
   const channel = createDaemonFetchChannel({ client, descriptor, onError });
-  channel.listen({ frame, lost });
+  if (listen) channel.listen({ frame, lost });
   async function open(): Promise<void> {
     channel.send({
       type: "session.open",
@@ -51,6 +52,117 @@ function setup() {
 }
 
 describe("daemon fetch channel", () => {
+  it.each([NetworkFetchOpcode.End, NetworkFetchOpcode.Fail])(
+    "settles stream cancellation on terminal %s and reuses the slot without replay",
+    async (opcode) => {
+      const context = setup({ ...NETWORK_FETCH_LIMITS, maxConcurrentRequests: 1 }, false);
+      const onClosed = vi.fn();
+      const transport = await openNetworkFetchTransport({
+        channel: context.channel,
+        capability: {
+          destinationOrigin: descriptor.origin,
+          contentOrigin: descriptor.contentOrigin,
+          pathPrefix: descriptor.pathPrefix,
+        },
+        ttlMs: 60_000,
+        limits: { maxConcurrentRequests: 1 },
+        onClosed,
+      });
+      try {
+        const input = {
+          ...request,
+          headers: [],
+          body: null,
+          initiator: {
+            boundOrigin: descriptor.origin,
+            generation: 1,
+            mode: "subresource" as const,
+          },
+        };
+        const first = transport.request(input, new AbortController().signal);
+        const head = {
+          status: 200,
+          statusText: "OK",
+          headers: [],
+          url: request.url,
+          redirected: false,
+          redirect: null,
+          setCookieDropped: 0,
+          droppedRequestHeaders: [],
+        };
+        expect(
+          context.wire.receive({
+            subscriptionId: "owner",
+            fetchId: 1,
+            opcode: NetworkFetchOpcode.Head,
+            head,
+          }),
+        ).toBe(true);
+        const response = await first;
+        expect(response.body).not.toBeNull();
+        const settled = vi.fn();
+        const cancelling = response.body!.getReader().cancel().then(settled);
+        await Promise.resolve();
+        expect(settled).not.toHaveBeenCalled();
+        expect(context.send).toHaveBeenCalledTimes(2);
+        await expect(transport.request(input, new AbortController().signal)).rejects.toMatchObject({
+          reason: "limit",
+        });
+        const terminal =
+          opcode === NetworkFetchOpcode.End
+            ? { subscriptionId: "owner", fetchId: 1, opcode }
+            : {
+                subscriptionId: "owner",
+                fetchId: 1,
+                opcode,
+                failure: { code: "upstream_error" as const, message: "Upstream failure" },
+              };
+        expect(context.wire.receive(terminal)).toBe(true);
+        await cancelling;
+        expect(settled).toHaveBeenCalledOnce();
+        const second = transport.request(input, new AbortController().signal);
+        expect(context.send).toHaveBeenCalledTimes(3);
+        expect(
+          context.wire.receive({
+            subscriptionId: "owner",
+            fetchId: 1,
+            opcode: NetworkFetchOpcode.Cancelled,
+            dnsPending: false,
+          }),
+        ).toBe(true);
+        expect(context.wire.receive(terminal)).toBe(true);
+        expect(
+          context.wire.receive({
+            subscriptionId: "owner",
+            fetchId: 2,
+            opcode: NetworkFetchOpcode.Head,
+            head,
+          }),
+        ).toBe(true);
+        expect(
+          context.wire.receive({
+            subscriptionId: "owner",
+            fetchId: 2,
+            opcode: NetworkFetchOpcode.End,
+          }),
+        ).toBe(true);
+        const next = await second;
+        await expect(next.body!.getReader().read()).resolves.toEqual({
+          done: true,
+          value: undefined,
+        });
+        expect(settled).toHaveBeenCalledOnce();
+        expect(context.send).toHaveBeenCalledTimes(3);
+        expect(context.client.openNetworkFetch).toHaveBeenCalledOnce();
+        expect(context.handle.ended).toBeNull();
+        expect(context.onError).not.toHaveBeenCalled();
+        expect(onClosed).not.toHaveBeenCalled();
+      } finally {
+        transport.close();
+      }
+    },
+  );
+
   it("opens with pinned identity and installs ordered SDK listeners before the first request", async () => {
     const context = setup();
     await context.open();
@@ -138,6 +250,7 @@ describe("daemon fetch channel", () => {
     context.wire.closed("owner", "revoked");
     await context.open();
     expect(context.frame.mock.calls).toEqual([[{ type: "closed", reason: "revoked" }]]);
+    expect(context.onError).toHaveBeenCalledExactlyOnceWith("cleanup_pending");
     expect(context.send).not.toHaveBeenCalled();
   });
 
