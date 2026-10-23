@@ -3,6 +3,7 @@ import {
   PURGE_DEADLINE_MS,
   createLifecycleToken,
   parseHello,
+  parseContentMessage,
   parseLifecycleToBroker,
   parseResumed,
   validateBridgeLimits,
@@ -18,6 +19,9 @@ import {
 import { startPortSession, type PortSession } from "./port-session.web";
 import { createCapability, type WebProxyCapability } from "./request-policy";
 import type { WebProxyTransport } from "./transport";
+import { createBrokerNavigation, type WebProxyNavigationSnapshot } from "./broker-navigation.web";
+import type { NavigationOutcome } from "./navigation-messages";
+export type { WebProxyNavigationSnapshot } from "./broker-navigation.web";
 
 export type WebProxyLifecycle = "negotiating" | "ready" | "unavailable";
 
@@ -93,6 +97,8 @@ export type WebProxyResumeResult =
   | { kind: "failed"; reason: WebProxyResumeFailure };
 
 export interface WebProxyBrokerOptions {
+  navigation?: { assetVersion: string; timeoutMs?: number };
+  onNavigationState?: (state: WebProxyNavigationSnapshot) => void;
   capability: WebProxyCapability;
   transport: WebProxyTransport;
   container: HTMLElement;
@@ -104,6 +110,11 @@ export interface WebProxyBrokerOptions {
 }
 
 export interface WebProxyBroker {
+  getNavigationState(): WebProxyNavigationSnapshot;
+  navigate(input: { url: string }): Promise<NavigationOutcome>;
+  reload(): Promise<NavigationOutcome>;
+  goBack(): Promise<NavigationOutcome>;
+  goForward(): Promise<NavigationOutcome>;
   // The frame of the current generation; null once the generation ended. Every generation gets
   // a fresh element, so no late event of a previous document can be mistaken for the next one.
   getFrame(): HTMLIFrameElement | null;
@@ -216,6 +227,12 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     suspended: 0,
   };
   const suspendedDropGenerations = new Set<number>();
+  const navigation = createBrokerNavigation({
+    capability,
+    assetVersion: options.navigation?.assetVersion ?? null,
+    timeoutMs: options.navigation?.timeoutMs ?? 30_000,
+    onState: (snapshot) => options.onNavigationState?.(snapshot),
+  });
 
   function setState(next: WebProxyBrokerState): void {
     state = next;
@@ -242,6 +259,7 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
   }
 
   function closeSidePort(): void {
+    navigation.reset();
     if (side === null) return;
     if (side.timer !== null) clearTimeout(side.timer);
     side.port.removeEventListener("message", onSideMessage);
@@ -300,6 +318,7 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
 
   // The seam the authoritative revocation reuses: authority ends, the frame stays.
   function fence(): void {
+    navigation.reset();
     session?.quiesce();
     if (frame !== null) frame.inert = true;
   }
@@ -348,6 +367,11 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     transport: WebProxyTransport;
   }): PortSession {
     const { generation } = input;
+    input.port.addEventListener("message", (event) => {
+      const message = parseContentMessage(event.data, limits);
+      if (message?.type === "paseo.web.request" && state.status === "granted")
+        navigation.observeRequest(message);
+    });
     const started = startPortSession({
       port: input.port,
       generation,
@@ -445,6 +469,7 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
       purgeQueryNonce = createLifecycleToken();
       sendToShell({ type: "paseo.web.purge.query", v: 1, nonce: purgeQueryNonce });
       lifecycle = "ready";
+      activateNavigation();
       publishLifecycle();
       return true;
     }
@@ -493,6 +518,7 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
 
   // The side port carries content from the content origin: a malformed message ends the view.
   function onSideMessage(event: MessageEvent): void {
+    if (event.ports.length === 0 && navigation.receive(event.data)) return;
     const message = parseLifecycleToBroker(event.data);
     if (message === null || event.ports.length > 0 || !acceptSideMessage(message)) violate();
   }
@@ -569,6 +595,7 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     }
     if (frame !== null) frame.inert = false;
     setState({ status: "granted", generation, ...lifecycleFields() });
+    activateNavigation();
     current.settle({ kind: "resumed", previous, generation, documentPreserved: documentKept });
   }
 
@@ -602,6 +629,7 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
       return Promise.resolve({ kind: "failed", reason: "not_suspended" });
     }
     const previous = state.generation;
+    navigation.reset();
     const generation = previous + 1;
     const channel = new MessageChannel();
     const settled = Promise.withResolvers<WebProxyResumeResult>();
@@ -722,10 +750,25 @@ export function attachWebProxyBroker(options: WebProxyBrokerOptions): WebProxyBr
     ownerWindow.removeEventListener("message", onWindowMessage);
   }
 
+  function activateNavigation(): void {
+    if (side === null || lifecycle !== "ready" || state.status !== "granted") return;
+    const port = side.port;
+    navigation.activate({
+      generation: state.generation,
+      shellInstance: side.offer,
+      send: (message) => port.postMessage(message),
+    });
+  }
+
   ownerWindow.addEventListener("message", onWindowMessage);
   navigate();
 
   return {
+    getNavigationState: navigation.getSnapshot,
+    navigate: ({ url }) => navigation.run({ kind: "navigate", url }),
+    reload: () => navigation.run({ kind: "reload" }),
+    goBack: () => navigation.run({ kind: "back" }),
+    goForward: () => navigation.run({ kind: "forward" }),
     getFrame: () => frame,
     getState: () => state,
     revoke: (reason) => revoke(reason),

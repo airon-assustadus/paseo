@@ -20,6 +20,9 @@ import {
   type ResumeMessage,
   type SuspendMessage,
 } from "../bridge-messages";
+import { parseNavigationToShell, type NavigationQueryMessage } from "../navigation-messages";
+import { parseShellNavigationReady } from "./navigation-binding";
+import { createShellNavigation } from "./navigation.web";
 import {
   isResync,
   parseLifecycleArmed,
@@ -51,6 +54,7 @@ export type ShellBootstrapStatus =
   | "revoked";
 
 export interface ShellBootstrapOptions {
+  navigation?: { assetVersion: string };
   window: Window;
   // A deploy constant. Never read from the URL: a hostile framer could name itself.
   controlOrigin: string;
@@ -190,6 +194,102 @@ function startRelay(input: {
   let reference: Document | null = null;
   const marks = new Map<number, NavigationMark>();
   let current = openContext(grant.generation, grant.limits, grant.port);
+  let navigationQuery: NavigationQueryMessage | null = null;
+  let navigationSequence = 0;
+  let navigationGeneration = 0;
+  let navigationAttempt = 0;
+  let navigationReadyForBinding = false;
+  const navigation =
+    options.navigation === undefined
+      ? null
+      : createShellNavigation({
+          frame: appFrame,
+          origin: options.window.location.origin,
+          assetVersion: options.navigation.assetVersion,
+          timeoutMs: 30_000,
+          enter: prepareNavigationEntry,
+          send: (message) => {
+            if (lifecycleConfirmed && current.state === "live" && purgeOp === null)
+              side?.postMessage(message, []);
+          },
+        });
+
+  async function prepareNavigationEntry(target: string): Promise<boolean> {
+    if (sessionPort === null || current.state !== "live") return false;
+    const ctx = current;
+    const ticket = createTicket();
+    const reply = nextReply();
+    sessionPort.postMessage(
+      {
+        type: "paseo.shell.navigation.ticket.prepare",
+        v: 1,
+        ticket,
+        target,
+      },
+      [],
+    );
+    const ready = await reply;
+    if (
+      ctx !== current ||
+      ctx.state !== "live" ||
+      ready?.type !== "paseo.shell.ticket.ready" ||
+      ready.ticket !== ticket
+    )
+      return false;
+    appFrame.referrerPolicy = "no-referrer";
+    appFrame.src = `${options.enterPath}?t=${ticket}`;
+    return true;
+  }
+
+  function negotiateNavigation(): void {
+    const query = navigationQuery;
+    const worker = binding;
+    if (
+      navigation === null ||
+      query === null ||
+      worker === null ||
+      !isSessionReady ||
+      !lifecycleConfirmed ||
+      current.state !== "live" ||
+      query.generation !== current.generation
+    )
+      return;
+    const attempt = ++navigationAttempt;
+    const ctx = current;
+    const nonce = createLifecycleToken();
+    const channel = new MessageChannel();
+    const timer = setTimeout(() => channel.port1.close(), options.sessionReplyTimeoutMs);
+    channel.port1.addEventListener(
+      "message",
+      (event) => {
+        clearTimeout(timer);
+        channel.port1.close();
+        const reply = parseShellNavigationReady(event.data);
+        if (
+          attempt !== navigationAttempt ||
+          ctx !== current ||
+          ctx.state !== "live" ||
+          binding !== worker
+        )
+          return;
+        if (
+          event.ports.length !== 0 ||
+          reply?.nonce !== nonce ||
+          !reply.supported ||
+          reply.assetVersion !== query.assetVersion
+        )
+          return;
+        navigationReadyForBinding = true;
+        navigation.activate({ generation: ctx.generation, shellInstance: query.shellInstance });
+      },
+      { once: true },
+    );
+    channel.port1.start();
+    worker.postMessage(
+      { type: "paseo.shell.navigation.query", v: 1, nonce, assetVersion: query.assetVersion },
+      [channel.port2],
+    );
+  }
 
   function openContext(generation: number, limits: BridgeLimits, port: MessagePort) {
     const ctx: GenerationContext = {
@@ -370,6 +470,7 @@ function startRelay(input: {
       return;
     }
     ctx.pending.set(requestId, { workerPort, mode: request.mode, headForwarded: false });
+    navigation?.request(request);
     listenToWorkerPort({ ctx, requestId, workerPort, mode: request.mode });
     toBroker(ctx, request, request.body === null ? [] : [request.body]);
   }
@@ -384,6 +485,7 @@ function startRelay(input: {
     if (message === null) return;
     if (message.type === "paseo.shell.admitted") {
       admitted = message.clientIds;
+      if (!navigationReadyForBinding) negotiateNavigation();
       return;
     }
     const resolve = awaitingReply;
@@ -398,6 +500,9 @@ function startRelay(input: {
   }
 
   function disarm(): void {
+    navigationReadyForBinding = false;
+    navigationAttempt += 1;
+    navigation?.deactivate();
     armAttempt += 1;
     setWorkerArmed(false);
   }
@@ -483,6 +588,7 @@ function startRelay(input: {
     disarm();
     watchBinding(source);
     arm();
+    negotiateNavigation();
   }
 
   async function openSession(worker: ServiceWorker): Promise<string | null> {
@@ -495,6 +601,10 @@ function startRelay(input: {
     if ((await reply)?.type !== "paseo.shell.session.ready" || sessionPort === null) return null;
     isSessionReady = true;
     arm();
+    if (options.navigation !== undefined) {
+      negotiateNavigation();
+      return "";
+    }
     const ticket = createTicket();
     const ticketReply = nextReply();
     const prepare: ShellTicketPrepareMessage = { type: "paseo.shell.ticket.prepare", ticket };
@@ -508,6 +618,8 @@ function startRelay(input: {
   function revoke(reason: BridgeRevokeReason): void {
     if (revokedReason !== null) return;
     revokedReason = reason;
+    navigationAttempt += 1;
+    navigation?.dispose();
     armAttempt += 1;
     const close: ShellSessionCloseMessage = { type: "paseo.shell.session.close" };
     sessionPort?.postMessage(close, []);
@@ -563,6 +675,7 @@ function startRelay(input: {
       return;
     }
     if (ctx.state === "suspended") noteLateHead(ctx, message);
+    if (ctx.state === "live") navigation?.response(message);
     const entry = ctx.pending.get(message.requestId);
     if (entry === undefined) return;
     noteNavigationResponse(ctx, message);
@@ -616,6 +729,8 @@ function startRelay(input: {
 
   // From here on every request is answered locally with the v1 primitives, never forwarded.
   function answerPendingLocally(ctx: GenerationContext): void {
+    navigationAttempt += 1;
+    navigation?.deactivate();
     ctx.state = "suspended";
     for (const [requestId, entry] of ctx.pending) {
       const isNavigationHead = entry.mode === "navigate" && !entry.headForwarded;
@@ -730,8 +845,39 @@ function startRelay(input: {
     toControl({ type: "paseo.web.purged", v: 1, op, localStorage, sessionStorage, ...worker });
   }
 
+  function onNavigationMessage(event: MessageEvent): boolean {
+    const navigationMessage = parseNavigationToShell(event.data);
+    if (navigationMessage !== null) {
+      if (
+        !lifecycleConfirmed ||
+        purgeOp !== null ||
+        current.state !== "live" ||
+        event.ports.length !== 0
+      )
+        return true;
+      if (
+        navigationMessage.generation !== current.generation ||
+        navigationMessage.shellInstance !== acceptedOffer?.offer
+      )
+        return true;
+      if (navigationGeneration !== current.generation) {
+        navigationGeneration = current.generation;
+        navigationSequence = 0;
+      }
+      if (navigationMessage.sequence <= navigationSequence) return true;
+      navigationSequence = navigationMessage.sequence;
+      if (navigationMessage.type === "paseo.web.navigation.query") {
+        if (navigationMessage.assetVersion !== options.navigation?.assetVersion) return true;
+        navigationQuery = navigationMessage;
+        negotiateNavigation();
+      } else void navigation?.command(navigationMessage);
+      return true;
+    }
+    return false;
+  }
+
   function onSideMessage(event: MessageEvent): void {
-    if (revokedReason !== null) return;
+    if (revokedReason !== null || onNavigationMessage(event)) return;
     const message = parseLifecycleToShell(event.data);
     if (message === null) return;
     if (message.type === "paseo.web.lifecycle.ready") {
@@ -802,7 +948,7 @@ export async function startShellBootstrap(options: ShellBootstrapOptions): Promi
     showStatus(doc, "session_refused");
     return;
   }
-  appFrame.src = `${options.enterPath}?t=${ticket}`;
+  if (options.navigation === undefined) appFrame.src = `${options.enterPath}?t=${ticket}`;
   doc.body.append(appFrame);
   showStatus(doc, "ready");
 }

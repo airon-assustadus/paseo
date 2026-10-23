@@ -19,6 +19,7 @@ import {
 import type { ShellDropCause, ShellFetchMessage, ShellRequestMessage } from "./relay-messages";
 
 export interface ShellWorkerConfig {
+  navigation?: { assetVersion: string };
   controlOrigin: string;
   // Served by the static shell host (bootstrap, worker). Checked before mountPath.
   shellPathPrefix: string;
@@ -268,6 +269,8 @@ function awaitResponse(input: {
     headers.append("content-security-policy", shellPolicy(config.controlOrigin));
     headers.set("x-dns-prefetch-control", "off");
     headers.set("origin-agent-cluster", "?1");
+    if (config.navigation !== undefined && input.mode === "navigate")
+      headers.set("cache-control", "no-store");
     const init = { status: message.status, statusText: message.statusText, headers };
     const hasNoBody = input.method === "HEAD" || NULL_BODY_STATUSES.has(message.status);
     if (hasNoBody) {
@@ -448,6 +451,7 @@ export function createShellWorker(input: {
   const { origin } = input;
   const binding = createClientBinding({
     config: {
+      navigation: config.navigation,
       origin,
       bootstrapPath: config.bootstrapPath,
       shellPathPrefix: config.shellPathPrefix,
@@ -469,11 +473,12 @@ export function createShellWorker(input: {
   async function enter(fetch: ShellFetchInput, url: URL): Promise<Response> {
     const isNestedNavigation =
       fetch.request.mode === "navigate" && fetch.request.destination !== "document";
-    const entered =
-      isNestedNavigation && (await binding.enter({ ...fetch, ticket: url.searchParams.get("t") }));
-    if (!entered) return failureResponse(403, "ticket_rejected");
+    const target = isNestedNavigation
+      ? await binding.enterTarget({ ...fetch, ticket: url.searchParams.get("t") })
+      : null;
+    if (target === null) return failureResponse(403, "ticket_rejected");
     // Same-origin redirect: the next hop keeps resultingClientId and finds its reservation.
-    return Response.redirect(`${origin}${config.mountPath}`, 302);
+    return Response.redirect(`${origin}${target}`, 302);
   }
 
   function respond(response: Promise<Response>): ShellFetchDecision {
@@ -560,7 +565,8 @@ export function installShellWorker(scope: unknown, config: ShellWorkerConfig): v
     },
     origin: scope.location.origin,
   });
-  scope.addEventListener("install", (event) => event.waitUntil(scope.skipWaiting()));
+  if (config.navigation === undefined)
+    scope.addEventListener("install", (event) => event.waitUntil(scope.skipWaiting()));
   scope.addEventListener("message", (event) => {
     const sourceId = event.source === null ? null : event.source.id;
     const waitUntil = (promise: Promise<unknown>) => event.waitUntil(promise);

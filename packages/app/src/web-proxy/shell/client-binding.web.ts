@@ -1,5 +1,10 @@
 import { PURGE_WORKER_BUDGET_MS } from "../bridge-messages";
 import {
+  parseShellNavigationQuery,
+  parseShellNavigationTicket,
+  type ShellNavigationQuery,
+} from "./navigation-binding";
+import {
   MAX_ADMITTED_CLIENTS,
   isSessionOpen,
   parseLifecycleArm,
@@ -45,6 +50,7 @@ export interface ShellClients {
 }
 
 export interface BindingConfig {
+  navigation?: { assetVersion: string };
   origin: string;
   bootstrapPath: string;
   shellPathPrefix: string;
@@ -113,6 +119,7 @@ export interface NavigationInput {
 }
 
 export interface ClientBinding {
+  enterTarget(input: NavigationInput & { ticket: string | null }): Promise<string | null>;
   handleMessage(input: ShellMessageInput): void;
   // Consumes a ticket and reserves resultingClientId for the next hop of this navigation.
   enter(input: NavigationInput & { ticket: string | null }): Promise<boolean>;
@@ -121,6 +128,8 @@ export interface ClientBinding {
 }
 
 interface Session {
+  navigation: boolean;
+  targets: Map<string, string>;
   bootstrapId: string;
   port: MessagePort;
   // clientId → admitted at
@@ -263,17 +272,32 @@ export function createClientBinding(input: {
 
   function onSessionMessage(session: Session, data: unknown): void {
     if (sessions.get(session.bootstrapId) !== session) return;
-    const message = parseSessionPortMessage(data);
+    const message = parseShellNavigationTicket(data) ?? parseSessionPortMessage(data);
     if (message === null || message.type === "paseo.shell.session.close") {
       dropSession(session);
       return;
     }
     expire(session.tickets);
+    for (const ticket of session.targets.keys())
+      if (!session.tickets.has(ticket)) session.targets.delete(ticket);
+    if (message.type === "paseo.shell.navigation.ticket.prepare") {
+      const target = new URL(message.target, config.origin);
+      if (
+        !session.navigation ||
+        target.origin !== config.origin ||
+        target.pathname.startsWith(config.shellPathPrefix)
+      ) {
+        send(session, { type: "paseo.shell.refused", reason: "protocol_error" });
+        return;
+      }
+    }
     if (session.tickets.size >= BINDING_LIMITS.maxTicketsPerSession) {
       send(session, { type: "paseo.shell.refused", reason: "ticket_limit" });
       return;
     }
     session.tickets.set(message.ticket, now() + config.ticketTtlMs);
+    if (message.type === "paseo.shell.navigation.ticket.prepare")
+      session.targets.set(message.ticket, message.target);
     send(session, { type: "paseo.shell.ticket.ready", ticket: message.ticket });
   }
 
@@ -292,6 +316,8 @@ export function createClientBinding(input: {
     const session: Session = {
       bootstrapId,
       port,
+      navigation: false,
+      targets: new Map(),
       admitted: new Map(),
       tickets: new Map(),
       entries: new Map(),
@@ -344,6 +370,8 @@ export function createClientBinding(input: {
     const session: Session = {
       bootstrapId,
       port: reply.port,
+      navigation: false,
+      targets: new Map(),
       admitted,
       tickets: new Map(),
       entries: new Map(),
@@ -486,10 +514,56 @@ export function createClientBinding(input: {
     return { kind: "route", port: session.port, armed: session.armed };
   }
 
+  async function enterTarget({
+    ticket,
+    clientId,
+    resultingClientId,
+  }: NavigationInput & { ticket: string | null }): Promise<string | null> {
+    if (ticket === null || clientId !== "" || resultingClientId === "") return null;
+    for (const session of sessions.values()) {
+      expire(session.tickets);
+      if (!session.tickets.delete(ticket)) continue;
+      const target = session.targets.get(ticket) ?? config.mountPath;
+      session.targets.delete(ticket);
+      if (!(await isLive(session))) return null;
+      expire(session.entries);
+      if (session.entries.size >= BINDING_LIMITS.maxTicketsPerSession) return null;
+      session.entries.set(resultingClientId, now() + config.ticketTtlMs);
+      return target;
+    }
+    return null;
+  }
+
+  async function negotiateNavigation(
+    sourceId: string,
+    query: ShellNavigationQuery,
+    port: MessagePort,
+  ): Promise<void> {
+    const session = sessions.get(sourceId);
+    const supported =
+      session !== undefined &&
+      (await isLive(session)) &&
+      config.navigation?.assetVersion === query.assetVersion;
+    if (session !== undefined) session.navigation = supported;
+    port.postMessage({
+      type: "paseo.shell.navigation.ready",
+      v: 1,
+      nonce: query.nonce,
+      assetVersion: query.assetVersion,
+      supported,
+    });
+    port.close();
+  }
+
   return {
     handleMessage({ data, sourceId, ports, waitUntil }) {
       const port = ports[0];
       if (sourceId === null || ports.length !== 1 || port === undefined) return;
+      const navigationQuery = parseShellNavigationQuery(data);
+      if (navigationQuery !== null) {
+        waitUntil(negotiateNavigation(sourceId, navigationQuery, port));
+        return;
+      }
       const purgeRequest = parseShellPurge(data);
       if (purgeRequest !== null) {
         // Called during the dispatch and bounded: past the budget the bootstrap stopped waiting, and
@@ -506,19 +580,8 @@ export function createClientBinding(input: {
       if (isSessionOpen(data)) void openSession(sourceId, port);
     },
 
-    async enter({ ticket, clientId, resultingClientId }) {
-      if (ticket === null || clientId !== "" || resultingClientId === "") return false;
-      for (const session of sessions.values()) {
-        expire(session.tickets);
-        if (!session.tickets.delete(ticket)) continue;
-        if (!(await isLive(session))) return false;
-        expire(session.entries);
-        if (session.entries.size >= BINDING_LIMITS.maxTicketsPerSession) return false;
-        session.entries.set(resultingClientId, now() + config.ticketTtlMs);
-        return true;
-      }
-      return false;
-    },
+    enterTarget,
+    enter: async (entry) => (await enterTarget(entry)) !== null,
 
     async routeNavigation({ clientId, resultingClientId }) {
       if (resultingClientId === "") return refused("client_not_admitted");
