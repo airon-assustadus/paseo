@@ -145,8 +145,11 @@ export function DomProxyPane({
   }, [interactive, surface]);
 
   useEffect(() => {
+    if (snapshot.url !== null) input.current?.replaceText(snapshot.url);
+  }, [snapshot.url]);
+
+  useEffect(() => {
     if (snapshot.url !== null) {
-      input.current?.replaceText(snapshot.url);
       useBrowserStore.getState().updateBrowser(browserId, {
         url: snapshot.url,
         ...(snapshot.title !== null ? { title: snapshot.title } : {}),
@@ -161,7 +164,10 @@ export function DomProxyPane({
     interactive &&
     controller !== null &&
     snapshot.phase !== "opening" &&
-    (snapshot.canNavigate || snapshot.phase === "closed" || snapshot.phase === "blocked");
+    (snapshot.canNavigate ||
+      snapshot.phase === "unavailable" ||
+      snapshot.phase === "closed" ||
+      snapshot.phase === "blocked");
   const submit = useCallback(() => {
     if (!canSubmit || !controller) return;
     const url = normalizeWorkspaceBrowserUrl(input.current?.getText() ?? initialUrl);

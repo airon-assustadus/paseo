@@ -55,7 +55,7 @@ const configuration: NetworkFetchConfiguration = {
 
 function fakeController() {
   let snapshot: WebProxyProductSnapshot = {
-    phase: "closed",
+    phase: "unavailable",
     url: null,
     title: null,
     canNavigate: false,
@@ -192,6 +192,11 @@ describe("workspace web proxy panel contract", () => {
     optIn();
     const view = renderPane();
     const control = controls[0];
+    expect(
+      view
+        .getByRole("button", { name: i18n.t("workspace.browser.controls.navigate") })
+        .getAttribute("aria-disabled"),
+    ).not.toBe("true");
     await userEvent.fill(view.getByTestId("dom-proxy-url"), "http://localhost:4321/requested");
     await userEvent.click(
       view.getByRole("button", { name: i18n.t("workspace.browser.controls.navigate") }),
@@ -246,5 +251,26 @@ describe("workspace web proxy panel contract", () => {
         .getAttribute("aria-disabled"),
     ).toBe("true");
     expect(controls[0].controller.closeView).not.toHaveBeenCalled();
+  });
+
+  it("preserves an address draft when only confirmed title or cleanup state changes", async () => {
+    optIn();
+    const view = renderPane();
+    const control = controls[0];
+    act(() => control.emit({ phase: "active", url: "https://before.example.test/" }));
+    const address = view.getByTestId("dom-proxy-url");
+    await userEvent.fill(address, "https://next.example.test/draft");
+    act(() =>
+      control.emit({
+        title: "New title",
+        cleanup: { status: "pending_local", requiredEpoch: "3" },
+      }),
+    );
+    expect(view.getByDisplayValue("https://next.example.test/draft")).toBeTruthy();
+    expect(useBrowserStore.getState().browsersById[browserId]?.title).toBe("New title");
+    expect(useBrowserStore.getState().browsersById[browserId]?.url).toBe(
+      "https://before.example.test/",
+    );
+    expect(control.controller.navigate).not.toHaveBeenCalled();
   });
 });
