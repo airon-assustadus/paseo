@@ -115,9 +115,32 @@ function setup() {
   const wire = new NetworkFetchRegistry({ send() {}, close: closeOwner, handlerError() {} });
   const container = document.createElement("div");
   document.body.appendChild(container);
+  const statusListeners = new Set<Parameters<WebProxyProductClient["subscribeRawMessages"]>[0]>();
+  const connectionListeners = new Set<
+    Parameters<WebProxyProductClient["subscribeConnectionStatus"]>[0]
+  >();
   const client = {
     isNetworkFetchSupported: vi.fn(() => true),
-    getConnectionState: vi.fn(() => ({ status: "connected" }) as const),
+    getConnectionState: vi.fn(
+      (): ReturnType<WebProxyProductClient["getConnectionState"]> => ({ status: "connected" }),
+    ),
+    subscribeRawMessages: vi.fn(
+      (listener: Parameters<WebProxyProductClient["subscribeRawMessages"]>[0]) => {
+        statusListeners.add(listener);
+        return () => {
+          statusListeners.delete(listener);
+        };
+      },
+    ),
+    subscribeConnectionStatus: vi.fn(
+      (listener: Parameters<WebProxyProductClient["subscribeConnectionStatus"]>[0]) => {
+        connectionListeners.add(listener);
+        listener(client.getConnectionState());
+        return () => {
+          connectionListeners.delete(listener);
+        };
+      },
+    ),
     getLastServerInfoMessage: vi.fn(
       (): ReturnType<WebProxyProductClient["getLastServerInfoMessage"]> =>
         ({
@@ -174,10 +197,245 @@ function setup() {
       request.addEventListener("error", () => reject(request.error));
     });
   });
-  return { client, options, controller, persistence, registry, wire, handles, closeOwner };
+  function emitServerInfo(): void {
+    const payload = client.getLastServerInfoMessage();
+    if (payload === null) throw new Error("Missing test server info");
+    for (const listener of statusListeners) listener({ type: "status", payload });
+  }
+  return {
+    client,
+    options,
+    controller,
+    persistence,
+    registry,
+    wire,
+    handles,
+    closeOwner,
+    emitServerInfo,
+    statusListeners,
+    connectionListeners,
+  };
+}
+
+function deferred<Value>() {
+  let resolve = (_value: Value) => {};
+  const promise = new Promise<Value>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+const authorityChanges = ["removed", "replaced", "unsupported"] as const;
+
+function changeAuthority(
+  context: ReturnType<typeof setup>,
+  change: (typeof authorityChanges)[number],
+): void {
+  if (change === "unsupported") context.client.isNetworkFetchSupported.mockReturnValue(false);
+  else
+    context.client.getLastServerInfoMessage.mockReturnValue({
+      status: "server_info",
+      serverId: "host",
+      hostname: null,
+      version: null,
+      ...(change === "replaced"
+        ? { networkFetchConfiguration: { ...configuration, assetVersion: "version-two" } }
+        : {}),
+    });
+}
+
+function restoreAuthority(context: ReturnType<typeof setup>): void {
+  context.client.isNetworkFetchSupported.mockReturnValue(true);
+  context.client.getLastServerInfoMessage.mockReturnValue({
+    status: "server_info",
+    serverId: "host",
+    hostname: null,
+    version: null,
+    networkFetchConfiguration: configuration,
+  });
+  context.emitServerInfo();
 }
 
 describe("product controller", () => {
+  it.each(authorityChanges)(
+    "invalidates admitted owner synchronously on %s authority before mounting",
+    async (change) => {
+      const context = setup();
+      const admitted = deferred<void>();
+      const release = deferred<void>();
+      const originalOpen = context.client.openNetworkFetch.getMockImplementation();
+      if (originalOpen === undefined) throw new Error("Missing test implementation");
+      context.client.openNetworkFetch.mockImplementation(async () => {
+        const handle = await originalOpen();
+        admitted.resolve();
+        await release.promise;
+        return handle;
+      });
+      const opening = context.controller.open("https://upstream.example/");
+      await admitted.promise;
+      changeAuthority(context, change);
+      context.emitServerInfo();
+      expect(context.controller.getSnapshot().phase).toBe("unavailable");
+      restoreAuthority(context);
+      release.resolve();
+      await opening;
+      expect(context.handles[0].ended).toBe("closed");
+      expect(attach).not.toHaveBeenCalled();
+      expect(context.controller.getSnapshot().phase).toBe("unavailable");
+    },
+  );
+
+  it.each(authorityChanges)(
+    "fences %s authority between mount and hello without waiting for UI teardown",
+    async (change) => {
+      const context = setup();
+      await context.controller.open("https://upstream.example/");
+      const retained = lastBroker;
+      changeAuthority(context, change);
+      context.emitServerInfo();
+      expect(retained.frame.inert).toBe(true);
+      expect(retained.dispose).toHaveBeenCalledOnce();
+      expect(context.handles[0].ended).toBe("closed");
+      expect(context.controller.getSnapshot().phase).toBe("unavailable");
+      restoreAuthority(context);
+      retained.activate();
+      expect(context.controller.getSnapshot().phase).toBe("unavailable");
+      expect(retained.purge).not.toHaveBeenCalled();
+      expect(context.client.requestNetworkFetchCleanup).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(authorityChanges)(
+    "invalidates %s authority while awaiting resume ACK and rejects late grant",
+    async (change) => {
+      const context = setup();
+      await context.controller.open("https://upstream.example/");
+      const retained = lastBroker;
+      retained.activate();
+      context.wire.closed(context.handles[0].subscriptionId, "expired");
+      const entered = deferred<void>();
+      const acknowledgement = deferred<Awaited<ReturnType<WebProxyBroker["resume"]>>>();
+      retained.instance.resume = vi.fn(() => {
+        entered.resolve();
+        return acknowledgement.promise;
+      });
+      const resuming = context.controller.resume();
+      await entered.promise;
+      changeAuthority(context, change);
+      context.emitServerInfo();
+      expect(retained.frame.inert).toBe(true);
+      expect(retained.dispose).toHaveBeenCalledOnce();
+      expect(context.handles[1].ended).toBe("closed");
+      expect(context.controller.getSnapshot().phase).toBe("unavailable");
+      restoreAuthority(context);
+      retained.activate();
+      acknowledgement.resolve({
+        kind: "resumed",
+        previous: 1,
+        generation: 2,
+        documentPreserved: true,
+      });
+      await resuming;
+      expect(retained.frame.inert).toBe(true);
+      expect(context.controller.getSnapshot().phase).toBe("unavailable");
+      expect(retained.purge).not.toHaveBeenCalled();
+    },
+  );
+
+  it("revalidates grant even before a status observer is notified", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    changeAuthority(context, "removed");
+    retained.activate();
+    expect(context.controller.getSnapshot().phase).toBe("unavailable");
+    expect(retained.frame.inert).toBe(true);
+    expect(retained.dispose).toHaveBeenCalledOnce();
+    expect(context.handles[0].ended).toBe("closed");
+  });
+
+  it("revalidates authenticated configuration after resume ACK before releasing inert", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    retained.activate();
+    context.wire.closed(context.handles[0].subscriptionId, "expired");
+    retained.instance.resume = vi.fn(async () => {
+      changeAuthority(context, "removed");
+      return { kind: "resumed", previous: 1, generation: 2, documentPreserved: true } as const;
+    });
+    await context.controller.resume();
+    expect(context.controller.getSnapshot().phase).toBe("unavailable");
+    expect(retained.frame.inert).toBe(true);
+    expect(retained.dispose).toHaveBeenCalledOnce();
+    expect(context.handles[1].ended).toBe("closed");
+  });
+
+  it("unsubscribes on Stop and rearms observers on the next open", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    expect(context.statusListeners.size).toBe(1);
+    expect(context.connectionListeners.size).toBe(1);
+    context.controller.stop();
+    expect(context.statusListeners.size).toBe(0);
+    expect(context.connectionListeners.size).toBe(0);
+    changeAuthority(context, "removed");
+    context.emitServerInfo();
+    expect(context.controller.getSnapshot().phase).toBe("closed");
+    restoreAuthority(context);
+    await context.controller.open("https://upstream.example/");
+    expect(context.statusListeners.size).toBe(1);
+    expect(context.connectionListeners.size).toBe(1);
+    changeAuthority(context, "unsupported");
+    context.emitServerInfo();
+    expect(context.controller.getSnapshot().phase).toBe("unavailable");
+    expect(context.handles[1].ended).toBe("closed");
+  });
+
+  it("preserves the view on synchronous connection loss and ignores unchanged server info", async () => {
+    const context = setup();
+    await context.controller.open("https://upstream.example/");
+    const retained = lastBroker;
+    retained.activate();
+    context.emitServerInfo();
+    expect(context.controller.getSnapshot().phase).toBe("active");
+    expect(context.handles[0].ended).toBeNull();
+    context.client.getConnectionState.mockReturnValue({ status: "disconnected" });
+    for (const listener of context.connectionListeners)
+      listener(context.client.getConnectionState());
+    expect(context.controller.getSnapshot()).toMatchObject({ phase: "suspended", canResume: true });
+    expect(retained.frame.inert).toBe(true);
+    expect(retained.dispose).not.toHaveBeenCalled();
+    expect(retained.purge).not.toHaveBeenCalled();
+    expect(context.handles[0].ended).toBe("closed");
+    context.client.getConnectionState.mockReturnValue({ status: "connected" });
+    for (const listener of context.connectionListeners)
+      listener(context.client.getConnectionState());
+    expect(context.controller.getSnapshot().phase).toBe("suspended");
+    await context.controller.resume();
+    expect(context.controller.getSnapshot().phase).toBe("active");
+    expect(retained.frame.inert).toBe(false);
+    expect(retained.dispose).not.toHaveBeenCalled();
+  });
+
+  it.each(authorityChanges)(
+    "fences an active view synchronously when authority is %s",
+    async (change) => {
+      const context = setup();
+      await context.controller.open("https://upstream.example/");
+      const retained = lastBroker;
+      retained.activate();
+      changeAuthority(context, change);
+      context.emitServerInfo();
+      expect(context.controller.getSnapshot().phase).toBe("unavailable");
+      expect(retained.frame.inert).toBe(true);
+      expect(retained.dispose).toHaveBeenCalledOnce();
+      expect(context.handles[0].ended).toBe("closed");
+      expect(retained.purge).not.toHaveBeenCalled();
+      expect(context.client.requestNetworkFetchCleanup).not.toHaveBeenCalled();
+    },
+  );
+
   it("refuses missing or stale authenticated configuration and another selected host", async () => {
     const context = setup();
     const missing = createWebProxyProductController({ ...context.options, configuration: null });
