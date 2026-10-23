@@ -27,47 +27,32 @@ export type BinaryFrame =
   | { kind: "tunnel"; frame: TunnelFrame }
   | { kind: "remote_browser"; frame: RemoteBrowserBinaryFrame };
 
+const networkFetchOpcodes = new Set<number>(Object.values(NetworkFetchOpcode));
+const terminalOpcodes = new Set<number>(Object.values(TerminalStreamOpcode));
+const fileTransferOpcodes = new Set<number>(Object.values(FileTransferOpcode));
+const tunnelOpcodes = new Set<number>(Object.values(TunnelOpcode));
+const remoteBrowserOpcodes = new Set<number>(Object.values(RemoteBrowserOpcode));
+
 export function decodeBinaryFrame(bytes: Uint8Array): BinaryFrame | null {
-  switch (bytes[0]) {
-    case NetworkFetchOpcode.Request:
-    case NetworkFetchOpcode.Body:
-    case NetworkFetchOpcode.End:
-    case NetworkFetchOpcode.Cancel:
-    case NetworkFetchOpcode.Credit:
-    case NetworkFetchOpcode.Head:
-    case NetworkFetchOpcode.Fail:
-    case NetworkFetchOpcode.Cancelled: {
-      const frame = decodeNetworkFetchFrame(bytes);
-      return frame ? { kind: "network_fetch", frame } : null;
-    }
-    case TerminalStreamOpcode.Output:
-    case TerminalStreamOpcode.Input:
-    case TerminalStreamOpcode.Resize:
-    case TerminalStreamOpcode.Snapshot:
-    case TerminalStreamOpcode.Restore: {
-      const frame = decodeTerminalStreamFrame(bytes);
-      return frame ? { kind: "terminal", frame } : null;
-    }
-    case FileTransferOpcode.FileBegin:
-    case FileTransferOpcode.FileChunk:
-    case FileTransferOpcode.FileEnd: {
-      const frame = decodeFileTransferFrame(bytes);
-      return frame ? { kind: "file_transfer", frame } : null;
-    }
-    case TunnelOpcode.Open:
-    case TunnelOpcode.Connected:
-    case TunnelOpcode.Data:
-    case TunnelOpcode.Close:
-    case TunnelOpcode.WindowUpdate: {
-      const frame = decodeTunnelFrame(bytes);
-      return frame ? { kind: "tunnel", frame } : null;
-    }
-    case RemoteBrowserOpcode.Frame:
-    case RemoteBrowserOpcode.FrameAck: {
-      const frame = decodeRemoteBrowserFrame(bytes);
-      return frame ? { kind: "remote_browser", frame } : null;
-    }
-    default:
-      return null;
+  if (networkFetchOpcodes.has(bytes[0])) {
+    const frame = decodeNetworkFetchFrame(bytes);
+    return frame ? { kind: "network_fetch", frame } : null;
   }
+  if (terminalOpcodes.has(bytes[0])) {
+    const frame = decodeTerminalStreamFrame(bytes);
+    return frame ? { kind: "terminal", frame } : null;
+  }
+  if (fileTransferOpcodes.has(bytes[0])) {
+    const frame = decodeFileTransferFrame(bytes);
+    return frame ? { kind: "file_transfer", frame } : null;
+  }
+  if (tunnelOpcodes.has(bytes[0])) {
+    const frame = decodeTunnelFrame(bytes);
+    return frame ? { kind: "tunnel", frame } : null;
+  }
+  if (remoteBrowserOpcodes.has(bytes[0])) {
+    const frame = decodeRemoteBrowserFrame(bytes);
+    return frame ? { kind: "remote_browser", frame } : null;
+  }
+  return null;
 }

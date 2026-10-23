@@ -96,6 +96,9 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 function uint32(value: number): boolean {
   return Number.isInteger(value) && value > 0 && value <= NETWORK_FETCH_MAX_FETCH_ID;
 }
+function boundedPayload(payload: Uint8Array, maximum: number): boolean {
+  return payload.length > 0 && payload.length <= maximum;
+}
 function permitted(opcode: number, direction?: NetworkFetchDirection): boolean {
   if (opcode < NetworkFetchOpcode.Request || opcode > NetworkFetchOpcode.Cancelled) return false;
   if (direction === "client_to_host") return opcode <= NetworkFetchOpcode.Credit;
@@ -162,6 +165,18 @@ export function encodeNetworkFetchFrame(
 }
 export function decodeNetworkFetchFrame(
   bytes: Uint8Array,
+  direction: "client_to_host",
+): NetworkFetchClientFrame | null;
+export function decodeNetworkFetchFrame(
+  bytes: Uint8Array,
+  direction: "host_to_client",
+): NetworkFetchServerFrame | null;
+export function decodeNetworkFetchFrame(
+  bytes: Uint8Array,
+  direction?: NetworkFetchDirection,
+): NetworkFetchBinaryFrame | null;
+export function decodeNetworkFetchFrame(
+  bytes: Uint8Array,
   direction?: NetworkFetchDirection,
 ): NetworkFetchBinaryFrame | null {
   const opcode = bytes[0];
@@ -178,7 +193,7 @@ export function decodeNetworkFetchFrame(
     const payload = bytes.subarray(6 + idLength);
     switch (opcode) {
       case NetworkFetchOpcode.Body:
-        return payload.length > 0 && payload.length <= NETWORK_FETCH_MAX_CHUNK_BYTES
+        return boundedPayload(payload, NETWORK_FETCH_MAX_CHUNK_BYTES)
           ? { ...identity, opcode, data: payload }
           : null;
       case NetworkFetchOpcode.End:
@@ -190,7 +205,7 @@ export function decodeNetworkFetchFrame(
         return uint32(credit) ? { ...identity, opcode, bytes: credit } : null;
       }
     }
-    if (!payload.length || payload.length > NETWORK_FETCH_MAX_METADATA_BYTES) return null;
+    if (!boundedPayload(payload, NETWORK_FETCH_MAX_METADATA_BYTES)) return null;
     const value: unknown = JSON.parse(decoder.decode(payload));
     switch (opcode) {
       case NetworkFetchOpcode.Request:

@@ -9,9 +9,39 @@ import {
   encodeTunnelFrame,
   TunnelOpcode,
   type TunnelFrame,
+  NetworkFetchOpcode,
+  encodeNetworkFetchFrame,
+  RemoteBrowserOpcode,
+  encodeRemoteBrowserFrame,
 } from "./index.js";
 
 describe("binary frame demux", () => {
+  it("routes fetch frames and retains remote browser routing", () => {
+    const fetch = { opcode: NetworkFetchOpcode.Cancel, subscriptionId: "owner", fetchId: 1 };
+    expect(decodeBinaryFrame(encodeNetworkFetchFrame(fetch))).toEqual({
+      kind: "network_fetch",
+      frame: fetch,
+    });
+    const ack = {
+      opcode: RemoteBrowserOpcode.FrameAck,
+      subscriptionId: "owner",
+      generation: 1,
+      seq: 1,
+    };
+    expect(decodeBinaryFrame(encodeRemoteBrowserFrame(ack))).toEqual({
+      kind: "remote_browser",
+      frame: ack,
+    });
+  });
+  it("keeps fetch opcode allocation disjoint from other binary protocols", () => {
+    const existing = new Set<number>([
+      ...Object.values(TerminalStreamOpcode),
+      ...Object.values(FileTransferOpcode),
+      ...Object.values(TunnelOpcode),
+      ...Object.values(RemoteBrowserOpcode),
+    ]);
+    expect(Object.values(NetworkFetchOpcode).some((opcode) => existing.has(opcode))).toBe(false);
+  });
   it("routes terminal frames by opcode", () => {
     expect(
       decodeBinaryFrame(

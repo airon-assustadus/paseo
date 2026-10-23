@@ -95,6 +95,8 @@ class FetchHandle implements NetworkFetch {
   private readonly frameListeners = new Set<(frame: NetworkFetchServerFrame) => void>();
   private readonly endListeners = new Set<(reason: NetworkFetchEnd) => void>();
   private closing: Promise<void> | null = null;
+  private readonly pendingFrames: NetworkFetchServerFrame[] = [];
+  private delivering = false;
 
   constructor(
     opened: NetworkFetchOpened,
@@ -102,8 +104,8 @@ class FetchHandle implements NetworkFetch {
     private readonly release: () => void,
   ) {
     this.subscriptionId = opened.subscriptionId;
-    this.descriptor = opened.descriptor;
-    this.limits = opened.limits;
+    this.descriptor = Object.freeze({ ...opened.descriptor });
+    this.limits = Object.freeze({ ...opened.limits });
   }
   onFrame(listener: (frame: NetworkFetchServerFrame) => void): () => void {
     if (!this.ended) this.frameListeners.add(listener);
@@ -122,28 +124,10 @@ class FetchHandle implements NetworkFetch {
     );
     const exchange = this.exchanges.get(frame.fetchId);
     if (frame.opcode === NetworkFetchOpcode.Request) {
-      if (!this.frameListeners.size || frame.fetchId <= this.lastFetchId)
-        throw new NetworkFetchRpcError("open", "protocol_error");
-      if (
-        this.exchanges.size >= this.limits.maxConcurrentRequests ||
-        bytes.length - 6 - new TextEncoder().encode(this.subscriptionId).length >
-          this.limits.maxRequestHeadBytes ||
-        (frame.request.body.kind === "stream" &&
-          (frame.request.body.length ?? 0) > this.limits.maxRequestBodyBytes)
-      ) {
-        throw new NetworkFetchRpcError("open", "limit_exceeded");
-      }
-      this.lastFetchId = frame.fetchId;
-      this.exchanges.set(frame.fetchId, {
-        uploadRemaining: this.limits.initialWindowBytes,
-        uploadTotal: 0,
-        uploadLength: frame.request.body.kind === "stream" ? frame.request.body.length : 0,
-        uploadEnded: frame.request.body.kind === "none",
-        responseRemaining: this.limits.initialWindowBytes,
-        responseTotal: 0,
-        headed: false,
-        cancelling: false,
-      });
+      this.beginRequest(
+        frame,
+        bytes.length - 6 - new TextEncoder().encode(this.subscriptionId).length,
+      );
     } else {
       if (!exchange || exchange.cancelling)
         throw new NetworkFetchRpcError("open", "protocol_error");
@@ -186,11 +170,50 @@ class FetchHandle implements NetworkFetch {
       throw new NetworkFetchRpcError("open", "channel_lost");
     }
   }
+  private beginRequest(
+    frame: Extract<NetworkFetchSendFrame, { opcode: typeof NetworkFetchOpcode.Request }>,
+    metadataBytes: number,
+  ): void {
+    if (!this.frameListeners.size || frame.fetchId <= this.lastFetchId)
+      throw new NetworkFetchRpcError("open", "protocol_error");
+    if (
+      this.exchanges.size >= this.limits.maxConcurrentRequests ||
+      metadataBytes > this.limits.maxRequestHeadBytes ||
+      (frame.request.body.kind === "stream" &&
+        (frame.request.body.length ?? 0) > this.limits.maxRequestBodyBytes)
+    ) {
+      throw new NetworkFetchRpcError("open", "limit_exceeded");
+    }
+    this.lastFetchId = frame.fetchId;
+    this.exchanges.set(frame.fetchId, {
+      uploadRemaining: this.limits.initialWindowBytes,
+      uploadTotal: 0,
+      uploadLength: frame.request.body.kind === "stream" ? frame.request.body.length : 0,
+      uploadEnded: frame.request.body.kind === "none",
+      responseRemaining: this.limits.initialWindowBytes,
+      responseTotal: 0,
+      headed: false,
+      cancelling: false,
+    });
+  }
   receive(frame: NetworkFetchServerFrame): boolean {
     if (this.ended) return true;
     const exchange = this.exchanges.get(frame.fetchId);
     if (!exchange) return frame.fetchId <= this.lastFetchId;
-    if (exchange.cancelling && frame.opcode !== NetworkFetchOpcode.Cancelled) return true;
+    if (!this.frameListeners.size || this.pendingFrames.length >= 256) return false;
+    if (
+      exchange.cancelling &&
+      frame.opcode !== NetworkFetchOpcode.Cancelled &&
+      frame.opcode !== NetworkFetchOpcode.End &&
+      frame.opcode !== NetworkFetchOpcode.Fail
+    )
+      return true;
+    if (!this.acceptFrame(frame, exchange)) return false;
+    this.pendingFrames.push(frame);
+    this.drainFrames();
+    return true;
+  }
+  private acceptFrame(frame: NetworkFetchServerFrame, exchange: Exchange): boolean {
     switch (frame.opcode) {
       case NetworkFetchOpcode.Head:
         if (
@@ -217,7 +240,7 @@ class FetchHandle implements NetworkFetch {
         exchange.uploadRemaining += frame.bytes;
         break;
       case NetworkFetchOpcode.End:
-        if (!exchange.headed) return false;
+        if (!exchange.headed && !exchange.cancelling) return false;
         this.exchanges.delete(frame.fetchId);
         break;
       case NetworkFetchOpcode.Cancelled:
@@ -228,8 +251,23 @@ class FetchHandle implements NetworkFetch {
         this.exchanges.delete(frame.fetchId);
         break;
     }
-    for (const listener of this.frameListeners) this.deliver(() => listener(frame));
     return true;
+  }
+  private drainFrames(): void {
+    if (this.delivering) return;
+    this.delivering = true;
+    try {
+      while (this.pendingFrames.length && !this.ended) {
+        const pending = this.pendingFrames.shift()!;
+        const listeners = Array.from(this.frameListeners);
+        for (const listener of listeners) {
+          if (this.ended) break;
+          this.deliver(() => listener(pending));
+        }
+      }
+    } finally {
+      this.delivering = false;
+    }
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;
@@ -242,6 +280,7 @@ class FetchHandle implements NetworkFetch {
     if (this.ended) return;
     this.ended = reason;
     this.exchanges.clear();
+    this.pendingFrames.length = 0;
     this.frameListeners.clear();
     this.release();
     for (const listener of this.endListeners) this.deliver(() => listener(reason));
@@ -260,6 +299,11 @@ export class NetworkFetchRegistry {
   private readonly retired = new Set<string>();
   constructor(private readonly connection: NetworkFetchConnection) {}
   open(opened: NetworkFetchOpened): NetworkFetch {
+    encodeNetworkFetchFrame({
+      opcode: NetworkFetchOpcode.End,
+      subscriptionId: opened.subscriptionId,
+      fetchId: 1,
+    });
     if (this.handles.has(opened.subscriptionId) || this.retired.has(opened.subscriptionId))
       throw new NetworkFetchRpcError("open", "protocol_error");
     const handle = new FetchHandle(opened, this.connection, () => {
