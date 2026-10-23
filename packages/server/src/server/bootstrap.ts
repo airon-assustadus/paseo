@@ -11,6 +11,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { Logger } from "pino";
 import { z } from "zod";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
+import type { NetworkFetchConfig } from "./network-fetch/configuration.js";
 
 export type ListenTarget =
   | { type: "tcp"; host: string; port: number }
@@ -389,6 +390,7 @@ export type DaemonLifecycleIntent =
     };
 
 export interface PaseoDaemonConfig {
+  networkFetch?: NetworkFetchConfig;
   listen: string;
   paseoHome: string;
   daemonVersion?: string;
@@ -1739,6 +1741,7 @@ export async function createPaseoDaemon(
               pluginRuntime,
               orchestrationSkills,
               workspaceLabelService,
+              config.networkFetch,
             );
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();

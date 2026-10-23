@@ -7,6 +7,11 @@ export type PermissionRequirement = DaemonPermission | readonly DaemonPermission
 
 const INBOUND_PERMISSION = {
   "network.tunnel.open.request": "network.proxy",
+  "network.fetch.resolve_destination.request": "network.proxy",
+  "network.fetch.reconcile_destination.request": "network.proxy",
+  "network.fetch.request_cleanup.request": "network.proxy",
+  "network.fetch.open.request": "network.proxy",
+  "network.fetch.close.request": "network.proxy",
   "network.tunnel.close.request": "network.proxy",
   "browser.remote.open.request": "network.proxy",
   "browser.remote.attach.request": "network.proxy",
@@ -227,6 +232,12 @@ const INBOUND_PERMISSION = {
 
 const OUTBOUND_PERMISSION = {
   "network.tunnel.open.response": "network.proxy",
+  "network.fetch.resolve_destination.response": "network.proxy",
+  "network.fetch.reconcile_destination.response": "network.proxy",
+  "network.fetch.request_cleanup.response": "network.proxy",
+  "network.fetch.open.response": "network.proxy",
+  "network.fetch.close.response": "network.proxy",
+  "network.fetch.closed.update": "network.proxy",
   "network.tunnel.close.response": "network.proxy",
   "network.tunnel.closed": "network.proxy",
   "browser.remote.open.response": "network.proxy",
@@ -474,6 +485,14 @@ export function requiredPermissionForInbound(operation: InboundOperation): Permi
 export function requiredPermissionForOutbound(
   message: SessionOutboundMessage,
 ): PermissionRequirement {
+  switch (message.type) {
+    case "network.fetch.resolve_destination.response":
+    case "network.fetch.reconcile_destination.response":
+    case "network.fetch.request_cleanup.response":
+    case "network.fetch.open.response":
+    case "network.fetch.close.response":
+      if (!message.payload.ok) return null;
+  }
   // The legacy status envelope carries both agent RPC results and daemon configuration.
   if (
     message.type === "status" &&

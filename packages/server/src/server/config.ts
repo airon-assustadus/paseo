@@ -618,6 +618,7 @@ export function resolveConfigFromPersisted(
     mcpInjectIntoAgents,
     browserToolsEnabled,
     git: resolveGitProcessConfig(env, persisted),
+    networkFetch: persisted.daemon?.networkFetch ?? { enabled: false },
     autoArchiveAfterMerge,
     enableTerminalAgentHooks: persisted.daemon?.enableTerminalAgentHooks ?? false,
     appendSystemPrompt,

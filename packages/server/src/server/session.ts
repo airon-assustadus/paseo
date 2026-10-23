@@ -1,4 +1,5 @@
 import { searchTimeline } from "./agent/chat-search/index.js";
+import { parseServerInfoStatusPayload } from "@getpaseo/protocol/messages";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
 import type {
@@ -13,6 +14,11 @@ import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/me
 import type { MessageReceipts } from "./message-receipts/index.js";
 import equal from "fast-deep-equal";
 import { SessionDelivery, type OwnedSubscription } from "./session/owned-subscriptions/index.js";
+import {
+  NETWORK_FETCH_FAMILY,
+  NetworkFetchProductSession,
+} from "./network-fetch/network-fetch-session.js";
+import type { NetworkFetchManager } from "./network-fetch/network-fetch-manager.js";
 import {
   NETWORK_TUNNEL_FAMILY,
   NetworkTunnelSession,
@@ -458,6 +464,8 @@ function remoteBrowserLauncher(launcher: RemoteBrowserLauncher | null | undefine
 }
 
 export interface SessionOptions {
+  principalId?: string;
+  networkFetch?: NetworkFetchManager | null;
   browserToolsBroker?: BrowserToolsBroker | null;
   /** Daemon-wide remote browser manager; absent means the feature is unavailable. */
   remoteBrowsers?: RemoteBrowserLauncher | null;
@@ -800,6 +808,7 @@ export class Session {
   private readonly resolveScriptHealth: ((hostname: string) => ScriptHealthState | null) | null;
   private readonly terminalController: TerminalSessionController;
   private readonly networkTunnelSession: NetworkTunnelSession;
+  private readonly networkFetchSession: NetworkFetchProductSession;
   private readonly remoteBrowserSession: RemoteBrowserSession;
   private inflightRequests = 0;
   private peakInflightRequests = 0;
@@ -926,6 +935,7 @@ export class Session {
       },
       logger: this.sessionLogger,
     });
+    this.networkFetchSession = this.createNetworkFetchSession(options);
     this.remoteBrowserSession = new RemoteBrowserSession({
       host: {
         emit: (msg) => this.emit(msg),
@@ -2045,6 +2055,24 @@ export class Session {
     );
   }
 
+  private createNetworkFetchSession(options: SessionOptions): NetworkFetchProductSession {
+    return new NetworkFetchProductSession(
+      {
+        principalId: options.principalId ?? null,
+        emit: (message) => this.emit(message),
+        begin: (stop) => this.delivery.begin(NETWORK_FETCH_FAMILY, undefined, stop),
+        currentSource: () => this.delivery.currentSource,
+        requestSignal: () => this.delivery.requestSignal,
+        supportsFetch: (source) =>
+          this.delivery.isModern(source) &&
+          this.supportsForSource(CLIENT_CAPS.networkFetch, source),
+        allowsNetworkProxy: () => this.authorization.allowsPermission("network.proxy"),
+        reportReleaseFailure: () => this.sessionLogger.error("Network fetch teardown failed"),
+      },
+      options.networkFetch ?? null,
+    );
+  }
+
   private emitProviderSubagentWorkspaceUpdate(event: ProviderSubagentManagerEvent): void {
     if (event.type === "timeline") {
       return;
@@ -2165,6 +2193,15 @@ export class Session {
         "agent.session.inbound",
       );
       if (!this.authorization.allowsInbound(msg)) {
+        switch (msg.type) {
+          case "network.fetch.resolve_destination.request":
+          case "network.fetch.reconcile_destination.request":
+          case "network.fetch.request_cleanup.request":
+          case "network.fetch.open.request":
+          case "network.fetch.close.request":
+            await this.networkFetchSession.handle(msg);
+            return;
+        }
         const requestId = sessionRequestId(msg);
         if (requestId) {
           this.emit({
@@ -2221,6 +2258,7 @@ export class Session {
   public setPermissions(permissions: readonly DaemonPermission[]): void {
     // The closed notice must leave while network.proxy still authorizes it, so revoke runs first.
     if (!permissions.includes("network.proxy")) {
+      this.networkFetchSession.revoke();
       void this.networkTunnelSession
         .revoke()
         .catch((error) =>
@@ -2324,6 +2362,14 @@ export class Session {
     msg: SessionInboundMessage,
     source?: object,
   ): Promise<void> | undefined {
+    switch (msg.type) {
+      case "network.fetch.resolve_destination.request":
+      case "network.fetch.reconcile_destination.request":
+      case "network.fetch.request_cleanup.request":
+      case "network.fetch.open.request":
+      case "network.fetch.close.request":
+        return this.networkFetchSession.handle(msg);
+    }
     if (msg.type === "browser.host.register.request") return this.registerBrowserHost(msg);
     if (msg.type === "network.tunnel.open.request") {
       this.networkTunnelSession.handleOpenRequest(msg);
@@ -3184,6 +3230,10 @@ export class Session {
   }
 
   public async handleBinaryFrame(binaryFrame: BinaryFrame, source: object): Promise<void> {
+    if (binaryFrame.kind === "network_fetch") {
+      await this.networkFetchSession.handleFrame(binaryFrame.frame, source);
+      return;
+    }
     // Tunnels carry network.proxy authority of their own; the workspace.write gate below is for terminals and files.
     if (binaryFrame.kind === "tunnel") {
       await this.networkTunnelSession.handleFrame(binaryFrame.frame, source);
@@ -8444,6 +8494,10 @@ export class Session {
   private emit(msg: SessionOutboundMessage): void {
     if (!this.authorization.allowsOutbound(msg)) return;
     if (this.delivery.reply(msg)) return;
+    if (msg.type === "status" && msg.payload.status === "server_info") {
+      this.emitLegacyServerInfo(msg);
+      return;
+    }
     if (this.emitSubscribedEvent(msg)) return;
     // JSON.stringify(msg) is only computed when trace is enabled — it runs for
     // every outbound message otherwise, and trace is disabled by default.
@@ -8480,8 +8534,41 @@ export class Session {
 
   private supportsNetworkTunnel(source?: object): boolean {
     return source
-      ? this.supportsForSource(CLIENT_CAPS.networkTunnel, source)
-      : this.supports(CLIENT_CAPS.networkTunnel);
+      ? this.supportsForSource(CLIENT_CAPS.networkTunnel, source) ||
+          this.supportsForSource(CLIENT_CAPS.networkFetch, source)
+      : this.supports(CLIENT_CAPS.networkTunnel) || this.supports(CLIENT_CAPS.networkFetch);
+  }
+
+  private emitLegacyServerInfo(message: Extract<SessionOutboundMessage, { type: "status" }>): void {
+    if (this.onMessageToSource && this.clientSources.size > 0) {
+      for (const source of this.clientSources.keys()) {
+        if (!this.delivery.isModern(source))
+          this.onMessageToSource(source, this.projectNetworkFetchServerInfo(message, source));
+      }
+      return;
+    }
+    this.onMessage(this.projectNetworkFetchServerInfo(message));
+  }
+
+  private projectNetworkFetchServerInfo(
+    message: Extract<SessionOutboundMessage, { type: "status" }>,
+    source?: object,
+  ): SessionOutboundMessage {
+    const { networkFetchConfiguration, ...payload } = message.payload;
+    const permissions = this.permissionsForSource(source);
+    const enabled =
+      this.networkFetchSession.available &&
+      parseServerInfoStatusPayload(message.payload)?.features?.networkFetch;
+    return {
+      ...message,
+      payload: {
+        ...payload,
+        permissions,
+        ...(networkFetchConfiguration && enabled && permissions.includes("network.proxy")
+          ? { networkFetchConfiguration }
+          : {}),
+      },
+    };
   }
 
   private projectMessageForClient(
@@ -8490,10 +8577,7 @@ export class Session {
   ): SessionOutboundMessage {
     // COMPAT(networkTunnel): added in v0.12.0, remove permission projection after 2027-10-08 once client floor >= v0.12.0.
     if (message.type === "status" && message.payload.status === "server_info") {
-      return {
-        ...message,
-        payload: { ...message.payload, permissions: this.permissionsForSource(source) },
-      };
+      return this.projectNetworkFetchServerInfo(message, source);
     }
     if (
       message.type === "hub.management.daemon.connect.response" ||

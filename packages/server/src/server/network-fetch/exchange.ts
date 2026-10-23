@@ -1,4 +1,8 @@
 import http from "node:http";
+import type { NetworkFetchLimits } from "@getpaseo/protocol/network-fetch/rpc-schemas";
+import type { NetworkFetchResponseHead } from "@getpaseo/protocol/binary-frames/network-fetch";
+export type { NetworkFetchLimits } from "@getpaseo/protocol/network-fetch/rpc-schemas";
+export type { NetworkFetchResponseHead } from "@getpaseo/protocol/binary-frames/network-fetch";
 import { isIP, type Socket } from "node:net";
 import { pipeline, type Readable } from "node:stream";
 import tls from "node:tls";
@@ -42,30 +46,6 @@ export interface NetworkFetchRedirect {
   location: string;
   /** Whether the target stays inside the session scope; widening it needs the trusted control. */
   allowed: boolean;
-}
-
-export interface NetworkFetchResponseHead {
-  status: number;
-  statusText: string;
-  headers: HeaderList;
-  url: string;
-  redirected: boolean;
-  redirect: NetworkFetchRedirect | null;
-  setCookieDropped: number;
-  droppedRequestHeaders: string[];
-}
-
-export interface NetworkFetchLimits {
-  initialWindowBytes: number;
-  maxChunkBytes: number;
-  maxConcurrentRequests: number;
-  connectTimeoutMs: number;
-  maxRequestHeadBytes: number;
-  maxResponseHeadBytes: number;
-  responseHeadTimeoutMs: number;
-  maxRequestBodyBytes: number;
-  maxResponseBodyBytes: number;
-  maxRedirects: number;
 }
 
 /**
