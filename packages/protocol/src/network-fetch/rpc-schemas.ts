@@ -7,12 +7,27 @@ export const NETWORK_FETCH_MAX_CHUNK_BYTES = 65536;
 export const NETWORK_FETCH_MAX_FETCH_ID = 0xffffffff;
 
 export const NetworkFetchEpochSchema = z.string().regex(/^(0|[1-9][0-9]*)(?![\s\S])/);
-export const NetworkFetchDestinationIdSchema = z.string().length(52).regex(/^[a-z2-7]{52}$/);
+export const NetworkFetchDestinationIdSchema = z
+  .string()
+  .length(52)
+  .regex(/^[a-z2-7]{52}$/);
 export const NetworkFetchConfigurationSchema = z.object({
-  dedicatedContentDomain: z.string().min(1).max(253).regex(/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?![\s\S])/),
+  dedicatedContentDomain: z
+    .string()
+    .min(1)
+    .max(253)
+    .regex(/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?![\s\S])/),
   assetVersion: z.string().min(1).max(256),
-  bootstrapPath: z.string().min(1).max(8192).regex(/^\/(?!\/)[^\\?#\s]*(?![\s\S])/),
-  pathPrefix: z.string().min(1).max(8192).regex(/^\/(?!\/)[^\\?#\s]*(?![\s\S])/),
+  bootstrapPath: z
+    .string()
+    .min(1)
+    .max(8192)
+    .regex(/^\/(?!\/)[^\\?#\s]*(?![\s\S])/),
+  pathPrefix: z
+    .string()
+    .min(1)
+    .max(8192)
+    .regex(/^\/(?!\/)[^\\?#\s]*(?![\s\S])/),
   ttlMs: z.number().int().min(1).max(2147483647),
   handshakeTimeoutMs: z.number().int().min(1).max(2147483647),
 });
