@@ -1186,6 +1186,7 @@ export const ar: TranslationResources = {
       sort: {
         label: "الترتيب",
         created: "تاريخ الإنشاء",
+        manual: "يدوي",
         lastPrompt: "آخر طلب",
         updateHost: "حدّث المضيفين لترتيب مساحات العمل",
       },
