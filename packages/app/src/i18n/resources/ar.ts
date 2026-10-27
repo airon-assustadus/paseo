@@ -2035,12 +2035,13 @@ export const ar: TranslationResources = {
     output: "الإخراج",
   },
   turnSummary: {
-    messages: {
-      one: "كتب {{count}} رسالة",
-      other: "كتب {{count}} رسائل",
-    },
+    details: "عرض تفاصيل الجولة",
+    sentBy: "أرسلها {{name}}",
+    showMore: "عرض المزيد",
+    showLess: "عرض أقل",
   },
   toolCallGroup: {
+    thought: "فكّر",
     editedFiles: {
       one: "حرّر {{count}} ملفًا",
       other: "حرّر {{count}} ملفات",
@@ -2388,10 +2389,23 @@ export const ar: TranslationResources = {
             "عند تشغيل الوكيل، يوجّه Enter الجولة النشطة. يضيف Command/Ctrl+Enter إلى قائمة الانتظار.",
           queue: "عند تشغيل الوكيل، يضيف Enter إلى قائمة الانتظار. Command/Ctrl+Enter يرسل.",
         },
+        commandEnterDescriptions: {
+          interrupt: "عند تشغيل الوكيل، يوقف {{modifier}}+Enter التشغيل. يُدرج Enter سطرًا جديدًا.",
+          steer: "عند تشغيل الوكيل، يوجّه {{modifier}}+Enter الجولة النشطة. يُدرج Enter سطرًا جديدًا.",
+          queue:
+            "عند تشغيل الوكيل، يضيف {{modifier}}+Enter إلى قائمة الانتظار. يُدرج Enter سطرًا جديدًا.",
+        },
         options: {
           interrupt: "مقاطعة",
           steer: "توجيه",
           queue: "طابور",
+        },
+      },
+      sendShortcut: {
+        label: "اختصار الإرسال",
+        options: {
+          enter: "Enter",
+          "mod-enter": "{{modifier}}+Enter",
         },
       },
       serviceUrls: {
