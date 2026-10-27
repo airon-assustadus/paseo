@@ -1,3 +1,4 @@
+import type { PluginAgentToolsRuntime } from "./agent-tools.js";
 import type { PluginLifecycle } from "./lifecycle/index.js";
 import path from "node:path";
 import { stat, rm } from "node:fs/promises";
@@ -37,6 +38,10 @@ import type { PluginUsageSourceMetadata } from "./plugin-process-protocol.js";
 const BUILTIN_PROVIDER_ID_SET: ReadonlySet<string> = new Set(BUILTIN_PROVIDER_IDS);
 
 interface PluginRuntimePort {
+  subscribeSessionOpenChanges?: PluginRuntime["subscribeSessionOpenChanges"];
+  isToolPluginAvailable?: PluginRuntime["isToolPluginAvailable"];
+  callTool?: PluginRuntime["callTool"];
+  detachTools?: PluginRuntime["detachTools"];
   emit?: PluginLifecycle["emit"];
   drainEvents?: PluginRuntime["drainEvents"];
   before?: PluginLifecycle["before"];
@@ -129,6 +134,34 @@ export class PluginService {
 
   readonly emit: PluginLifecycle["emit"] = (name, event) => {
     this.runtime.emit?.(name, event);
+  };
+
+  subscribeSessionOpenChanges(listener: () => void): () => void {
+    return this.runtime.subscribeSessionOpenChanges?.(listener) ?? (() => {});
+  }
+
+  readonly isToolPluginAvailable: PluginAgentToolsRuntime["isToolPluginAvailable"] = (
+    pluginId,
+    pluginInstanceId,
+  ) => {
+    return this.runtime.isToolPluginAvailable?.(pluginId, pluginInstanceId) ?? false;
+  };
+
+  readonly detachTools: PluginAgentToolsRuntime["detachTools"] = (agentId) => {
+    this.runtime.detachTools?.(agentId);
+  };
+
+  readonly callTool: PluginAgentToolsRuntime["callTool"] = async (
+    pluginId,
+    pluginInstanceId,
+    agent,
+    name,
+    input,
+    signal,
+  ) => {
+    if (!this.isToolPluginAvailable(pluginId, pluginInstanceId) || !this.runtime.callTool)
+      return { isError: true, text: `Plugin is not available: ${pluginId}` };
+    return this.runtime.callTool(pluginId, pluginInstanceId, agent, name, input, signal);
   };
 
   async drainEvents(): Promise<void> {
