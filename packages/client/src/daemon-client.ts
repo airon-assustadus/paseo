@@ -7306,16 +7306,7 @@ export class DaemonClient {
   }
 
   private tryHandleBinaryFrame(rawBytes: Uint8Array): boolean {
-    const hostFrame = decodeHostRouteFrame(rawBytes);
-    if (rawBytes[0] === HOST_ROUTE_OPCODE && !hostFrame) {
-      this.disposeTransport(1008, "Invalid host routing frame");
-      this.scheduleReconnect({ reason: "Invalid host routing frame", event: "INVALID_HOST_FRAME" });
-      return true;
-    }
-    if (hostFrame) {
-      for (const handler of this.hostFrameListeners) handler(hostFrame);
-      return true;
-    }
+    if (this.tryHandleHostRouteFrame(rawBytes)) return true;
     if (this.tryHandleNetworkFetchFrame(rawBytes)) return true;
     const fileFrame = decodeFileTransferFrame(rawBytes);
     if (fileFrame) {
@@ -7402,6 +7393,18 @@ export class DaemonClient {
       event: "NETWORK_TUNNEL_PROTOCOL_ERROR",
       reasonCode: "protocol_error",
     });
+  }
+
+  private tryHandleHostRouteFrame(rawBytes: Uint8Array): boolean {
+    const hostFrame = decodeHostRouteFrame(rawBytes);
+    if (rawBytes[0] === HOST_ROUTE_OPCODE && !hostFrame) {
+      this.disposeTransport(1008, "Invalid host routing frame");
+      this.scheduleReconnect({ reason: "Invalid host routing frame", event: "INVALID_HOST_FRAME" });
+      return true;
+    }
+    if (!hostFrame) return false;
+    for (const handler of this.hostFrameListeners) handler(hostFrame);
+    return true;
   }
 
   private tryHandleNetworkFetchFrame(rawBytes: Uint8Array): boolean {

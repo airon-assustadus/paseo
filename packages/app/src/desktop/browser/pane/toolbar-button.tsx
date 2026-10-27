@@ -1,5 +1,5 @@
 import { useMemo, type ReactNode } from "react";
-import { Pressable, Text, type StyleProp, type ViewStyle } from "react-native";
+import { Text, type StyleProp, type ViewStyle } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
@@ -26,18 +26,16 @@ export function ToolbarButton({
   );
   return (
     <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
-      <TooltipTrigger asChild disabled={disabled}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={label}
-          accessibilityState={accessibilityState}
-          disabled={disabled}
-          onPress={onPress}
-          style={style}
-          testID={testID}
-        >
-          {children}
-        </Pressable>
+      <TooltipTrigger
+        accessibilityRole="button"
+        accessibilityLabel={label}
+        accessibilityState={accessibilityState}
+        disabled={disabled}
+        onPress={onPress}
+        style={style}
+        testID={testID}
+      >
+        {children}
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" offset={8}>
         <Text style={styles.toolbarTooltipText}>{label}</Text>
