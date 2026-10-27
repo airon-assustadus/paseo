@@ -1,6 +1,7 @@
+// 0x30 belongs to upstream host routing (HOST_ROUTE_OPCODE) since Paseo 0.13.
 export const RemoteBrowserOpcode = {
-  Frame: 0x30,
-  FrameAck: 0x31,
+  Frame: 0x50,
+  FrameAck: 0x51,
 } as const;
 
 export type RemoteBrowserOpcode = (typeof RemoteBrowserOpcode)[keyof typeof RemoteBrowserOpcode];

@@ -158,15 +158,19 @@ test("DaemonClient uploads file bytes to daemon temp storage", async () => {
       chunkSize: 5,
     });
 
+    const uploadId = result.file?.id ?? "";
+    expect(uploadId).toMatch(
+      /^upload_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
     expect(result).toEqual({
       requestId: "req-upload-e2e",
       file: {
         type: "uploaded_file",
-        id: expect.stringMatching(/^upload_[0-9a-f-]{36}$/),
+        id: uploadId,
         fileName: "notes.txt",
         mimeType: "text/plain",
         size: 11,
-        path: path.join(daemon.paseoHome, "uploads", result.file?.id ?? "", "notes.txt"),
+        path: path.join(daemon.paseoHome, "uploads", uploadId, "notes.txt"),
       },
       error: null,
     });
@@ -399,7 +403,7 @@ class RejectingMcpResumeClient implements AgentClient {
   }
 }
 
-test("createAgent fails when the initial turn cannot start", async () => {
+test("createAgent preserves the agent when the initial turn cannot start", async () => {
   const testAgent = new StubAgentClient({
     sessionId: "start-turn-failure-session",
     supportsStreaming: false,
@@ -418,16 +422,18 @@ test("createAgent fails when the initial turn cannot start", async () => {
     await client.connect();
     await client.fetchAgents({ subscribe: {} });
 
-    await expect(
-      client.createAgent({
-        provider: "codex",
-        cwd: tmpCwd(),
-        title: "Start failure agent",
-        modeId: "full-access",
-        model: "gpt-5.4-mini",
-        initialPrompt: "Run exactly: sleep 30",
-      }),
-    ).rejects.toThrow("Initial turn failed to start");
+    const agent = await client.createAgent({
+      provider: "codex",
+      cwd: tmpCwd(),
+      title: "Start failure agent",
+      modeId: "full-access",
+      model: "gpt-5.4-mini",
+      initialPrompt: "Run exactly: sleep 30",
+    });
+    expect(agent).toMatchObject({
+      status: "error",
+      lastError: "Initial turn failed to start",
+    });
   } finally {
     await client.close();
     await daemon.close();

@@ -1,8 +1,10 @@
 import { createElement, type ComponentType } from "react";
+import { lightHighlightColors } from "@getpaseo/highlight";
 
 const testTheme = {
   colorScheme: "light",
   colors: {
+    syntax: lightHighlightColors,
     foreground: "#111111",
     foregroundMuted: "#666666",
     statusSuccess: "#15803d",

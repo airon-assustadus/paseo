@@ -1,4 +1,5 @@
 import { decodeTunnelFrame, TunnelOpcode, type TunnelFrame } from "./tunnel.js";
+import { HOST_ROUTE_OPCODE, decodeHostRouteFrame, type HostRouteFrame } from "./host-route.js";
 import {
   decodeNetworkFetchFrame,
   NetworkFetchOpcode,
@@ -22,6 +23,7 @@ import {
 
 export type BinaryFrame =
   | { kind: "network_fetch"; frame: NetworkFetchBinaryFrame }
+  | { kind: "host_route"; frame: HostRouteFrame }
   | { kind: "terminal"; frame: TerminalStreamFrame }
   | { kind: "file_transfer"; frame: FileTransferFrame }
   | { kind: "tunnel"; frame: TunnelFrame }
@@ -34,6 +36,10 @@ const tunnelOpcodes = new Set<number>(Object.values(TunnelOpcode));
 const remoteBrowserOpcodes = new Set<number>(Object.values(RemoteBrowserOpcode));
 
 export function decodeBinaryFrame(bytes: Uint8Array): BinaryFrame | null {
+  if (bytes[0] === HOST_ROUTE_OPCODE) {
+    const frame = decodeHostRouteFrame(bytes);
+    return frame ? { kind: "host_route", frame } : null;
+  }
   if (networkFetchOpcodes.has(bytes[0])) {
     const frame = decodeNetworkFetchFrame(bytes);
     return frame ? { kind: "network_fetch", frame } : null;

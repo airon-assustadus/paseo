@@ -42,7 +42,7 @@ import {
   findPaneById,
   useWorkspaceLayoutStore,
 } from "@/stores/workspace-layout-store";
-import { shouldShowWorkspaceSetup, useWorkspaceSetupStore } from "@/stores/workspace-setup-store";
+import { shouldShowWorkspaceSetup } from "@/stores/workspace-setup-store";
 import { clearCommandCenterFocusRestoreElement } from "@/utils/command-center-focus-restore";
 import { getShortcutOs } from "@/utils/shortcut-platform";
 import {
@@ -189,6 +189,7 @@ export function useWorkspaceCommandCenterActions(): void {
     workspaceDirectory: workspace.workspaceDirectory ?? null,
     currentBranch: workspace.gitRuntime?.currentBranch ?? null,
     pinnedAt: workspace.pinnedAt ?? null,
+    setupStatus: workspace.setupStatus ?? null,
     labels: workspace.labels ?? [],
   }));
   const cwd = useWorkspaceDirectory(serverId, workspaceId);
@@ -197,12 +198,10 @@ export function useWorkspaceCommandCenterActions(): void {
   const isPinned = fields?.pinnedAt != null;
   const isCompact = useIsCompactFormFactor();
   const canPin = useHostFeature(serverId, "workspacePinning");
-  const persistenceKey =
-    serverId && fields
-      ? buildWorkspaceTabPersistenceKey({ serverId, workspaceId: fields.id })
-      : null;
-  const canShowSetup = useWorkspaceSetupStore((state) =>
-    shouldShowWorkspaceSetup(persistenceKey ? (state.snapshots[persistenceKey] ?? null) : null),
+  const supportsSetupObservation = useHostFeature(serverId, "workspaceSetupObservation");
+  const canShowSetup = shouldShowWorkspaceSetup(
+    fields?.setupStatus ?? null,
+    supportsSetupObservation,
   );
   const { overrides } = useKeyboardShortcutOverrides();
   const { gitActions, isGit } = useGitActions({

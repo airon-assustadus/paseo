@@ -7,7 +7,7 @@ The wire contract is `packages/protocol/src/remote-browser/rpc-schemas.ts` and `
 ## Design
 
 ```text
-app pane  <- JPEG frames (0x30), state events      -> input, navigate, resize, visibility, acks (0x31)
+app pane  <- JPEG frames (0x50), state events      -> input, navigate, resize, visibility, acks (0x51)
   `-- DaemonClient.openRemoteBrowser()  (owned subscription per attachment)
         `-- RemoteBrowserSession  (one per daemon Session: ownership, queue, frames, state)
               `-- RemoteBrowserManager  (daemon-wide: count, memory watchdog, shutdown)
