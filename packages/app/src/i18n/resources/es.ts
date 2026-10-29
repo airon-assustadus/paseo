@@ -2205,6 +2205,7 @@ export const es: TranslationResources = {
       days: "{{value}} d",
       hours: "{{value}} h",
       minutes: "{{value}} min",
+      pair: "{{first}} {{second}}",
     },
     timing: {
       lastUpdated: "Última actualización {{relativeTime}}",
@@ -2212,6 +2213,8 @@ export const es: TranslationResources = {
       resetTimePassed: "Pasó la hora de restablecimiento",
       resettingNow: "se restablece ahora",
       resetsIn: "se restablece en {{duration}}",
+      resetsAtWeekday: "{{weekday}} {{time}}",
+      resetsAtDate: "{{date}}, {{time}}",
       runsOutNow: "se agota ahora",
       runsOutIn: "se agota en {{duration}}",
       justNow: "ahora mismo",

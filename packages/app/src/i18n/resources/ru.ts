@@ -2191,6 +2191,7 @@ export const ru: TranslationResources = {
       days: "{{value}} дн.",
       hours: "{{value}} ч",
       minutes: "{{value}} мин",
+      pair: "{{first}} {{second}}",
     },
     timing: {
       lastUpdated: "Последнее обновление {{relativeTime}}",
@@ -2198,6 +2199,8 @@ export const ru: TranslationResources = {
       resetTimePassed: "Время сброса прошло",
       resettingNow: "сброс сейчас",
       resetsIn: "сброс через {{duration}}",
+      resetsAtWeekday: "{{weekday}} {{time}}",
+      resetsAtDate: "{{date}}, {{time}}",
       runsOutNow: "закончится сейчас",
       runsOutIn: "закончится через {{duration}}",
       justNow: "только что",
