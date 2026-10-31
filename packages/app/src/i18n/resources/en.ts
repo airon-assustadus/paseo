@@ -2056,7 +2056,6 @@ export const en = {
   toolCallDetails: {
     error: "Error",
     empty: "No additional details available",
-    subAgentActivity: "Sub-agent activity",
     input: "Input",
     output: "Output",
   },
@@ -2135,6 +2134,11 @@ export const en = {
     },
   },
   providerUsage: {
+    checkUsage: "Check usage",
+    checkUsageHint: "Applies to {{host}} on every device",
+    off: "Usage is off on {{host}}.",
+    turnOn: "Turn on",
+
     options: "Settings",
     refreshFailed: "Unable to refresh usage",
     noHosts: "No connected hosts",

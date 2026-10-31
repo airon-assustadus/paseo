@@ -2079,7 +2079,6 @@ export const es: TranslationResources = {
   toolCallDetails: {
     error: "Error",
     empty: "No hay detalles adicionales disponibles",
-    subAgentActivity: "Actividad de subagente",
     input: "Aporte",
     output: "Producción",
   },
@@ -2158,6 +2157,11 @@ export const es: TranslationResources = {
     },
   },
   providerUsage: {
+    checkUsage: "Consultar uso",
+    checkUsageHint: "Se aplica a {{host}} en todos los dispositivos",
+    off: "El uso está desactivado en {{host}}.",
+    turnOn: "Activar",
+
     options: "Configuración",
     refreshFailed: "No se pudo actualizar el uso",
     noHosts: "No hay hosts conectados",
